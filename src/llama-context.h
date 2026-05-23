@@ -246,6 +246,11 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // [EXPERIMENTAL] MoE expert cache controls (called through the public C API).
+    bool load_moe_oracle(const char * path);
+    void moe_oracle_prefill(int call_idx);
+    void moe_cache_clear();
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,

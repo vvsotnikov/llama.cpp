@@ -108,6 +108,7 @@ int main(int argc, char ** argv) {
     int  n_threads           = 24;
     int  n_cpu_moe           = 0;   // -ncmoe N: offload first N layers' MoE expert tensors to CPU
     int  moe_cache_size      = 0;   // -moecache C: per-layer GPU expert cache slots (0 = disabled)
+    std::string oracle_path  = "";  // --oracle path: replay MOE2 trace to drive selective fills
     bool wrap                = true; // wrap prompt in the Qwen chat template
     bool no_mmap             = false;
     bool no_trace            = false;
@@ -126,6 +127,7 @@ int main(int argc, char ** argv) {
         else if (a == "-t")          n_threads  = atoi(next("-t"));
         else if (a == "-ncmoe" || a == "--n-cpu-moe")    n_cpu_moe      = atoi(next("-ncmoe"));
         else if (a == "-moecache" || a == "--moe-cache-size") moe_cache_size = atoi(next("-moecache"));
+        else if (a == "--oracle")    oracle_path = next("--oracle");
         else if (a == "--raw")       wrap       = false;
         else if (a == "--no-mmap")   no_mmap    = true;
         else if (a == "--no-trace")  no_trace   = true;
@@ -134,7 +136,7 @@ int main(int argc, char ** argv) {
     if (model_path.empty()) {
         fprintf(stderr,
             "usage: %s -m model.gguf [-p prompt] [-o out.bin] [-n n_predict] [-ngl n] [-t threads] "
-            "[-ncmoe N] [-moecache C] [--raw] [--no-mmap] [--no-trace]\n",
+            "[-ncmoe N] [-moecache C] [--oracle trace.bin] [--raw] [--no-mmap] [--no-trace]\n",
             argv[0]);
         return 1;
     }
@@ -204,6 +206,20 @@ int main(int argc, char ** argv) {
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create context\n"); return 1; }
 
+    // [EXPERIMENTAL] oracle-driven MoE expert prefill.
+    if (!oracle_path.empty()) {
+        if (moe_cache_size == 0) {
+            fprintf(stderr, "--oracle requires -moecache > 0\n");
+            return 1;
+        }
+        if (!llama_moe_oracle_load(ctx, oracle_path.c_str())) {
+            fprintf(stderr, "failed to load oracle '%s'\n", oracle_path.c_str());
+            return 1;
+        }
+        // Throw away the post-ctor warmup; oracle prefill should start from cold.
+        llama_moe_cache_clear(ctx);
+    }
+
     llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
 
@@ -227,6 +243,9 @@ int main(int argc, char ** argv) {
         if (n > 0) { fwrite(buf, 1, n, stderr); }
 
         st.call_idx = call;
+        if (!oracle_path.empty()) {
+            llama_moe_oracle_prefill(ctx, call);
+        }
         if (llama_decode(ctx, llama_batch_get_one(&id, 1))) {
             fprintf(stderr, "decode failed at step %d\n", n_decode);
             break;
@@ -244,8 +263,9 @@ int main(int argc, char ** argv) {
         no_trace ? "" : (std::string(" (trace -> ") + out_path + ", "
                           + std::to_string(st.n_rec) + " records)").c_str());
     fprintf(stderr,
-        "config: ngl=%d ncmoe=%d moecache=%d mmap=%d trace=%d\n",
-        ngl, n_cpu_moe, moe_cache_size, !no_mmap, !no_trace);
+        "config: ngl=%d ncmoe=%d moecache=%d mmap=%d trace=%d oracle=%s\n",
+        ngl, n_cpu_moe, moe_cache_size, !no_mmap, !no_trace,
+        oracle_path.empty() ? "(none)" : oracle_path.c_str());
 
     llama_sampler_free(smpl);
     llama_free(ctx);

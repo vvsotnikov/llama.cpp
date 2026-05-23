@@ -447,6 +447,18 @@ extern "C" {
     // TODO: update API to start accepting pointers to params structs (https://github.com/ggml-org/llama.cpp/discussions/9172)
     LLAMA_API struct llama_model_params          llama_model_default_params(void);
     LLAMA_API struct llama_context_params        llama_context_default_params(void);
+
+    // [EXPERIMENTAL] MoE expert prefetch cache controls.
+    // The cache is created automatically when `llama_context_params::moe_expert_cache_size`
+    // is non-zero. By default the cache is pre-warmed with every (layer, expert) so the
+    // first decode produces correct output. To switch to an oracle-driven selective fill
+    // (the regime that actually benefits from a smaller VRAM budget) call
+    // `llama_moe_oracle_load` then `llama_moe_cache_clear`, and call
+    // `llama_moe_oracle_prefill(ctx, call_idx)` before each `llama_decode` whose step
+    // index matches the trace's `call_idx`.
+    LLAMA_API bool llama_moe_oracle_load   (struct llama_context * ctx, const char * path);
+    LLAMA_API void llama_moe_oracle_prefill(struct llama_context * ctx, int call_idx);
+    LLAMA_API void llama_moe_cache_clear   (struct llama_context * ctx);
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 

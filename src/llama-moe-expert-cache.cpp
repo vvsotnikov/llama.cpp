@@ -29,6 +29,15 @@ void llama_moe_expert_cache_free(llama_moe_expert_cache * cache) {
     if (!cache) {
         return;
     }
+    if (cache->n_hits + cache->n_misses > 0) {
+        const uint64_t lookups = cache->n_hits + cache->n_misses;
+        LLAMA_LOG_INFO("%s: stats — hits=%llu misses=%llu (%.1f%% hit) fills=%llu\n",
+                       __func__,
+                       (unsigned long long) cache->n_hits,
+                       (unsigned long long) cache->n_misses,
+                       lookups ? 100.0 * cache->n_hits / lookups : 0.0,
+                       (unsigned long long) cache->n_fills);
+    }
     // The buffer & context unique_ptrs free themselves.
     delete cache;
 }
@@ -282,5 +291,146 @@ void llama_moe_expert_cache_invalidate_all(llama_moe_expert_cache * cache) {
         std::fill(L.slot_valid.begin(),     L.slot_valid.end(),     0);
         std::fill(L.slot_lru.begin(),       L.slot_lru.end(),       0);
         L.lru_counter = 0;
+    }
+}
+
+// MOE2 format:
+//   bytes 0..3 : "MOE2"
+//   records: int32 hdr[6] = { tid, layer, call_idx, ne0, ne1, dtype } + ne0*ne1*4 bytes
+// tid 2 = ffn_moe_topk (i32), the selected expert IDs.
+bool llama_moe_expert_cache_load_oracle(
+        llama_moe_expert_cache * cache,
+        const char * path) {
+    if (!cache || !path) {
+        return false;
+    }
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        LLAMA_LOG_ERROR("%s: failed to open '%s'\n", __func__, path);
+        return false;
+    }
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "MOE2", 4) != 0) {
+        LLAMA_LOG_ERROR("%s: bad magic in '%s' (expected MOE2)\n", __func__, path);
+        fclose(f);
+        return false;
+    }
+
+    cache->oracle_layer_to_idx.assign(cache->layers.size() ? 0 : 0, -1);
+    // We need n_layer mapping; widen to the largest layer index we see, then we'll
+    // rebuild from cache->layers below.
+    std::vector<std::vector<std::vector<int32_t>>> per_layer; // [layer_idx][step]
+    int32_t max_layer = -1;
+    int32_t max_step  = 0;
+
+    int32_t hdr[6];
+    size_t n_topk_records = 0;
+    while (fread(hdr, sizeof(int32_t), 6, f) == 6) {
+        const int32_t tid    = hdr[0];
+        const int32_t layer  = hdr[1];
+        const int32_t call   = hdr[2];
+        const int32_t ne0    = hdr[3];
+        const int32_t ne1    = hdr[4];
+        const int32_t dtype  = hdr[5];
+        const size_t nbytes  = (size_t) ne0 * ne1 * 4;
+
+        // Keep only the i32 topk records for decode steps (single-token, call >= 1).
+        if (tid != 2 || dtype != 1 || call < 1 || ne1 != 1) {
+            if (fseek(f, (long) nbytes, SEEK_CUR) != 0) {
+                LLAMA_LOG_ERROR("%s: seek past record failed\n", __func__);
+                fclose(f);
+                return false;
+            }
+            continue;
+        }
+
+        if (layer < 0) {
+            fseek(f, (long) nbytes, SEEK_CUR);
+            continue;
+        }
+        if (layer > max_layer) {
+            max_layer = layer;
+            per_layer.resize(layer + 1);
+        }
+        if ((size_t) call >= per_layer[layer].size()) {
+            per_layer[layer].resize(call + 1);
+        }
+
+        std::vector<int32_t> ids(ne0);
+        if (fread(ids.data(), 4, ne0, f) != (size_t) ne0) {
+            LLAMA_LOG_ERROR("%s: short read for topk record\n", __func__);
+            fclose(f);
+            return false;
+        }
+        per_layer[layer][call] = std::move(ids);
+        if (call > max_step) {
+            max_step = call;
+        }
+        ++n_topk_records;
+    }
+    fclose(f);
+
+    if (n_topk_records == 0) {
+        LLAMA_LOG_ERROR("%s: no decode-step topk records found in '%s'\n", __func__, path);
+        return false;
+    }
+
+    // Rebuild per-managed-layer oracle table indexed by cache->layers order.
+    cache->oracle_experts.clear();
+    cache->oracle_experts.reserve(cache->layers.size());
+    cache->oracle_layer_to_idx.assign((size_t) (max_layer + 1), -1);
+    for (size_t i = 0; i < cache->layers.size(); ++i) {
+        const int L = cache->layers[i].layer;
+        cache->oracle_layer_to_idx[L] = (int32_t) i;
+        if (L < (int) per_layer.size()) {
+            cache->oracle_experts.push_back(std::move(per_layer[L]));
+        } else {
+            cache->oracle_experts.emplace_back();
+        }
+    }
+    cache->oracle_max_step = max_step;
+    cache->oracle_loaded   = true;
+
+    LLAMA_LOG_INFO("%s: oracle loaded from %s: %zu topk records, max_step=%d, %zu managed layers covered\n",
+                   __func__, path, n_topk_records, max_step, cache->layers.size());
+    return true;
+}
+
+bool llama_moe_expert_cache_has_oracle(const llama_moe_expert_cache * cache) {
+    return cache && cache->oracle_loaded;
+}
+
+void llama_moe_expert_cache_prefill_step(
+        llama_moe_expert_cache * cache,
+        int call_idx,
+        int /*over_fetch*/) {
+    if (!cache || !cache->oracle_loaded) {
+        return;
+    }
+    if (call_idx < 1 || call_idx > cache->oracle_max_step) {
+        return;
+    }
+    for (size_t i = 0; i < cache->layers.size(); ++i) {
+        auto & L = cache->layers[i];
+        if ((int) i >= (int) cache->oracle_experts.size()) {
+            continue;
+        }
+        const auto & steps = cache->oracle_experts[i];
+        if ((size_t) call_idx >= steps.size()) {
+            continue;
+        }
+        const auto & ids = steps[call_idx];
+        for (int32_t e : ids) {
+            if (e < 0 || e >= L.n_expert) {
+                continue;
+            }
+            if (L.slot_valid[e]) {
+                cache->n_hits++;
+                L.slot_lru[e] = ++L.lru_counter;
+                continue;
+            }
+            cache->n_misses++;
+            llama_moe_expert_cache_fill_sync(cache, L.layer, e);
+        }
     }
 }

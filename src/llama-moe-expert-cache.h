@@ -85,6 +85,14 @@ struct llama_moe_expert_cache {
     // One entry per ncmoe-managed MoE layer (sorted by layer index).
     std::vector<llama_moe_expert_cache_layer> layers;
 
+    // Oracle: per-layer per-decode-step list of expert ids the router selected.
+    // Indexed as oracle_experts[layer_idx_in_oracle][step_idx]. layer_to_oracle maps
+    // a model layer index to its slot in oracle_experts (or -1 if not in trace).
+    bool                                                    oracle_loaded = false;
+    std::vector<std::vector<std::vector<int32_t>>>          oracle_experts;
+    std::vector<int32_t>                                    oracle_layer_to_idx; // size = n_layer
+    int32_t                                                 oracle_max_step = 0;
+
     // Stats (for diagnostics / bench reporting).
     uint64_t n_hits      = 0;
     uint64_t n_misses    = 0;
@@ -126,6 +134,34 @@ bool llama_moe_expert_cache_fill_sync(
         llama_moe_expert_cache * cache,
         int layer,
         int expert);
+
+// Oracle: load a MOE2-format trace and use it to predict which experts each layer
+// will select at each decode step. Returns true on success. On success, the cache
+// switches to oracle mode and the auto-warmup is skipped; per-step prefills happen
+// via `llama_moe_expert_cache_prefill_step`.
+//
+// MOE2 format (see examples/moe-trace/moe-trace.cpp):
+//   bytes 0..3 : "MOE2"
+//   records: int32 hdr[6] = { tid, layer, call_idx, ne0, ne1, dtype } + payload bytes
+//            tid 2 = ffn_moe_topk (i32) — the selected expert IDs
+// Only tid==2, decode-step records (call_idx >= 1, ne1 == 1) are kept.
+bool llama_moe_expert_cache_load_oracle(
+        llama_moe_expert_cache * cache,
+        const char * path);
+
+// Returns true if an oracle has been loaded.
+bool llama_moe_expert_cache_has_oracle(const llama_moe_expert_cache * cache);
+
+// For step `call_idx` (1-indexed decode step matching the trace), look up the
+// oracle's predicted experts for each managed layer and sync-fill any that aren't
+// already in the cache. Increments hit/miss counters.
+//
+// `over_fetch` is currently ignored (Phase 1 cache holds all slots so there is no
+// notion of over-fetch yet — the parameter is there for the Phase 2 interface).
+void llama_moe_expert_cache_prefill_step(
+        llama_moe_expert_cache * cache,
+        int call_idx,
+        int over_fetch = 0);
 
 // Fill EVERY expert slot of EVERY managed layer. Equivalent to "copy all the CPU
 // expert tensors to GPU once". Lets us A/B-test the cache plumbing against a known-

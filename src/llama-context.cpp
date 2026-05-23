@@ -3339,6 +3339,49 @@ void llama_context::opt_epoch(
 // interface implementation
 //
 
+bool llama_context::load_moe_oracle(const char * path) {
+    if (!moe_expert_cache) {
+        LLAMA_LOG_WARN("%s: MoE expert cache is not enabled; pass moe_expert_cache_size > 0\n", __func__);
+        return false;
+    }
+    return llama_moe_expert_cache_load_oracle(moe_expert_cache.get(), path);
+}
+
+void llama_context::moe_oracle_prefill(int call_idx) {
+    if (!moe_expert_cache) {
+        return;
+    }
+    llama_moe_expert_cache_prefill_step(moe_expert_cache.get(), call_idx, 0);
+}
+
+void llama_context::moe_cache_clear() {
+    if (!moe_expert_cache) {
+        return;
+    }
+    llama_moe_expert_cache_invalidate_all(moe_expert_cache.get());
+}
+
+bool llama_moe_oracle_load(struct llama_context * ctx, const char * path) {
+    if (!ctx) {
+        return false;
+    }
+    return ctx->load_moe_oracle(path);
+}
+
+void llama_moe_oracle_prefill(struct llama_context * ctx, int call_idx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->moe_oracle_prefill(call_idx);
+}
+
+void llama_moe_cache_clear(struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->moe_cache_clear();
+}
+
 llama_context_params llama_context_default_params() {
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
