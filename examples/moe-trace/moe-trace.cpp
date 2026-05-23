@@ -109,6 +109,7 @@ int main(int argc, char ** argv) {
     int  n_cpu_moe           = 0;   // -ncmoe N: offload first N layers' MoE expert tensors to CPU
     int  moe_cache_size      = 0;   // -moecache C: per-layer GPU expert cache slots (0 = disabled)
     std::string oracle_path  = "";  // --oracle path: replay MOE2 trace to drive selective fills
+    int  lookahead           = 0;   // --lookahead K: speculative prefill K steps ahead each iter
     bool wrap                = true; // wrap prompt in the Qwen chat template
     bool no_mmap             = false;
     bool no_trace            = false;
@@ -128,6 +129,7 @@ int main(int argc, char ** argv) {
         else if (a == "-ncmoe" || a == "--n-cpu-moe")    n_cpu_moe      = atoi(next("-ncmoe"));
         else if (a == "-moecache" || a == "--moe-cache-size") moe_cache_size = atoi(next("-moecache"));
         else if (a == "--oracle")    oracle_path = next("--oracle");
+        else if (a == "--lookahead") lookahead  = atoi(next("--lookahead"));
         else if (a == "--raw")       wrap       = false;
         else if (a == "--no-mmap")   no_mmap    = true;
         else if (a == "--no-trace")  no_trace   = true;
@@ -218,6 +220,15 @@ int main(int argc, char ** argv) {
         }
         // Throw away the post-ctor warmup; oracle prefill should start from cold.
         llama_moe_cache_clear(ctx);
+
+        // Pre-issue fills for step 1 (+ lookahead). These run on the copy stream
+        // while the host walks into the first decode call. The fill event is
+        // recorded after every prefill_step; the matching wait is queued on the
+        // compute stream right before each `llama_decode` below.
+        llama_moe_oracle_prefill(ctx, 1);
+        for (int k = 1; k <= lookahead; k++) {
+            llama_moe_oracle_prefill(ctx, 1 + k);
+        }
     }
 
     llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -244,7 +255,12 @@ int main(int argc, char ** argv) {
 
         st.call_idx = call;
         if (!oracle_path.empty()) {
-            llama_moe_oracle_prefill(ctx, call);
+            // Queue the compute-stream wait FIRST so it captures the event state
+            // produced by the previous iteration's prefills (i.e. fills for step
+            // `call`). Then issue prefills for the NEXT step(s) — those run on the
+            // copy stream concurrently with the decode we're about to submit.
+            llama_moe_oracle_wait_fills(ctx);
+            llama_moe_oracle_prefill(ctx, call + 1 + lookahead);
         }
         if (llama_decode(ctx, llama_batch_get_one(&id, 1))) {
             fprintf(stderr, "decode failed at step %d\n", n_decode);

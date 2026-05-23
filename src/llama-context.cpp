@@ -3351,7 +3351,17 @@ void llama_context::moe_oracle_prefill(int call_idx) {
     if (!moe_expert_cache) {
         return;
     }
+    // Issue async H2D fills + stamp the fill event. Does NOT queue the compute-stream
+    // wait — that's a separate call so the caller can stage prefills ahead of the
+    // upcoming decode (speculative lookahead).
     llama_moe_expert_cache_prefill_step(moe_expert_cache.get(), call_idx, 0);
+}
+
+void llama_context::moe_oracle_wait_fills() {
+    if (!moe_expert_cache || !moe_expert_cache->backend) {
+        return;
+    }
+    llama_moe_expert_cache_wait_fills(moe_expert_cache.get(), moe_expert_cache->backend);
 }
 
 void llama_context::moe_cache_clear() {
@@ -3373,6 +3383,13 @@ void llama_moe_oracle_prefill(struct llama_context * ctx, int call_idx) {
         return;
     }
     ctx->moe_oracle_prefill(call_idx);
+}
+
+void llama_moe_oracle_wait_fills(struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->moe_oracle_wait_fills();
 }
 
 void llama_moe_cache_clear(struct llama_context * ctx) {

@@ -38,6 +38,12 @@ void llama_moe_expert_cache_free(llama_moe_expert_cache * cache) {
                        lookups ? 100.0 * cache->n_hits / lookups : 0.0,
                        (unsigned long long) cache->n_fills);
     }
+    if (cache->fill_event) {
+        ggml_backend_event_free(cache->fill_event);
+    }
+    if (cache->copy_backend) {
+        ggml_backend_free(cache->copy_backend);
+    }
     // The buffer & context unique_ptrs free themselves.
     delete cache;
 }
@@ -176,6 +182,20 @@ void llama_moe_expert_cache_allocate(
         throw std::runtime_error("MoE expert cache: backend buffer allocation failed");
     }
 
+    // Spin up a second backend instance on the SAME device for async fills. Its stream
+    // runs concurrently with the compute backend's stream → H2D copies can overlap
+    // with the compute kernel that reads them (when fills land before the kernel).
+    auto * dev = ggml_backend_get_device(gpu_backend);
+    cache->copy_backend = ggml_backend_dev_init(dev, nullptr);
+    if (cache->copy_backend) {
+        cache->fill_event = ggml_backend_event_new(dev);
+        cache->async_fill = (cache->fill_event != nullptr);
+        LLAMA_LOG_INFO("%s: async fill enabled (%s on the same device for the copy stream)\n",
+                       __func__, ggml_backend_name(cache->copy_backend));
+    } else {
+        LLAMA_LOG_WARN("%s: failed to init copy backend; falling back to sync fills\n", __func__);
+    }
+
     const size_t mb = ggml_backend_buffer_get_size(cache->buf.get()) / (1024 * 1024);
     LLAMA_LOG_INFO(
         "%s: MoE expert cache allocated on %s: %zu managed layers x %d slots/layer = %zu MiB total\n",
@@ -240,6 +260,8 @@ bool llama_moe_expert_cache_fill_sync(
     // Phase 1: slot == expert id (full-size shadow).
     const int slot = expert;
 
+    const bool use_async = cache->async_fill && cache->copy_backend;
+
     auto copy_one = [&](ggml_tensor * cache_t, const ggml_tensor * src_t) {
         if (!cache_t || !src_t) {
             return;
@@ -251,7 +273,11 @@ bool llama_moe_expert_cache_fill_sync(
         const size_t src_off    = (size_t) expert * src_t->nb[2];
         const size_t dst_off    = (size_t) slot   * cache_t->nb[2];
         const char * src_data   = (const char *) src_t->data + src_off;
-        ggml_backend_tensor_set(cache_t, src_data, dst_off, slab_bytes);
+        if (use_async) {
+            ggml_backend_tensor_set_async(cache->copy_backend, cache_t, src_data, dst_off, slab_bytes);
+        } else {
+            ggml_backend_tensor_set(cache_t, src_data, dst_off, slab_bytes);
+        }
     };
 
     copy_one(L->cache_up,   L->src_up);
@@ -410,6 +436,7 @@ void llama_moe_expert_cache_prefill_step(
     if (call_idx < 1 || call_idx > cache->oracle_max_step) {
         return;
     }
+    bool issued_any = false;
     for (size_t i = 0; i < cache->layers.size(); ++i) {
         auto & L = cache->layers[i];
         if ((int) i >= (int) cache->oracle_experts.size()) {
@@ -430,7 +457,29 @@ void llama_moe_expert_cache_prefill_step(
                 continue;
             }
             cache->n_misses++;
-            llama_moe_expert_cache_fill_sync(cache, L.layer, e);
+            if (llama_moe_expert_cache_fill_sync(cache, L.layer, e)) {
+                issued_any = true;
+            }
         }
     }
+    // Stamp the copy-stream event so subsequent waits on the compute backend block
+    // until these fills land. Always record, even if no fills were issued — that way
+    // the event reflects "everything submitted up to now is done", which is the
+    // contract `llama_moe_expert_cache_wait_fills` expects.
+    if (cache->async_fill && cache->fill_event && cache->copy_backend) {
+        ggml_backend_event_record(cache->fill_event, cache->copy_backend);
+    }
+    (void) issued_any;
+}
+
+void llama_moe_expert_cache_wait_fills(
+        llama_moe_expert_cache * cache,
+        ggml_backend_t compute_backend) {
+    if (!cache || !cache->async_fill || !cache->fill_event || !compute_backend) {
+        return;
+    }
+    // Cross-stream sync: make the compute stream block on the fill event. Async on
+    // the host (queues a stream-wait-event), so the host can return immediately and
+    // queue the compute graph on top of the wait.
+    ggml_backend_event_wait(compute_backend, cache->fill_event);
 }

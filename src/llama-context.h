@@ -249,6 +249,7 @@ public:
     // [EXPERIMENTAL] MoE expert cache controls (called through the public C API).
     bool load_moe_oracle(const char * path);
     void moe_oracle_prefill(int call_idx);
+    void moe_oracle_wait_fills();
     void moe_cache_clear();
 
 private:

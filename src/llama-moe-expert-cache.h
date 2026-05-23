@@ -77,6 +77,15 @@ struct llama_moe_expert_cache {
     ggml_backend_t       backend = nullptr;
     ggml_backend_buffer_type_t buft = nullptr;
 
+    // [EXPERIMENTAL] dedicated CUDA copy stream + event for async fills. The copy
+    // backend is a second ggml backend instance bound to the SAME device as `backend`,
+    // so its stream runs concurrently with the compute stream. `fill_event` is recorded
+    // on the copy stream after a batch of fills; the compute stream waits on it before
+    // running the kernel that reads the filled slots. Both are owned by this struct.
+    ggml_backend_t       copy_backend = nullptr;
+    ggml_backend_event_t fill_event   = nullptr;
+    bool                 async_fill   = false;  // false → fall back to sync (no copy stream)
+
     // ggml_context holding the cache tensor metadata; backend buffer holding their data.
     // Both owned by this struct via unique_ptr<...>.
     ggml_context_ptr        ctx;
@@ -153,8 +162,12 @@ bool llama_moe_expert_cache_load_oracle(
 bool llama_moe_expert_cache_has_oracle(const llama_moe_expert_cache * cache);
 
 // For step `call_idx` (1-indexed decode step matching the trace), look up the
-// oracle's predicted experts for each managed layer and sync-fill any that aren't
-// already in the cache. Increments hit/miss counters.
+// oracle's predicted experts for each managed layer and fill any that aren't
+// already in the cache. Fills run async on the dedicated copy stream when
+// available (initialized in `..._allocate`); otherwise synchronous.
+//
+// Records the cache's fill event after issuing; `..._wait_fills` queues the
+// matching cross-stream wait on the compute backend's stream.
 //
 // `over_fetch` is currently ignored (Phase 1 cache holds all slots so there is no
 // notion of over-fetch yet — the parameter is there for the Phase 2 interface).
@@ -162,6 +175,15 @@ void llama_moe_expert_cache_prefill_step(
         llama_moe_expert_cache * cache,
         int call_idx,
         int over_fetch = 0);
+
+// Cross-stream sync: queue a stream-wait-event on `compute_backend`'s stream so
+// that any subsequently-submitted compute work blocks until the most recent
+// prefill batch has landed. Host-side this is non-blocking (just queues the
+// wait). Called by the public llama_moe_oracle_prefill wrapper after the fills
+// are issued.
+void llama_moe_expert_cache_wait_fills(
+        llama_moe_expert_cache * cache,
+        ggml_backend_t compute_backend);
 
 // Fill EVERY expert slot of EVERY managed layer. Equivalent to "copy all the CPU
 // expert tensors to GPU once". Lets us A/B-test the cache plumbing against a known-

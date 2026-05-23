@@ -456,9 +456,17 @@ extern "C" {
     // `llama_moe_oracle_load` then `llama_moe_cache_clear`, and call
     // `llama_moe_oracle_prefill(ctx, call_idx)` before each `llama_decode` whose step
     // index matches the trace's `call_idx`.
-    LLAMA_API bool llama_moe_oracle_load   (struct llama_context * ctx, const char * path);
-    LLAMA_API void llama_moe_oracle_prefill(struct llama_context * ctx, int call_idx);
-    LLAMA_API void llama_moe_cache_clear   (struct llama_context * ctx);
+    LLAMA_API bool llama_moe_oracle_load       (struct llama_context * ctx, const char * path);
+    // Issue async fills for the experts the oracle predicts will be used at decode
+    // step `call_idx`. Returns immediately; the actual H2D copies run on a dedicated
+    // CUDA copy stream. Caller must invoke `llama_moe_oracle_wait_fills` before the
+    // `llama_decode` that *needs* those experts to be present in the cache.
+    LLAMA_API void llama_moe_oracle_prefill    (struct llama_context * ctx, int call_idx);
+    // Queue a cross-stream wait on the compute backend's stream so that any
+    // subsequently-submitted compute work blocks until the most-recent prefill batch
+    // has completed. Non-blocking on the host.
+    LLAMA_API void llama_moe_oracle_wait_fills (struct llama_context * ctx);
+    LLAMA_API void llama_moe_cache_clear       (struct llama_context * ctx);
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 
