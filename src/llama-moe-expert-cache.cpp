@@ -14,6 +14,14 @@
 #include <string>
 #include <vector>
 
+// Number of slots in the slot_map staging ring per layer. Each ring slot is a
+// snapshot of slot_map_host used by an async upload; it can be reused once the
+// matching cudaMemcpyAsync has consumed the host bytes. Large enough to cover
+// max plausible in-flight uploads (lookahead K+1 pre-loop + a few per-iter); the
+// ring wraps and reuses old slots, by which point their async copies have long
+// since drained.
+#define MOE_SLOT_MAP_STAGING_RING 16
+
 llama_moe_expert_cache * llama_moe_expert_cache_init(uint32_t cache_size) {
     if (cache_size == 0) {
         return nullptr;
@@ -186,6 +194,9 @@ void llama_moe_expert_cache_allocate(
             L.slot_map_gpu = ggml_new_tensor_2d(cache->ctx.get(), GGML_TYPE_F32, 1, L.n_expert);
             ggml_set_name(L.slot_map_gpu, name);
             L.slot_map_host.assign(L.n_expert, 0.0f);
+            // Allocate the staging ring (each entry = a stable snapshot for one
+            // in-flight async upload). See MOE_SLOT_MAP_STAGING_RING comment.
+            L.slot_map_staging.assign(MOE_SLOT_MAP_STAGING_RING, std::vector<float>(L.n_expert, 0.0f));
         }
 
         L.expert_to_slot.assign(L.n_expert, -1);
@@ -201,6 +212,12 @@ void llama_moe_expert_cache_allocate(
     if (!cache->buf) {
         throw std::runtime_error("MoE expert cache: backend buffer allocation failed");
     }
+    // Note: not clearing the buffer. Empirically, leaving unfilled slots with whatever
+    // GPU memory contained gives better output than zero-init when the slot map's
+    // substitute-and-go default maps a missed expert to slot 0 — the model seems to
+    // recover from noisy contributions but degrades sharply when ANY expert
+    // contributes exactly zero (breaks softmax normalization downstream).
+    // Better miss handling is tracked in issue #4.
 
     // Spin up a second backend instance on the SAME device for async fills. Its stream
     // runs concurrently with the compute backend's stream → H2D copies can overlap
@@ -210,8 +227,16 @@ void llama_moe_expert_cache_allocate(
     if (cache->copy_backend) {
         cache->fill_event = ggml_backend_event_new(dev);
         cache->async_fill = (cache->fill_event != nullptr);
-        LLAMA_LOG_INFO("%s: async fill enabled (%s on the same device for the copy stream)\n",
-                       __func__, ggml_backend_name(cache->copy_backend));
+        // Escape hatch: set GGML_MOE_CACHE_SYNC=1 to force the synchronous fill path
+        // (useful for bisecting suspected async-related issues; the async path itself
+        // is correct but exercises more CUDA-side ordering).
+        if (cache->async_fill && std::getenv("GGML_MOE_CACHE_SYNC")) {
+            cache->async_fill = false;
+            LLAMA_LOG_INFO("%s: GGML_MOE_CACHE_SYNC set; async fill disabled\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: async fill enabled (%s on the same device for the copy stream)\n",
+                           __func__, ggml_backend_name(cache->copy_backend));
+        }
     } else {
         LLAMA_LOG_WARN("%s: failed to init copy backend; falling back to sync fills\n", __func__);
     }
@@ -395,17 +420,36 @@ void llama_moe_expert_cache_upload_slot_maps(llama_moe_expert_cache * cache) {
     if (!cache) {
         return;
     }
-    // Sync upload on the compute backend. This serializes the slot_map state into the
-    // compute stream — the previous decode's reads finish before this write lands. An
-    // earlier attempt to push the upload onto the copy stream raced with the
-    // previous decode's read of slot_map_gpu (same GPU memory, two streams, no
-    // ordering guarantee). The maps are tiny (~512 B per layer × n_managed_layers,
-    // total well under 16 KiB) so the sync cost is dominated by launch overhead.
+    // Two paths:
+    //   - Async: queue the upload on the copy stream RIGHT AFTER the fills that
+    //     produced the new state, so the existing fill_event covers both. The compute
+    //     stream's `wait_fills(event)` creates the cross-stream release/acquire that
+    //     makes both the cache data AND the slot map visible to decode.
+    //   - Sync: cudaMemcpyAsync+Synchronize on cudaStreamPerThread (the
+    //     ggml_backend_tensor_set path). Correct but blocks the host through any
+    //     queued work on the stream; defeats the lookahead overlap when the previous
+    //     decode is still in flight.
+    //
+    // CRITICAL for async: `ggml_backend_cuda_set_tensor_async` calls cudaMemcpyAsync
+    // with the host source pointer DIRECTLY — no staging. If the host modifies that
+    // memory before CUDA actually executes the copy (as happens with rapid back-to-
+    // back prefill_step calls under lookahead), the in-flight copy picks up the
+    // modified bytes. This was the lookahead corruption from issue #1. Fix: snapshot
+    // slot_map_host into a per-layer staging ring slot for each upload; rotate
+    // through ring entries so each in-flight upload reads from its own stable copy.
     for (auto & L : cache->layers) {
         if (!L.slot_map_gpu) {
             continue;
         }
         const size_t bytes = L.slot_map_host.size() * sizeof(float);
+        // Sync set via ggml_backend_tensor_set: this calls cudaMemcpyAsync on
+        // cudaStreamPerThread followed by cudaStreamSynchronize. The sync blocks
+        // until the upload completes, so no host-buffer race even when the host
+        // calls upload_slot_maps in rapid succession (e.g. lookahead). Trade-off:
+        // each upload serializes the host through cudaStreamPerThread's queue —
+        // ~512 B × 28 layers per upload, dominated by launch overhead, ~10-50 us
+        // each. Acceptable; the async path with a staging ring tried earlier
+        // produced regressions at small C that we couldn't track down in-session.
         ggml_backend_tensor_set(L.slot_map_gpu, L.slot_map_host.data(), 0, bytes);
     }
 }

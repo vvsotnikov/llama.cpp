@@ -64,6 +64,15 @@ struct llama_moe_expert_cache_layer {
     // produces garbage but doesn't OOB. With a perfect oracle this never happens.)
     std::vector<float> slot_map_host;
 
+    // Per-layer ring of pinned host staging buffers for the async slot_map upload.
+    // `ggml_backend_tensor_set_async` does NOT stage internally — the cudaMemcpyAsync
+    // reads from the host source pointer at copy-execution time. If the host modifies
+    // that source before the copy actually runs (e.g. between rapid prefill_step
+    // calls when using lookahead), the in-flight copy gets the modified bytes. The
+    // ring lets us snapshot slot_map_host into a stable buffer per upload.
+    std::vector<std::vector<float>> slot_map_staging; // size MOE_STAGING_RING
+    int                             slot_map_staging_next = 0;
+
     // GPU mirror of slot_map_host (lives in the same cache backend buffer).
     // Shape [1, n_expert], type F32.
     struct ggml_tensor * slot_map_gpu = nullptr;
