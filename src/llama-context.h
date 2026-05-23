@@ -6,11 +6,13 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
+#include "llama-moe-expert-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
@@ -274,6 +276,13 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     std::unique_ptr<llama_memory_i> memory;
+
+    // [EXPERIMENTAL] persistent GPU cache of MoE expert weights for speculative prefetch.
+    // Constructed in the llama_context ctor when cparams.moe_expert_cache_size > 0.
+    struct moe_expert_cache_deleter {
+        void operator()(llama_moe_expert_cache * p) const { llama_moe_expert_cache_free(p); }
+    };
+    std::unique_ptr<llama_moe_expert_cache, moe_expert_cache_deleter> moe_expert_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

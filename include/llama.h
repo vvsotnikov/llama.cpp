@@ -361,6 +361,13 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
+        // [EXPERIMENTAL] per-layer GPU cache size (number of expert slots) for MoE expert prefetch.
+        // 0 disables the cache and the model uses regular expert tensors. Non-zero allocates one
+        // [n_embd, n_ff, moe_expert_cache_size] cache tensor per ncmoe-managed MoE layer's expert
+        // matrix (ffn_up_exps / ffn_gate_exps / ffn_down_exps), with experts streamed in from CPU
+        // on demand and (eventually) speculatively prefetched ahead of compute.
+        uint32_t moe_expert_cache_size;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 

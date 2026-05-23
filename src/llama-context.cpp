@@ -85,6 +85,9 @@ llama_context::llama_context(
 
     cparams.ctx_type          = params.ctx_type;
 
+    // [EXPERIMENTAL] MoE expert prefetch cache — see llama-moe-expert-cache.h
+    moe_expert_cache.reset(llama_moe_expert_cache_init(params.moe_expert_cache_size));
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -366,6 +369,24 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        }
+
+        // [EXPERIMENTAL] allocate the MoE expert cache BEFORE sched_reserve so the
+        // worst-case graph reservation sees the (eventually) cache-backed mul_mat_id.
+        if (moe_expert_cache) {
+            std::vector<ggml_backend_t> backend_list;
+            backend_list.reserve(backends.size());
+            for (auto & b : backends) {
+                backend_list.push_back(b.get());
+            }
+            llama_moe_expert_cache_allocate(moe_expert_cache.get(), model, backend_list);
+
+            // Phase 1 sanity warmup: copy every (layer, expert) slab from CPU to the
+            // cache once. With slot == expert this makes the cache byte-equivalent to
+            // having the experts loaded on GPU directly, so we can verify the plumbing
+            // (graph swap + mul_mat_id reading from cache) before adding any predictor
+            // or fill policy. Disable later when we want to A/B against partial fills.
+            llama_moe_expert_cache_warmup_all(moe_expert_cache.get());
         }
 
         sched_reserve();
@@ -2284,6 +2305,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.moe_cache   =*/ moe_expert_cache.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3341,6 +3363,7 @@ llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
+        /*.moe_expert_cache_size       =*/ 0,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,

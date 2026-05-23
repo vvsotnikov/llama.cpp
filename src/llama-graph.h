@@ -546,6 +546,11 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
+    // [EXPERIMENTAL] MoE expert prefetch cache — model graphs use this to swap the
+    // CPU-resident expert tensors for GPU cache tensors in `mul_mat_id` (Phase 1) and
+    // later to emit a remap-ids op (Phase 2). nullptr when the cache is disabled.
+    const struct llama_moe_expert_cache * moe_cache = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -762,6 +767,9 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    // [EXPERIMENTAL] MoE expert prefetch cache; nullptr when disabled.
+    const struct llama_moe_expert_cache * moe_cache = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

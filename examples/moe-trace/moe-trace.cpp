@@ -18,7 +18,9 @@
 #include "llama.h"
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"  // ggml_backend_cpu_buffer_type for -ncmoe overrides
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -99,12 +101,16 @@ static bool moe_trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
 
 int main(int argc, char ** argv) {
     std::string model_path;
-    std::string out_path  = "trace.bin";
-    std::string prompt    = "Explain why the sky is blue.";
-    int  n_predict = 400;
-    int  ngl       = 0;   // CPU backend by default: no op fusion, host-readable tensors
-    int  n_threads = 24;
-    bool wrap      = true; // wrap prompt in the Qwen chat template
+    std::string out_path     = "trace.bin";
+    std::string prompt       = "Explain why the sky is blue.";
+    int  n_predict           = 400;
+    int  ngl                 = 0;   // CPU backend by default: no op fusion, host-readable tensors
+    int  n_threads           = 24;
+    int  n_cpu_moe           = 0;   // -ncmoe N: offload first N layers' MoE expert tensors to CPU
+    int  moe_cache_size      = 0;   // -moecache C: per-layer GPU expert cache slots (0 = disabled)
+    bool wrap                = true; // wrap prompt in the Qwen chat template
+    bool no_mmap             = false;
+    bool no_trace            = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -112,17 +118,24 @@ int main(int argc, char ** argv) {
             if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", what); exit(1); }
             return argv[++i];
         };
-        if      (a == "-m")    model_path = next("-m");
-        else if (a == "-o")    out_path   = next("-o");
-        else if (a == "-p")    prompt     = next("-p");
-        else if (a == "-n")    n_predict  = atoi(next("-n"));
-        else if (a == "-ngl")  ngl        = atoi(next("-ngl"));
-        else if (a == "-t")    n_threads  = atoi(next("-t"));
-        else if (a == "--raw") wrap       = false;
+        if      (a == "-m")          model_path = next("-m");
+        else if (a == "-o")          out_path   = next("-o");
+        else if (a == "-p")          prompt     = next("-p");
+        else if (a == "-n")          n_predict  = atoi(next("-n"));
+        else if (a == "-ngl")        ngl        = atoi(next("-ngl"));
+        else if (a == "-t")          n_threads  = atoi(next("-t"));
+        else if (a == "-ncmoe" || a == "--n-cpu-moe")    n_cpu_moe      = atoi(next("-ncmoe"));
+        else if (a == "-moecache" || a == "--moe-cache-size") moe_cache_size = atoi(next("-moecache"));
+        else if (a == "--raw")       wrap       = false;
+        else if (a == "--no-mmap")   no_mmap    = true;
+        else if (a == "--no-trace")  no_trace   = true;
         else { fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 1; }
     }
     if (model_path.empty()) {
-        fprintf(stderr, "usage: %s -m model.gguf [-p prompt] [-o out.bin] [-n n_predict] [-ngl n] [-t threads] [--raw]\n", argv[0]);
+        fprintf(stderr,
+            "usage: %s -m model.gguf [-p prompt] [-o out.bin] [-n n_predict] [-ngl n] [-t threads] "
+            "[-ncmoe N] [-moecache C] [--raw] [--no-mmap] [--no-trace]\n",
+            argv[0]);
         return 1;
     }
 
@@ -130,6 +143,27 @@ int main(int argc, char ** argv) {
 
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = ngl;
+    mp.use_mmap     = !no_mmap;
+
+    // -ncmoe N: offload the first N layers' MoE expert tensors to CPU via per-layer
+    // tensor_buft_overrides matching common's -ncmoe pattern. Storage must outlive load.
+    std::vector<std::string> ncmoe_patterns;
+    std::vector<llama_model_tensor_buft_override> overrides;
+    if (n_cpu_moe > 0) {
+        ncmoe_patterns.reserve(n_cpu_moe);
+        for (int L = 0; L < n_cpu_moe; L++) {
+            char buf[80];
+            snprintf(buf, sizeof(buf), "blk\\.%d\\.ffn_(up|down|gate|gate_up)_(ch|)exps", L);
+            ncmoe_patterns.emplace_back(buf);
+        }
+        overrides.reserve(ncmoe_patterns.size() + 1);
+        for (const auto & p : ncmoe_patterns) {
+            overrides.push_back({ p.c_str(), ggml_backend_cpu_buffer_type() });
+        }
+        overrides.push_back({ nullptr, nullptr });  // sentinel
+        mp.tensor_buft_overrides = overrides.data();
+    }
+
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) { fprintf(stderr, "failed to load model\n"); return 1; }
 
@@ -148,19 +182,24 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "prompt tokens: %d\n", n_prompt);
 
     trace_state st;
-    st.out = fopen(out_path.c_str(), "wb");
-    if (!st.out) { fprintf(stderr, "cannot open %s\n", out_path.c_str()); return 1; }
-    fwrite("MOE2", 1, 4, st.out);
+    if (!no_trace) {
+        st.out = fopen(out_path.c_str(), "wb");
+        if (!st.out) { fprintf(stderr, "cannot open %s\n", out_path.c_str()); return 1; }
+        fwrite("MOE2", 1, 4, st.out);
+    }
 
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx             = n_prompt + n_predict + 16;
-    cp.n_batch           = n_prompt > 2048 ? n_prompt : 2048;
-    cp.n_ubatch          = cp.n_batch;
-    cp.n_threads         = n_threads;
-    cp.n_threads_batch   = n_threads;
-    cp.cb_eval           = moe_trace_cb;
-    cp.cb_eval_user_data = &st;
-    cp.no_perf           = false;
+    llama_context_params cp     = llama_context_default_params();
+    cp.n_ctx                    = n_prompt + n_predict + 16;
+    cp.n_batch                  = n_prompt > 2048 ? n_prompt : 2048;
+    cp.n_ubatch                 = cp.n_batch;
+    cp.n_threads                = n_threads;
+    cp.n_threads_batch          = n_threads;
+    if (!no_trace) {
+        cp.cb_eval              = moe_trace_cb;
+        cp.cb_eval_user_data    = &st;
+    }
+    cp.moe_expert_cache_size    = (uint32_t) moe_cache_size;
+    cp.no_perf                  = false;
 
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create context\n"); return 1; }
@@ -175,6 +214,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    const auto t_decode_start = std::chrono::steady_clock::now();
     int n_decode = 0;
     for (int call = 1; n_decode < n_predict; ++call) {
         llama_token id = llama_sampler_sample(smpl, ctx, -1);
@@ -193,9 +233,19 @@ int main(int argc, char ** argv) {
         }
         n_decode++;
     }
+    const auto t_decode_end = std::chrono::steady_clock::now();
+    const double dt_s = std::chrono::duration<double>(t_decode_end - t_decode_start).count();
+    const double tok_per_s = n_decode > 0 ? n_decode / dt_s : 0.0;
 
-    fclose(st.out);
-    fprintf(stderr, "\ndone: %d generated tokens, %ld records -> %s\n", n_decode, st.n_rec, out_path.c_str());
+    if (st.out) fclose(st.out);
+    fprintf(stderr,
+        "\ndone: %d generated tokens in %.2fs = %.2f tok/s%s\n",
+        n_decode, dt_s, tok_per_s,
+        no_trace ? "" : (std::string(" (trace -> ") + out_path + ", "
+                          + std::to_string(st.n_rec) + " records)").c_str());
+    fprintf(stderr,
+        "config: ngl=%d ncmoe=%d moecache=%d mmap=%d trace=%d\n",
+        ngl, n_cpu_moe, moe_cache_size, !no_mmap, !no_trace);
 
     llama_sampler_free(smpl);
     llama_free(ctx);

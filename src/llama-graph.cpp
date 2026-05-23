@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-moe-expert-cache.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -954,6 +955,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    moe_cache        (params.moe_cache),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1379,6 +1381,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+
+    // [EXPERIMENTAL] MoE expert prefetch cache (Phase 1): when enabled for this layer,
+    // swap the CPU-resident expert tensors for the GPU cache mirrors. The cache shape
+    // matches the model's expert tensor so `mul_mat_id` reads expert_id-indexed slots
+    // unchanged. Cache fills (sync or speculative) happen out-of-band via the cache
+    // primitives; the graph just sees the GPU tensor.
+    if (moe_cache) {
+        if (ggml_tensor * cu = llama_moe_expert_cache_get_up(moe_cache, il))   { up_exps   = cu; }
+        if (ggml_tensor * cg = llama_moe_expert_cache_get_gate(moe_cache, il)) { gate_exps = cg; }
+        if (ggml_tensor * cd = llama_moe_expert_cache_get_down(moe_cache, il)) { down_exps = cd; }
+    }
 
     ggml_tensor * logits = nullptr;
 

@@ -2347,6 +2347,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"-moecache", "--moe-cache-size"}, "C",
+        "[EXPERIMENTAL] number of GPU cache slots per ncmoe-managed MoE layer for speculative "
+        "expert prefetch (0 = disabled). Each slot holds one expert's weights. Useful range: "
+        "8..64 (model has 128 experts, top-K=8 typically).",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_cache_size = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_SIZE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
