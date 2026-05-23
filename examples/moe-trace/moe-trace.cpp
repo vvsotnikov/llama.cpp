@@ -208,26 +208,23 @@ int main(int argc, char ** argv) {
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create context\n"); return 1; }
 
-    // [EXPERIMENTAL] oracle-driven MoE expert prefill.
-    if (!oracle_path.empty()) {
-        if (moe_cache_size == 0) {
-            fprintf(stderr, "--oracle requires -moecache > 0\n");
-            return 1;
-        }
-        if (!llama_moe_oracle_load(ctx, oracle_path.c_str())) {
-            fprintf(stderr, "failed to load oracle '%s'\n", oracle_path.c_str());
-            return 1;
-        }
-        // Throw away the post-ctor warmup; oracle prefill should start from cold.
-        llama_moe_cache_clear(ctx);
-
-        // Pre-issue fills for step 1 (+ lookahead). These run on the copy stream
-        // while the host walks into the first decode call. The fill event is
-        // recorded after every prefill_step; the matching wait is queued on the
-        // compute stream right before each `llama_decode` below.
-        llama_moe_oracle_prefill(ctx, 1);
-        for (int k = 1; k <= lookahead; k++) {
-            llama_moe_oracle_prefill(ctx, 1 + k);
+    // [EXPERIMENTAL] MoE expert prefill setup.
+    if (moe_cache_size > 0) {
+        if (!oracle_path.empty()) {
+            if (!llama_moe_oracle_load(ctx, oracle_path.c_str())) {
+                fprintf(stderr, "failed to load oracle '%s'\n", oracle_path.c_str());
+                return 1;
+            }
+            // Pre-issue fills for step 1 (+ lookahead). These run on the copy stream
+            // while the host walks into the first decode call.
+            llama_moe_oracle_prefill(ctx, 1);
+            for (int k = 1; k <= lookahead; k++) {
+                llama_moe_oracle_prefill(ctx, 1 + k);
+            }
+        } else {
+            // No oracle: warm the entire cache to provide the Phase-1 ceiling
+            // reference (output identical to running with experts on GPU directly).
+            llama_moe_cache_warmup_all(ctx);
         }
     }
 

@@ -467,6 +467,12 @@ extern "C" {
     // has completed. Non-blocking on the host.
     LLAMA_API void llama_moe_oracle_wait_fills (struct llama_context * ctx);
     LLAMA_API void llama_moe_cache_clear       (struct llama_context * ctx);
+    // Fill every (layer, expert) slab from CPU into the GPU cache once. Equivalent
+    // to "experts on GPU directly" once the call returns; only useful as a Phase-1
+    // ceiling reference for benchmarks. Respects the per-layer valid-slot cap (if
+    // configured smaller than n_expert, only the last C experts of each layer end
+    // up valid due to LRU eviction during the warmup).
+    LLAMA_API void llama_moe_cache_warmup_all  (struct llama_context * ctx);
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 

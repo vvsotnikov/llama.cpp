@@ -31,12 +31,13 @@ void llama_moe_expert_cache_free(llama_moe_expert_cache * cache) {
     }
     if (cache->n_hits + cache->n_misses > 0) {
         const uint64_t lookups = cache->n_hits + cache->n_misses;
-        LLAMA_LOG_INFO("%s: stats — hits=%llu misses=%llu (%.1f%% hit) fills=%llu\n",
+        LLAMA_LOG_INFO("%s: stats — hits=%llu misses=%llu (%.1f%% hit) fills=%llu evictions=%llu\n",
                        __func__,
                        (unsigned long long) cache->n_hits,
                        (unsigned long long) cache->n_misses,
                        lookups ? 100.0 * cache->n_hits / lookups : 0.0,
-                       (unsigned long long) cache->n_fills);
+                       (unsigned long long) cache->n_fills,
+                       (unsigned long long) cache->n_evictions);
     }
     if (cache->fill_event) {
         ggml_backend_event_free(cache->fill_event);
@@ -136,8 +137,11 @@ void llama_moe_expert_cache_allocate(
         L.layer    = il;
         L.n_expert = (int32_t) hparams.n_expert;
 
-        // Phase 1: C = n_expert (full-size shadow). Phase 2 will shrink this.
-        L.C = L.n_expert;
+        // Phase 1.5: GPU buffer is still full-size (no remap kernel yet), but the
+        // number of *valid* slots is capped at `cache->C`. The cap is enforced by
+        // LRU eviction in `fill_sync`. Setting C >= n_expert disables eviction (full
+        // cache available).
+        L.C = cache->C > 0 ? std::min(cache->C, L.n_expert) : L.n_expert;
 
         auto clone_managed = [&](const ggml_tensor * src, const char * base) -> ggml_tensor * {
             if (!src || !tensor_on_host(src)) {
@@ -168,10 +172,13 @@ void llama_moe_expert_cache_allocate(
         L.n_embd = (int32_t) any->ne[0];
         L.n_ff   = (int32_t) any->ne[1];
 
+        // In Phase 1.5 slot==expert addressing still holds (the GPU buffer has n_expert
+        // slots even though only C of them are "valid" at any time). The slot arrays
+        // are therefore sized to n_expert, not C.
         L.expert_to_slot.assign(L.n_expert, -1);
-        L.slot_to_expert.assign(L.C, -1);
-        L.slot_valid.assign(L.C, 0);
-        L.slot_lru.assign(L.C, 0);
+        L.slot_to_expert.assign(L.n_expert, -1);
+        L.slot_valid.assign(L.n_expert, 0);
+        L.slot_lru.assign(L.n_expert, 0);
 
         cache->layers.push_back(std::move(L));
     }
@@ -197,13 +204,18 @@ void llama_moe_expert_cache_allocate(
     }
 
     const size_t mb = ggml_backend_buffer_get_size(cache->buf.get()) / (1024 * 1024);
+    const int    eff_C = cache->layers.empty() ? 0 : cache->layers.front().C;
+    const int    n_exp = cache->layers.empty() ? 0 : cache->layers.front().n_expert;
     LLAMA_LOG_INFO(
-        "%s: MoE expert cache allocated on %s: %zu managed layers x %d slots/layer = %zu MiB total\n",
+        "%s: MoE expert cache allocated on %s: %zu managed layers, GPU buffer = %d slots/layer "
+        "(= %zu MiB), valid-slot cap (LRU) = %d/%d\n",
         __func__,
         ggml_backend_buft_name(cache->buft),
         cache->layers.size(),
-        cache->layers.front().C,
-        mb);
+        n_exp,
+        mb,
+        eff_C,
+        n_exp);
 }
 
 static const llama_moe_expert_cache_layer * find_layer(const llama_moe_expert_cache * cache, int layer) {
@@ -257,7 +269,33 @@ bool llama_moe_expert_cache_fill_sync(
     if (expert < 0 || expert >= L->n_expert) {
         return false;
     }
-    // Phase 1: slot == expert id (full-size shadow).
+    // Phase 1.5: slot == expert id (still using the full-size GPU buffer); but if the
+    // count of valid slots is already at the configured cap C, LRU-evict one before
+    // marking the new slot valid. The evicted slot's bytes stay in GPU memory but
+    // `slot_valid` flips to 0, so the next prefill_step sees a miss for that expert
+    // and refills. This is what the cache-size sweep measures.
+    if (L->C < L->n_expert && !L->slot_valid[expert]) {
+        int valid_count = 0;
+        for (uint8_t v : L->slot_valid) {
+            if (v) valid_count++;
+        }
+        if (valid_count >= L->C) {
+            int   victim     = -1;
+            uint64_t min_lru = UINT64_MAX;
+            for (int s = 0; s < L->n_expert; ++s) {
+                if (L->slot_valid[s] && L->slot_lru[s] < min_lru) {
+                    min_lru = L->slot_lru[s];
+                    victim  = s;
+                }
+            }
+            if (victim >= 0) {
+                L->slot_valid[victim]     = 0;
+                L->slot_to_expert[victim] = -1;
+                L->expert_to_slot[victim] = -1;
+                cache->n_evictions++;
+            }
+        }
+    }
     const int slot = expert;
 
     const bool use_async = cache->async_fill && cache->copy_backend;

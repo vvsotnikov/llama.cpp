@@ -251,6 +251,7 @@ public:
     void moe_oracle_prefill(int call_idx);
     void moe_oracle_wait_fills();
     void moe_cache_clear();
+    void moe_cache_warmup_all();
 
 private:
     llm_graph_params graph_params(

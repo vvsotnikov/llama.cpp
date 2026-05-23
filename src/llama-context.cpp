@@ -380,13 +380,10 @@ llama_context::llama_context(
                 backend_list.push_back(b.get());
             }
             llama_moe_expert_cache_allocate(moe_expert_cache.get(), model, backend_list);
-
-            // Phase 1 sanity warmup: copy every (layer, expert) slab from CPU to the
-            // cache once. With slot == expert this makes the cache byte-equivalent to
-            // having the experts loaded on GPU directly, so we can verify the plumbing
-            // (graph swap + mul_mat_id reading from cache) before adding any predictor
-            // or fill policy. Disable later when we want to A/B against partial fills.
-            llama_moe_expert_cache_warmup_all(moe_expert_cache.get());
+            // No auto-warmup. Callers that want the Phase-1 ceiling reference can
+            // invoke `llama_moe_cache_warmup_all` explicitly; oracle / predictor
+            // workflows start with a cold cache so timings reflect the actual fill
+            // policy, not init bookkeeping.
         }
 
         sched_reserve();
@@ -3371,6 +3368,13 @@ void llama_context::moe_cache_clear() {
     llama_moe_expert_cache_invalidate_all(moe_expert_cache.get());
 }
 
+void llama_context::moe_cache_warmup_all() {
+    if (!moe_expert_cache) {
+        return;
+    }
+    llama_moe_expert_cache_warmup_all(moe_expert_cache.get());
+}
+
 bool llama_moe_oracle_load(struct llama_context * ctx, const char * path) {
     if (!ctx) {
         return false;
@@ -3397,6 +3401,13 @@ void llama_moe_cache_clear(struct llama_context * ctx) {
         return;
     }
     ctx->moe_cache_clear();
+}
+
+void llama_moe_cache_warmup_all(struct llama_context * ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->moe_cache_warmup_all();
 }
 
 llama_context_params llama_context_default_params() {
