@@ -252,16 +252,24 @@ int main(int argc, char ** argv) {
 
         st.call_idx = call;
         if (!oracle_path.empty()) {
-            // Queue the compute-stream wait FIRST so it captures the event state
-            // produced by the previous iteration's prefills (i.e. fills for step
-            // `call`). Then issue prefills for the NEXT step(s) — those run on the
-            // copy stream concurrently with the decode we're about to submit.
+            // Queue the compute-stream wait for the fills issued at the END of the
+            // PREVIOUS iteration (which were for step `call`). The slot-map upload
+            // those fills triggered also sits on the same copy stream, so the wait
+            // covers both — by the time decode starts, both the expert slabs AND the
+            // matching slot map are in place.
             llama_moe_oracle_wait_fills(ctx);
-            llama_moe_oracle_prefill(ctx, call + 1 + lookahead);
         }
         if (llama_decode(ctx, llama_batch_get_one(&id, 1))) {
             fprintf(stderr, "decode failed at step %d\n", n_decode);
             break;
+        }
+        if (!oracle_path.empty()) {
+            // Issue prefills for the NEXT step (and any further lookahead). Submitted
+            // AFTER decode(call) has been queued, so the slot-map upload they trigger
+            // does NOT overwrite step `call`'s slot map before its kernels read it.
+            // The fills run on the copy stream while the host loops back to sample
+            // the next token and the GPU finishes decode `call`'s compute.
+            llama_moe_oracle_prefill(ctx, call + 1 + lookahead);
         }
         n_decode++;
     }

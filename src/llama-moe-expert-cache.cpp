@@ -57,10 +57,20 @@ static bool tensor_on_host(const ggml_tensor * t) {
     return ggml_backend_buffer_is_host(t->buffer);
 }
 
-// Helper: clone a tensor's shape onto another ggml_context (no data binding yet).
-// Phase 1: cache tensor has the SAME shape as the source — n_expert slots.
-static ggml_tensor * clone_shape(ggml_context * ctx, const ggml_tensor * src, const char * name) {
-    ggml_tensor * dst = ggml_new_tensor(ctx, src->type, GGML_MAX_DIMS, src->ne);
+// Helper: build a cache tensor that mirrors `src`'s shape except ne[2] = C (number
+// of slots). For Phase 2 this is C ≪ n_expert; the per-expert slabs are addressed
+// by slot id (which the graph computes by remapping the router's expert ids through
+// the per-layer slot map).
+static ggml_tensor * clone_shape_capped(ggml_context * ctx, const ggml_tensor * src,
+                                        int32_t C, const char * name) {
+    int64_t ne[GGML_MAX_DIMS] = {0};
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        ne[d] = src->ne[d];
+    }
+    if (ne[2] > 0) {
+        ne[2] = C;
+    }
+    ggml_tensor * dst = ggml_new_tensor(ctx, src->type, GGML_MAX_DIMS, ne);
     ggml_set_name(dst, name);
     return dst;
 }
@@ -117,9 +127,9 @@ void llama_moe_expert_cache_allocate(
         return;
     }
 
-    // Phase 1: cache shape == source shape. The user-provided C is informational only.
-    // Each managed layer contributes 3 cache tensors (up / gate / down).
-    const size_t n_tensors_max = managed_layers.size() * 3;
+    // Phase 2: cache shape `[n_embd, n_ff, C]` (or transpose for down). Each managed
+    // layer contributes 3 cache tensors (up / gate / down) + 1 slot map tensor.
+    const size_t n_tensors_max = managed_layers.size() * 4;
 
     ggml_init_params ip{};
     ip.mem_size   = ggml_tensor_overhead() * (n_tensors_max + 8);
@@ -137,10 +147,8 @@ void llama_moe_expert_cache_allocate(
         L.layer    = il;
         L.n_expert = (int32_t) hparams.n_expert;
 
-        // Phase 1.5: GPU buffer is still full-size (no remap kernel yet), but the
-        // number of *valid* slots is capped at `cache->C`. The cap is enforced by
-        // LRU eviction in `fill_sync`. Setting C >= n_expert disables eviction (full
-        // cache available).
+        // C = configured cache size, clamped to [1, n_expert]. C = 0 (cache disabled)
+        // shouldn't reach here, but defend with C = n_expert just in case.
         L.C = cache->C > 0 ? std::min(cache->C, L.n_expert) : L.n_expert;
 
         auto clone_managed = [&](const ggml_tensor * src, const char * base) -> ggml_tensor * {
@@ -149,7 +157,7 @@ void llama_moe_expert_cache_allocate(
             }
             char name[128];
             snprintf(name, sizeof(name), "moe_cache_%s_%d", base, il);
-            return clone_shape(cache->ctx.get(), src, name);
+            return clone_shape_capped(cache->ctx.get(), src, L.C, name);
         };
 
         L.src_up   = layer.ffn_up_exps;
@@ -161,24 +169,29 @@ void llama_moe_expert_cache_allocate(
         L.cache_down = clone_managed(layer.ffn_down_exps, "down");
 
         // Record dims from whichever expert tensor exists (they share n_embd / n_ff / n_expert).
-        const ggml_tensor * any =
-            L.cache_up   ? L.cache_up   :
-            L.cache_gate ? L.cache_gate :
-                           L.cache_down;
-        if (!any) {
-            // Defensive: managed_layers said this layer has at least one host tensor.
+        const ggml_tensor * any_src =
+            L.src_up   && tensor_on_host(L.src_up)   ? L.src_up   :
+            L.src_gate && tensor_on_host(L.src_gate) ? L.src_gate :
+                                                       L.src_down;
+        if (!any_src) {
             continue;
         }
-        L.n_embd = (int32_t) any->ne[0];
-        L.n_ff   = (int32_t) any->ne[1];
+        L.n_embd = (int32_t) any_src->ne[0];
+        L.n_ff   = (int32_t) any_src->ne[1];
 
-        // In Phase 1.5 slot==expert addressing still holds (the GPU buffer has n_expert
-        // slots even though only C of them are "valid" at any time). The slot arrays
-        // are therefore sized to n_expert, not C.
+        // Slot map: [1, n_expert] F32, host-mirrored.
+        {
+            char name[64];
+            snprintf(name, sizeof(name), "moe_cache_slotmap_%d", il);
+            L.slot_map_gpu = ggml_new_tensor_2d(cache->ctx.get(), GGML_TYPE_F32, 1, L.n_expert);
+            ggml_set_name(L.slot_map_gpu, name);
+            L.slot_map_host.assign(L.n_expert, 0.0f);
+        }
+
         L.expert_to_slot.assign(L.n_expert, -1);
-        L.slot_to_expert.assign(L.n_expert, -1);
-        L.slot_valid.assign(L.n_expert, 0);
-        L.slot_lru.assign(L.n_expert, 0);
+        L.slot_to_expert.assign(L.C, -1);
+        L.slot_valid.assign(L.C, 0);
+        L.slot_lru.assign(L.C, 0);
 
         cache->layers.push_back(std::move(L));
     }
@@ -207,15 +220,14 @@ void llama_moe_expert_cache_allocate(
     const int    eff_C = cache->layers.empty() ? 0 : cache->layers.front().C;
     const int    n_exp = cache->layers.empty() ? 0 : cache->layers.front().n_expert;
     LLAMA_LOG_INFO(
-        "%s: MoE expert cache allocated on %s: %zu managed layers, GPU buffer = %d slots/layer "
-        "(= %zu MiB), valid-slot cap (LRU) = %d/%d\n",
+        "%s: MoE expert cache allocated on %s: %zu managed layers, %d slots/layer (of %d experts), "
+        "buffer = %zu MiB\n",
         __func__,
         ggml_backend_buft_name(cache->buft),
         cache->layers.size(),
-        n_exp,
-        mb,
         eff_C,
-        n_exp);
+        n_exp,
+        mb);
 }
 
 static const llama_moe_expert_cache_layer * find_layer(const llama_moe_expert_cache * cache, int layer) {
@@ -245,6 +257,11 @@ ggml_tensor * llama_moe_expert_cache_get_down(const llama_moe_expert_cache * cac
     return L ? L->cache_down : nullptr;
 }
 
+ggml_tensor * llama_moe_expert_cache_get_slot_map(const llama_moe_expert_cache * cache, int layer) {
+    const auto * L = find_layer(cache, layer);
+    return L ? L->slot_map_gpu : nullptr;
+}
+
 // Mutable variant of find_layer for fill paths.
 static llama_moe_expert_cache_layer * find_layer_mut(llama_moe_expert_cache * cache, int layer) {
     if (!cache) {
@@ -269,34 +286,40 @@ bool llama_moe_expert_cache_fill_sync(
     if (expert < 0 || expert >= L->n_expert) {
         return false;
     }
-    // Phase 1.5: slot == expert id (still using the full-size GPU buffer); but if the
-    // count of valid slots is already at the configured cap C, LRU-evict one before
-    // marking the new slot valid. The evicted slot's bytes stay in GPU memory but
-    // `slot_valid` flips to 0, so the next prefill_step sees a miss for that expert
-    // and refills. This is what the cache-size sweep measures.
-    if (L->C < L->n_expert && !L->slot_valid[expert]) {
-        int valid_count = 0;
-        for (uint8_t v : L->slot_valid) {
-            if (v) valid_count++;
+
+    // Phase 2 slot allocation. If the expert is already cached just touch its LRU.
+    // Otherwise find a free slot or LRU-evict one.
+    int slot = L->expert_to_slot[expert];
+    if (slot < 0) {
+        // free slot first
+        for (int s = 0; s < L->C; ++s) {
+            if (!L->slot_valid[s]) {
+                slot = s;
+                break;
+            }
         }
-        if (valid_count >= L->C) {
-            int   victim     = -1;
+        if (slot < 0) {
+            // LRU eviction
+            int      victim  = -1;
             uint64_t min_lru = UINT64_MAX;
-            for (int s = 0; s < L->n_expert; ++s) {
-                if (L->slot_valid[s] && L->slot_lru[s] < min_lru) {
+            for (int s = 0; s < L->C; ++s) {
+                if (L->slot_lru[s] < min_lru) {
                     min_lru = L->slot_lru[s];
                     victim  = s;
                 }
             }
-            if (victim >= 0) {
-                L->slot_valid[victim]     = 0;
-                L->slot_to_expert[victim] = -1;
-                L->expert_to_slot[victim] = -1;
+            if (victim < 0) {
+                return false; // shouldn't happen
+            }
+            const int evicted_expert = L->slot_to_expert[victim];
+            if (evicted_expert >= 0) {
+                L->expert_to_slot[evicted_expert] = -1;
+                L->slot_map_host[evicted_expert]  = 0.0f; // substitute-and-go default
                 cache->n_evictions++;
             }
+            slot = victim;
         }
     }
-    const int slot = expert;
 
     const bool use_async = cache->async_fill && cache->copy_backend;
 
@@ -304,9 +327,10 @@ bool llama_moe_expert_cache_fill_sync(
         if (!cache_t || !src_t) {
             return;
         }
-        // Each expert occupies cache_t->nb[2] bytes (= ne[0] * ne[1] * element_size,
-        // rounded for quantized block alignment). Source layout matches because we
-        // cloned the shape exactly.
+        // cache_t->nb[2] is the per-slot stride in the *cache* (which has C slots);
+        // src_t->nb[2] is the per-expert stride in the source (which has n_expert
+        // slabs of the same byte size — the slab byte size matches because we
+        // preserved type and ne[0]/ne[1]).
         const size_t slab_bytes = cache_t->nb[2];
         const size_t src_off    = (size_t) expert * src_t->nb[2];
         const size_t dst_off    = (size_t) slot   * cache_t->nb[2];
@@ -326,6 +350,7 @@ bool llama_moe_expert_cache_fill_sync(
     L->expert_to_slot[expert] = slot;
     L->slot_valid[slot]       = 1;
     L->slot_lru[slot]         = ++L->lru_counter;
+    L->slot_map_host[expert]  = (float) slot;
     cache->n_fills++;
     return true;
 }
@@ -334,15 +359,22 @@ void llama_moe_expert_cache_warmup_all(llama_moe_expert_cache * cache) {
     if (!cache) {
         return;
     }
+    // With Phase 2's C < n_expert cache the "warmup all" semantic doesn't make sense
+    // — only C experts can be resident at a time. Fill the FIRST C experts of each
+    // managed layer; the rest stay un-cached. Useful only as a Phase-1-style ceiling
+    // reference when C is configured >= n_expert (i.e. the cache wasn't shrunk).
     size_t total = 0;
     for (auto & L : cache->layers) {
-        for (int e = 0; e < L.n_expert; ++e) {
+        const int n_to_fill = std::min(L.C, L.n_expert);
+        for (int e = 0; e < n_to_fill; ++e) {
             if (llama_moe_expert_cache_fill_sync(cache, L.layer, e)) {
                 ++total;
             }
         }
     }
     LLAMA_LOG_INFO("%s: warmed up %zu (layer, expert) cache slots\n", __func__, total);
+    // Push the resulting host-side slot map state to the GPU mirror.
+    llama_moe_expert_cache_upload_slot_maps(cache);
 }
 
 void llama_moe_expert_cache_invalidate_all(llama_moe_expert_cache * cache) {
@@ -354,7 +386,27 @@ void llama_moe_expert_cache_invalidate_all(llama_moe_expert_cache * cache) {
         std::fill(L.slot_to_expert.begin(), L.slot_to_expert.end(), -1);
         std::fill(L.slot_valid.begin(),     L.slot_valid.end(),     0);
         std::fill(L.slot_lru.begin(),       L.slot_lru.end(),       0);
+        std::fill(L.slot_map_host.begin(),  L.slot_map_host.end(),  0.0f);
         L.lru_counter = 0;
+    }
+}
+
+void llama_moe_expert_cache_upload_slot_maps(llama_moe_expert_cache * cache) {
+    if (!cache) {
+        return;
+    }
+    // Sync upload on the compute backend. This serializes the slot_map state into the
+    // compute stream — the previous decode's reads finish before this write lands. An
+    // earlier attempt to push the upload onto the copy stream raced with the
+    // previous decode's read of slot_map_gpu (same GPU memory, two streams, no
+    // ordering guarantee). The maps are tiny (~512 B per layer × n_managed_layers,
+    // total well under 16 KiB) so the sync cost is dominated by launch overhead.
+    for (auto & L : cache->layers) {
+        if (!L.slot_map_gpu) {
+            continue;
+        }
+        const size_t bytes = L.slot_map_host.size() * sizeof(float);
+        ggml_backend_tensor_set(L.slot_map_gpu, L.slot_map_host.data(), 0, bytes);
     }
 }
 
@@ -474,7 +526,7 @@ void llama_moe_expert_cache_prefill_step(
     if (call_idx < 1 || call_idx > cache->oracle_max_step) {
         return;
     }
-    bool issued_any = false;
+    bool any_fill = false;
     for (size_t i = 0; i < cache->layers.size(); ++i) {
         auto & L = cache->layers[i];
         if ((int) i >= (int) cache->oracle_experts.size()) {
@@ -489,25 +541,32 @@ void llama_moe_expert_cache_prefill_step(
             if (e < 0 || e >= L.n_expert) {
                 continue;
             }
-            if (L.slot_valid[e]) {
+            const int existing = L.expert_to_slot[e];
+            if (existing >= 0 && L.slot_valid[existing]) {
                 cache->n_hits++;
-                L.slot_lru[e] = ++L.lru_counter;
+                L.slot_lru[existing] = ++L.lru_counter;
                 continue;
             }
             cache->n_misses++;
             if (llama_moe_expert_cache_fill_sync(cache, L.layer, e)) {
-                issued_any = true;
+                any_fill = true;
             }
         }
     }
+
+    // If any fills happened, the host-side slot maps changed; push them to the GPU.
+    // The upload uses synchronous tensor_set on the compute backend, which is fine
+    // because the maps are tiny (~512 B per layer × n_layers) — measured at <0.1 ms
+    // for 28 layers, dominated by host→GPU launch overhead, not bandwidth.
+    if (any_fill) {
+        llama_moe_expert_cache_upload_slot_maps(cache);
+    }
+
     // Stamp the copy-stream event so subsequent waits on the compute backend block
-    // until these fills land. Always record, even if no fills were issued — that way
-    // the event reflects "everything submitted up to now is done", which is the
-    // contract `llama_moe_expert_cache_wait_fills` expects.
+    // until these fills land.
     if (cache->async_fill && cache->fill_event && cache->copy_backend) {
         ggml_backend_event_record(cache->fill_event, cache->copy_backend);
     }
-    (void) issued_any;
 }
 
 void llama_moe_expert_cache_wait_fills(

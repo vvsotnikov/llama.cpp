@@ -1382,15 +1382,23 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
-    // [EXPERIMENTAL] MoE expert prefetch cache (Phase 1): when enabled for this layer,
-    // swap the CPU-resident expert tensors for the GPU cache mirrors. The cache shape
-    // matches the model's expert tensor so `mul_mat_id` reads expert_id-indexed slots
-    // unchanged. Cache fills (sync or speculative) happen out-of-band via the cache
-    // primitives; the graph just sees the GPU tensor.
-    if (moe_cache) {
+    // [EXPERIMENTAL] MoE expert prefetch cache: swap the CPU-resident expert tensors
+    // for the smaller (Phase 2) GPU cache mirrors. The cache holds only C ≪ n_expert
+    // slabs, so we also need a remap of the router's expert ids into cache slot ids
+    // before mul_mat_id (see right after `selected_experts` below). Other ops that
+    // index n_expert-sized model tensors (probs, per-expert scales) keep using
+    // `selected_experts` unchanged.
+    //
+    // The swap is GATED on n_tokens == 1: prompt prefill (n_tokens > 1) needs the
+    // full expert set (the cache only holds the experts the predictor warmed up for
+    // decode — a different working set). Prefill keeps using the model's CPU-resident
+    // expert tensors; decode reads from the cache.
+    ggml_tensor * cache_slot_map = nullptr;
+    if (moe_cache && n_tokens == 1) {
         if (ggml_tensor * cu = llama_moe_expert_cache_get_up(moe_cache, il))   { up_exps   = cu; }
         if (ggml_tensor * cg = llama_moe_expert_cache_get_gate(moe_cache, il)) { gate_exps = cg; }
         if (ggml_tensor * cd = llama_moe_expert_cache_get_down(moe_cache, il)) { down_exps = cd; }
+        cache_slot_map = llama_moe_expert_cache_get_slot_map(moe_cache, il);
     }
 
     ggml_tensor * logits = nullptr;
@@ -1475,6 +1483,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // [EXPERIMENTAL] Phase 2 expert-cache slot remap. `mm_ids` is what feeds
+    // mul_mat_id when reading from the smaller cache; the original
+    // `selected_experts` (expert ids) is preserved for the ops that index
+    // n_expert-sized model tensors (probs, scales, biases).
+    //
+    // ggml_get_rows asserts `a->ne[2] == b->ne[1]`, which forces us to flatten
+    // selected_experts to a 1D-shaped tensor before the lookup and reshape back
+    // afterwards. The math is just a scalar map: slot = slot_map[expert].
+    ggml_tensor * mm_ids = selected_experts;
+    if (cache_slot_map) {
+        const int64_t n_ids = (int64_t) n_expert_used * n_tokens;
+        // selected_experts is a non-contiguous view (output of ggml_argsort_top_k);
+        // ggml_reshape requires contiguous input, so cont() first.
+        ggml_tensor * sel_c    = ggml_cont(ctx0, selected_experts);
+        ggml_tensor * sel_flat = ggml_reshape_3d(ctx0, sel_c, n_ids, 1, 1);
+        ggml_tensor * sm       = ggml_get_rows(ctx0, cache_slot_map, sel_flat); // F32 [1, n_ids, 1, 1]
+        ggml_tensor * sm_c     = ggml_cont(ctx0, sm);
+        sm_c                   = ggml_reshape_2d(ctx0, sm_c, n_expert_used, n_tokens); // F32
+        mm_ids                 = ggml_cast(ctx0, sm_c, GGML_TYPE_I32);                 // I32 [n_expert_used, n_tokens]
+        cb(mm_ids, "ffn_moe_slot_ids", il);
+    }
+
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
@@ -1532,7 +1562,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, mm_ids); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (gate_up_exps_b) {
@@ -1556,7 +1586,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, mm_ids); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_b) {
@@ -1574,7 +1604,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, mm_ids); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -1664,7 +1694,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, mm_ids); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {

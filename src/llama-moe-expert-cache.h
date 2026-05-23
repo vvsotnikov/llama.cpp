@@ -7,15 +7,11 @@
 //     the CPU backend per `--n-cpu-moe`), allocate a GPU-resident cache tensor that
 //     shadows each of the layer's expert-weight matrices (ffn_up_exps, ffn_gate_exps,
 //     ffn_down_exps). Cache is owned by the llama_context, persists across decode calls.
-//   - Phase 1 (current): cache tensors have the SAME shape as the model's expert
-//     tensors `[n_embd, n_ff, n_expert]`. This wastes VRAM (full duplicate on GPU) but
-//     means `mul_mat_id` works unmodified — the graph just reads from the GPU cache
-//     instead of the CPU source tensor. We validate that prediction + cross-token
-//     reuse beats the existing `-ncmoe` baseline before doing the surgical work to
-//     actually shrink the buffer.
-//   - Phase 2 (future): shrink each cache to `[n_embd, n_ff, C]` with C ≪ n_expert,
-//     add a `remap_ids` op so `mul_mat_id` reads slot-indexed cache. That's the actual
-//     VRAM-saving step. Gated on Phase 1 showing a real speedup.
+//   - Phase 2 (current): cache tensor is `[n_embd, n_ff, C]` with C ≪ n_expert (the
+//     "actual VRAM-saver"). A per-layer F32 slot map `[1, n_expert]` translates the
+//     router's expert ids into cache slot ids via ggml_get_rows + ggml_cast(I32);
+//     mul_mat_id then reads from the smaller cache. The slot map is updated on the
+//     host on every fill and uploaded to the GPU before each decode.
 //
 //   - Slot tracking (host-side): per-layer bitmap of which expert slabs in the cache
 //     currently hold valid data. On a router pick that hits a valid slot → use as-is.
@@ -54,17 +50,28 @@ struct llama_moe_expert_cache_layer {
     const struct ggml_tensor * src_gate = nullptr;
     const struct ggml_tensor * src_down = nullptr;
 
-    // expert_to_slot[e] = s in [0,C) if expert e is in slot s, else -1.
-    // slot_to_expert[s] = e if slot s holds expert e, else -1.
-    // In Phase 1 these are trivial (slot s == expert s).
+    // Phase 2 slot map. expert_to_slot[e] = s in [0,C) if expert e is in slot s,
+    // else -1. slot_to_expert[s] = e if slot s holds expert e, else -1.
+    // expert_to_slot has size n_expert; slot_to_expert has size C.
     std::vector<int32_t> expert_to_slot;
     std::vector<int32_t> slot_to_expert;
 
-    // Phase 1: per-slot validity (true once filled). Phase 2 will fold this into the
-    // slot map (slot_to_expert[s] != -1 implies valid).
+    // Host mirror of the GPU slot map. Stored as float so we can use the existing
+    // ggml_get_rows op (which only supports floating sources) followed by ggml_cast
+    // to i32 — no new ggml op required for the remap.
+    // slot_map_host[e] = (float) expert_to_slot[e] when in cache; 0.0 otherwise
+    // ("substitute-and-go" miss policy: a missing expert reads slot 0's data, which
+    // produces garbage but doesn't OOB. With a perfect oracle this never happens.)
+    std::vector<float> slot_map_host;
+
+    // GPU mirror of slot_map_host (lives in the same cache backend buffer).
+    // Shape [1, n_expert], type F32.
+    struct ggml_tensor * slot_map_gpu = nullptr;
+
+    // Per-slot validity (size C). 1 iff slot s currently holds a valid expert.
     std::vector<uint8_t> slot_valid;
 
-    // LRU: monotonically-increasing per-slot last-use counter; lowest = eviction victim.
+    // LRU: per-slot last-use counter (size C); lowest = eviction victim on miss.
     std::vector<uint64_t> slot_lru;
     uint64_t              lru_counter = 0;
 };
@@ -128,9 +135,19 @@ void llama_moe_expert_cache_allocate(
 // Lookup the cache tensor for layer L's `ffn_up_exps` (etc.). Returns nullptr if the
 // layer isn't cache-managed. Used by the graph builders to swap CPU tensors for
 // GPU cache tensors when emitting `mul_mat_id` calls.
-struct ggml_tensor * llama_moe_expert_cache_get_up   (const llama_moe_expert_cache * cache, int layer);
-struct ggml_tensor * llama_moe_expert_cache_get_gate (const llama_moe_expert_cache * cache, int layer);
-struct ggml_tensor * llama_moe_expert_cache_get_down (const llama_moe_expert_cache * cache, int layer);
+struct ggml_tensor * llama_moe_expert_cache_get_up       (const llama_moe_expert_cache * cache, int layer);
+struct ggml_tensor * llama_moe_expert_cache_get_gate     (const llama_moe_expert_cache * cache, int layer);
+struct ggml_tensor * llama_moe_expert_cache_get_down     (const llama_moe_expert_cache * cache, int layer);
+// Slot map tensor for layer L (F32 [1, n_expert]). The graph applies
+// ggml_get_rows(slot_map, selected_experts) → ggml_cast(I32) to translate router
+// expert ids into cache slot ids before mul_mat_id. Returns nullptr if not managed.
+struct ggml_tensor * llama_moe_expert_cache_get_slot_map (const llama_moe_expert_cache * cache, int layer);
+
+// Push any pending host-side slot map changes to the GPU. Called from the public
+// llama_moe_oracle_prefill wrapper after a fill batch updates the host-side maps,
+// so the upcoming compute graph sees the new mapping. Uses synchronous host→device
+// copy on the compute backend (small tensor, ~512 bytes per layer).
+void llama_moe_expert_cache_upload_slot_maps(llama_moe_expert_cache * cache);
 
 // Synchronously copy expert E's weight slabs from the CPU source tensors into the
 // corresponding slot of the GPU cache for layer L. Phase 1: slot == expert. The call
