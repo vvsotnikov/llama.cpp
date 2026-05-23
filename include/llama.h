@@ -473,6 +473,15 @@ extern "C" {
     // configured smaller than n_expert, only the last C experts of each layer end
     // up valid due to LRU eviction during the warmup).
     LLAMA_API void llama_moe_cache_warmup_all  (struct llama_context * ctx);
+    // Live temporal-1 predictor (no pre-collected trace required). Call once at
+    // setup to enable; from then on, the user's cb_eval should call
+    // `llama_moe_record_router(ctx, layer, ids, n_ids)` for every `ffn_moe_topk`
+    // tensor it sees. Before each `llama_decode`, call `llama_moe_predictor_prefill`
+    // to fill the cache with experts the predictor expects to be used (== experts
+    // the same layer used at the previous step).
+    LLAMA_API void llama_moe_predictor_enable  (struct llama_context * ctx);
+    LLAMA_API void llama_moe_record_router     (struct llama_context * ctx, int layer, const int32_t * ids, int n_ids);
+    LLAMA_API void llama_moe_predictor_prefill (struct llama_context * ctx);
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 

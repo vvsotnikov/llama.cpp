@@ -109,6 +109,14 @@ struct llama_moe_expert_cache {
     std::vector<int32_t>                                    oracle_layer_to_idx; // size = n_layer
     int32_t                                                 oracle_max_step = 0;
 
+    // Live (temporal) predictor: most-recently-observed router output per managed
+    // layer. Updated by `record_router` (from the user's cb_eval) and consumed by
+    // `predictor_prefill_from_observations` to drive fills for the next decode.
+    // Empty inner vector means "no observation yet" (cold start).
+    bool                                                    predictor_enabled = false;
+    std::vector<std::vector<int32_t>>                       last_selected_experts; // [managed_idx]
+    std::vector<int32_t>                                    layer_to_managed_idx;  // size n_layer, -1 if not managed
+
     // Stats (for diagnostics / bench reporting).
     uint64_t n_hits      = 0;
     uint64_t n_misses    = 0;
@@ -201,6 +209,24 @@ void llama_moe_expert_cache_prefill_step(
 void llama_moe_expert_cache_wait_fills(
         llama_moe_expert_cache * cache,
         ggml_backend_t compute_backend);
+
+// Live (temporal-1) predictor mode. Call once at setup; replaces the oracle path.
+void llama_moe_expert_cache_enable_predictor(llama_moe_expert_cache * cache);
+
+// Record an observed router output for `layer` (called from cb_eval when an
+// ffn_moe_topk tensor is read). The cache stashes the ids so the predictor can
+// use them as the prediction for the next decode step.
+void llama_moe_expert_cache_record_router(
+        llama_moe_expert_cache * cache,
+        int layer,
+        const int32_t * ids,
+        int n_ids);
+
+// Issue fills for the experts the temporal predictor expects to be needed next
+// (i.e. "the same experts the router picked last time, per layer"). Same async
+// fill + event-record semantics as `prefill_step`. Idempotent — already-cached
+// experts just get an LRU bump.
+void llama_moe_expert_cache_predictor_prefill(llama_moe_expert_cache * cache);
 
 // Fill EVERY expert slot of EVERY managed layer. Equivalent to "copy all the CPU
 // expert tensors to GPU once". Lets us A/B-test the cache plumbing against a known-

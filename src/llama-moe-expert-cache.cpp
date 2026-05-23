@@ -580,3 +580,79 @@ void llama_moe_expert_cache_wait_fills(
     // queue the compute graph on top of the wait.
     ggml_backend_event_wait(compute_backend, cache->fill_event);
 }
+
+void llama_moe_expert_cache_enable_predictor(llama_moe_expert_cache * cache) {
+    if (!cache) {
+        return;
+    }
+    cache->predictor_enabled = true;
+    cache->last_selected_experts.assign(cache->layers.size(), std::vector<int32_t>());
+    // Build layer_to_managed_idx lookup so record_router can be called with model
+    // layer indices (not cache-internal positions).
+    int max_layer = -1;
+    for (const auto & L : cache->layers) {
+        if (L.layer > max_layer) max_layer = L.layer;
+    }
+    cache->layer_to_managed_idx.assign(max_layer + 1, -1);
+    for (size_t i = 0; i < cache->layers.size(); ++i) {
+        cache->layer_to_managed_idx[cache->layers[i].layer] = (int32_t) i;
+    }
+    LLAMA_LOG_INFO("%s: live (temporal-1) MoE predictor enabled\n", __func__);
+}
+
+void llama_moe_expert_cache_record_router(
+        llama_moe_expert_cache * cache,
+        int layer,
+        const int32_t * ids,
+        int n_ids) {
+    if (!cache || !cache->predictor_enabled || !ids || n_ids <= 0) {
+        return;
+    }
+    if (layer < 0 || layer >= (int) cache->layer_to_managed_idx.size()) {
+        return;
+    }
+    const int idx = cache->layer_to_managed_idx[layer];
+    if (idx < 0) {
+        return; // not a managed layer
+    }
+    auto & buf = cache->last_selected_experts[idx];
+    buf.assign(ids, ids + n_ids);
+}
+
+void llama_moe_expert_cache_predictor_prefill(llama_moe_expert_cache * cache) {
+    if (!cache || !cache->predictor_enabled) {
+        return;
+    }
+    bool any_fill = false;
+    for (size_t i = 0; i < cache->layers.size(); ++i) {
+        auto & L = cache->layers[i];
+        const auto & ids = cache->last_selected_experts[i];
+        // Cold start: no observations yet → skip; the first decode runs with whatever
+        // is in the cache (empty + slot_map_host all-zero → garbage substitute on the
+        // first decode; the predictor catches up from the second decode onward).
+        if (ids.empty()) {
+            continue;
+        }
+        for (int32_t e : ids) {
+            if (e < 0 || e >= L.n_expert) {
+                continue;
+            }
+            const int existing = L.expert_to_slot[e];
+            if (existing >= 0 && L.slot_valid[existing]) {
+                cache->n_hits++;
+                L.slot_lru[existing] = ++L.lru_counter;
+                continue;
+            }
+            cache->n_misses++;
+            if (llama_moe_expert_cache_fill_sync(cache, L.layer, e)) {
+                any_fill = true;
+            }
+        }
+    }
+    if (any_fill) {
+        llama_moe_expert_cache_upload_slot_maps(cache);
+    }
+    if (cache->async_fill && cache->fill_event && cache->copy_backend) {
+        ggml_backend_event_record(cache->fill_event, cache->copy_backend);
+    }
+}
