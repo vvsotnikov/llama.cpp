@@ -123,6 +123,7 @@ int main(int argc, char ** argv) {
     int  n_threads           = 24;
     int  n_cpu_moe           = 0;   // -ncmoe N: offload first N layers' MoE expert tensors to CPU
     int  moe_cache_size      = 0;   // -moecache C: per-layer GPU expert cache slots (0 = disabled)
+    int  moe_overfetch       = 0;   // -moeoverfetch M: capture top-(K+M) for predictor over-fetch
     std::string oracle_path  = "";  // --oracle path: replay MOE2 trace to drive selective fills
     int  lookahead           = 0;   // --lookahead K: speculative prefill K steps ahead each iter
     bool live_predictor      = false; // --live-predictor: temporal-1 predictor (no trace file)
@@ -144,6 +145,7 @@ int main(int argc, char ** argv) {
         else if (a == "-t")          n_threads  = atoi(next("-t"));
         else if (a == "-ncmoe" || a == "--n-cpu-moe")    n_cpu_moe      = atoi(next("-ncmoe"));
         else if (a == "-moecache" || a == "--moe-cache-size") moe_cache_size = atoi(next("-moecache"));
+        else if (a == "-moeoverfetch" || a == "--moe-expert-overfetch") moe_overfetch = atoi(next("-moeoverfetch"));
         else if (a == "--oracle")    oracle_path = next("--oracle");
         else if (a == "--lookahead") lookahead  = atoi(next("--lookahead"));
         else if (a == "--live-predictor") live_predictor = true;
@@ -224,6 +226,7 @@ int main(int argc, char ** argv) {
         cp.cb_eval_user_data    = &st;
     }
     cp.moe_expert_cache_size    = (uint32_t) moe_cache_size;
+    cp.moe_expert_overfetch     = (uint32_t) moe_overfetch;
     cp.no_perf                  = false;
 
     llama_context * ctx = llama_init_from_model(model, cp);

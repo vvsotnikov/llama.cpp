@@ -1562,6 +1562,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.cb_eval                = params.cb_eval;
     cparams.cb_eval_user_data      = params.cb_eval_user_data;
     cparams.moe_expert_cache_size  = (uint32_t) params.moe_expert_cache_size;
+    cparams.moe_expert_overfetch   = (uint32_t) params.moe_expert_overfetch;
     cparams.offload_kqv            = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

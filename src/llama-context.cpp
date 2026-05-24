@@ -86,7 +86,8 @@ llama_context::llama_context(
     cparams.ctx_type          = params.ctx_type;
 
     // [EXPERIMENTAL] MoE expert prefetch cache — see llama-moe-expert-cache.h
-    moe_expert_cache.reset(llama_moe_expert_cache_init(params.moe_expert_cache_size));
+    moe_expert_cache.reset(llama_moe_expert_cache_init(params.moe_expert_cache_size,
+                                                       params.moe_expert_overfetch));
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -3483,6 +3484,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.moe_expert_cache_size       =*/ 0,
+        /*.moe_expert_overfetch        =*/ 0,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,

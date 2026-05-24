@@ -1485,14 +1485,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
 
-    // [EXPERIMENTAL] live-predictor capture: clone selected_experts into the cache's
-    // persistent topk buffer so the predictor can observe router output via a single
-    // post-decode batched tensor_get (instead of 48 cb_eval sync points). Inserted
-    // unconditionally when the cache layer is active — the cpy is cheap on GPU and
-    // lets the predictor turn observation on/off without re-reserving the graph.
+    // [EXPERIMENTAL] live-predictor capture: clone the router's top-(K+m) into the
+    // cache's persistent topk buffer. m comes from the cache config; capture width
+    // is n_expert_used + m (= topk_capture->ne[0]). The first n_expert_used are the
+    // actual selected experts (used by mul_mat_id); the remaining m are the
+    // predictor's over-fetch candidates (used only to seed the next step's prefill).
+    // Capturing top-(K+m) gets ~98.5% recall vs ~88% with top-K only per Step-1.
     if (moe_cache && n_tokens == 1) {
         if (ggml_tensor * topk_cap = llama_moe_expert_cache_get_topk_capture(moe_cache, il)) {
-            ggml_tensor * captured = ggml_cpy(ctx0, selected_experts, topk_cap);
+            const int n_cap = (int) topk_cap->ne[0];
+            ggml_tensor * src_topk = (n_cap == n_expert_used)
+                ? selected_experts
+                : ggml_argsort_top_k(ctx0, selection_probs, n_cap);
+            ggml_tensor * captured = ggml_cpy(ctx0, src_topk, topk_cap);
             ggml_build_forward_expand(gf, captured);
         }
     }

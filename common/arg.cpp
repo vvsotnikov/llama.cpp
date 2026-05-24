@@ -2359,6 +2359,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.moe_expert_cache_size = value;
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"-moeoverfetch", "--moe-expert-overfetch"}, "M",
+        "[EXPERIMENTAL] capture top-(K+M) router probs per cached layer for the predictor's "
+        "over-fetch margin (0 = capture top-K only). Step-1 analysis: top-16 (= 8+8) ≈ 98.5% "
+        "recall vs top-8 ≈ 88%. Recommended: 8.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_overfetch = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_OVERFETCH"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

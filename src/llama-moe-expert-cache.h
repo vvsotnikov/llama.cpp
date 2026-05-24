@@ -105,6 +105,7 @@ struct llama_moe_expert_cache_layer {
 struct llama_moe_expert_cache {
     int32_t C = 0;  // configured slots/layer (0 = disabled). Phase 1: forced to n_expert
                     // when allocated, regardless of user-provided value.
+    int32_t overfetch = 0; // additional experts captured for predictor over-fetch (top-(K+m))
 
     // GPU backend the cache lives on. Owned by the llama_context; not freed here.
     ggml_backend_t       backend = nullptr;
@@ -161,7 +162,7 @@ struct llama_moe_expert_cache {
 
 // Construct an empty disabled cache. Allocation happens later via `..._allocate`.
 // Returns nullptr if `cache_size == 0`.
-llama_moe_expert_cache * llama_moe_expert_cache_init(uint32_t cache_size);
+llama_moe_expert_cache * llama_moe_expert_cache_init(uint32_t cache_size, uint32_t overfetch);
 
 // Allocate the per-layer cache tensors + backend buffer. Walks the model's layers,
 // identifies those whose expert tensors are CPU-resident (the ncmoe-managed ones),

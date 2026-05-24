@@ -368,6 +368,13 @@ extern "C" {
         // on demand and (eventually) speculatively prefetched ahead of compute.
         uint32_t moe_expert_cache_size;
 
+        // [EXPERIMENTAL] number of additional experts (beyond the router's top-K) to capture per
+        // layer per step for the predictor's "over-fetch" margin. Step-1 analysis: top-(K+8) ≈
+        // 98.5% recall vs top-K ≈ 88% on the draft router. The captured top-(K+m) ids land in the
+        // cache's persistent topk buffer and are all fed to `predictor_prefill` for the next step.
+        // 0 = no over-fetch (current behavior).
+        uint32_t moe_expert_overfetch;
+
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 

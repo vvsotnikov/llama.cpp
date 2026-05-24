@@ -22,14 +22,15 @@
 // since drained.
 #define MOE_SLOT_MAP_STAGING_RING 16
 
-llama_moe_expert_cache * llama_moe_expert_cache_init(uint32_t cache_size) {
+llama_moe_expert_cache * llama_moe_expert_cache_init(uint32_t cache_size, uint32_t overfetch) {
     if (cache_size == 0) {
         return nullptr;
     }
     auto * cache = new llama_moe_expert_cache();
     cache->C = (int32_t) cache_size;
-    LLAMA_LOG_INFO("%s: MoE expert cache requested, %u slots/layer (allocation deferred)\n",
-                   __func__, cache_size);
+    cache->overfetch = (int32_t) overfetch;
+    LLAMA_LOG_INFO("%s: MoE expert cache requested, %u slots/layer, overfetch=%u (allocation deferred)\n",
+                   __func__, cache_size, overfetch);
     return cache;
 }
 
@@ -216,23 +217,26 @@ void llama_moe_expert_cache_allocate(
         cache->layers.push_back(std::move(L));
     }
 
-    // Cache-wide topk capture buffer. Shape [n_expert_used, n_managed_layers] I32.
-    // Each managed layer writes its `selected_experts` here via an inserted ggml_cpy
-    // in build_moe_ffn; live predictor observation reads the whole thing in one go.
+    // Cache-wide topk capture buffer. Shape [n_capture, n_managed_layers] I32,
+    // where n_capture = n_expert_used + overfetch. The graph captures the wider
+    // top-(K+m) for the predictor's over-fetch margin; the first K of each row are
+    // the actual selected_experts that mul_mat_id uses, the next m are the
+    // additional candidates we prefill speculatively.
     {
         const int n_eu     = (int) hparams.n_expert_used;
+        const int n_cap    = n_eu + cache->overfetch;
         const int n_layers = (int) cache->layers.size();
-        cache->n_expert_used_cap = n_eu;
-        cache->topk_buffer       = ggml_new_tensor_2d(cache->ctx.get(), GGML_TYPE_I32, n_eu, n_layers);
+        cache->n_expert_used_cap = n_cap;
+        cache->topk_buffer       = ggml_new_tensor_2d(cache->ctx.get(), GGML_TYPE_I32, n_cap, n_layers);
         ggml_set_name(cache->topk_buffer, "moe_cache_topk_buffer");
-        cache->topk_buffer_host.assign(n_eu * n_layers, 0);
+        cache->topk_buffer_host.assign(n_cap * n_layers, 0);
 
-        // Per-layer view (a slice of one column).
+        // Per-layer view (a slice of one column, width n_cap).
         for (int i = 0; i < n_layers; ++i) {
             auto & L = cache->layers[i];
             const size_t offset = (size_t) i * cache->topk_buffer->nb[1];
             L.topk_capture = ggml_view_2d(cache->ctx.get(), cache->topk_buffer,
-                                          n_eu, 1,
+                                          n_cap, 1,
                                           cache->topk_buffer->nb[1],
                                           offset);
             char name[64];
