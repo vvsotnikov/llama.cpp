@@ -217,33 +217,9 @@ void llama_moe_expert_cache_allocate(
         cache->layers.push_back(std::move(L));
     }
 
-    // Cache-wide topk capture buffer. Shape [n_capture, n_managed_layers] I32,
-    // where n_capture = n_expert_used + overfetch. The graph captures the wider
-    // top-(K+m) for the predictor's over-fetch margin; the first K of each row are
-    // the actual selected_experts that mul_mat_id uses, the next m are the
-    // additional candidates we prefill speculatively.
-    {
-        const int n_eu     = (int) hparams.n_expert_used;
-        const int n_cap    = n_eu + cache->overfetch;
-        const int n_layers = (int) cache->layers.size();
-        cache->n_expert_used_cap = n_cap;
-        cache->topk_buffer       = ggml_new_tensor_2d(cache->ctx.get(), GGML_TYPE_I32, n_cap, n_layers);
-        ggml_set_name(cache->topk_buffer, "moe_cache_topk_buffer");
-        cache->topk_buffer_host.assign(n_cap * n_layers, 0);
-
-        // Per-layer view (a slice of one column, width n_cap).
-        for (int i = 0; i < n_layers; ++i) {
-            auto & L = cache->layers[i];
-            const size_t offset = (size_t) i * cache->topk_buffer->nb[1];
-            L.topk_capture = ggml_view_2d(cache->ctx.get(), cache->topk_buffer,
-                                          n_cap, 1,
-                                          cache->topk_buffer->nb[1],
-                                          offset);
-            char name[64];
-            snprintf(name, sizeof(name), "moe_cache_topk_view_%d", L.layer);
-            ggml_set_name(L.topk_capture, name);
-        }
-    }
+    // (former cache-wide topk_buffer / per-layer topk_capture removed — the
+    // temporal-1 observation path is retired. Future within-step in-graph
+    // predictor will introduce its own predictions tensor here.)
 
     // Allocate one backend buffer covering every cache tensor.
     cache->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(cache->ctx.get(), cache->buft));
@@ -328,28 +304,6 @@ ggml_tensor * llama_moe_expert_cache_get_slot_map(const llama_moe_expert_cache *
 ggml_tensor * llama_moe_expert_cache_get_mask(const llama_moe_expert_cache * cache, int layer) {
     const auto * L = find_layer(cache, layer);
     return L ? L->cache_mask_gpu : nullptr;
-}
-
-ggml_tensor * llama_moe_expert_cache_get_topk_capture(const llama_moe_expert_cache * cache, int layer) {
-    const auto * L = find_layer(cache, layer);
-    return L ? L->topk_capture : nullptr;
-}
-
-void llama_moe_expert_cache_observe_routers(llama_moe_expert_cache * cache) {
-    if (!cache || !cache->topk_buffer || !cache->predictor_enabled) {
-        return;
-    }
-    const size_t bytes = cache->topk_buffer_host.size() * sizeof(int32_t);
-    // One sync H<-D copy for ALL managed layers' router outputs.
-    ggml_backend_tensor_get(cache->topk_buffer, cache->topk_buffer_host.data(), 0, bytes);
-    // Fan out to per-layer record_router (host-side fast path; no more sync points).
-    const int n_eu = cache->n_expert_used_cap;
-    for (size_t i = 0; i < cache->layers.size(); ++i) {
-        const int layer = cache->layers[i].layer;
-        const int32_t * src = cache->topk_buffer_host.data() + i * n_eu;
-        // Reuse the existing record_router path (updates last_selected_experts).
-        llama_moe_expert_cache_record_router(cache, layer, src, n_eu);
-    }
 }
 
 // Mutable variant of find_layer for fill paths.
@@ -628,6 +582,14 @@ bool llama_moe_expert_cache_has_oracle(const llama_moe_expert_cache * cache) {
     return cache && cache->oracle_loaded;
 }
 
+// xorshift64* RNG (small, no globals).
+static inline uint64_t moe_rng_next(uint64_t & state) {
+    uint64_t x = state;
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
 void llama_moe_expert_cache_prefill_step(
         llama_moe_expert_cache * cache,
         int call_idx,
@@ -639,6 +601,13 @@ void llama_moe_expert_cache_prefill_step(
         return;
     }
     bool any_fill = false;
+    // Threshold for keeping a prediction (cumulative-probability style). With accuracy
+    // = 1.0, threshold = ULLMAX so every random draw keeps the correct id. With
+    // accuracy = 0.9, ~10% of correct ids get replaced with a random non-correct
+    // expert from the same layer's n_expert space.
+    const float acc = cache->predictor_accuracy;
+    const uint64_t keep_threshold = acc >= 1.0f ? UINT64_MAX
+                                  : (uint64_t)(acc * (double) UINT64_MAX);
     for (size_t i = 0; i < cache->layers.size(); ++i) {
         auto & L = cache->layers[i];
         if ((int) i >= (int) cache->oracle_experts.size()) {
@@ -649,7 +618,39 @@ void llama_moe_expert_cache_prefill_step(
             continue;
         }
         const auto & ids = steps[call_idx];
-        for (int32_t e : ids) {
+        // Build the (possibly-degraded) prediction list for this layer at this step.
+        // To make miss-handling realistic, we replace SOME oracle-correct ids with
+        // random non-correct ones; the cache then prefills the wrong experts and the
+        // real router will miss them at compute time (mask zeroes the contribution).
+        std::vector<int32_t> pred;
+        pred.reserve(ids.size());
+        if (acc >= 1.0f) {
+            pred = ids;
+        } else {
+            // Set of correct ids for fast "is this in the right answer?" lookup.
+            std::vector<uint8_t> correct(L.n_expert, 0);
+            for (int32_t e : ids) {
+                if (e >= 0 && e < L.n_expert) correct[e] = 1;
+            }
+            for (int32_t e : ids) {
+                const uint64_t r = moe_rng_next(cache->rng_state);
+                if (r <= keep_threshold) {
+                    pred.push_back(e);
+                } else {
+                    // Pick a random NON-correct expert (so this is a genuine miss).
+                    // n_expert - |correct| candidates; sample uniformly.
+                    int32_t replacement = -1;
+                    for (int attempts = 0; attempts < 32; ++attempts) {
+                        int32_t cand = (int32_t)(moe_rng_next(cache->rng_state) % L.n_expert);
+                        if (!correct[cand]) { replacement = cand; break; }
+                    }
+                    if (replacement < 0) replacement = e; // fallback: keep correct
+                    pred.push_back(replacement);
+                }
+            }
+        }
+
+        for (int32_t e : pred) {
             if (e < 0 || e >= L.n_expert) {
                 continue;
             }
@@ -693,78 +694,13 @@ void llama_moe_expert_cache_wait_fills(
     ggml_backend_event_wait(compute_backend, cache->fill_event);
 }
 
-void llama_moe_expert_cache_enable_predictor(llama_moe_expert_cache * cache) {
+void llama_moe_expert_cache_set_predictor_accuracy(llama_moe_expert_cache * cache, float accuracy) {
     if (!cache) {
         return;
     }
-    cache->predictor_enabled = true;
-    cache->last_selected_experts.assign(cache->layers.size(), std::vector<int32_t>());
-    // Build layer_to_managed_idx lookup so record_router can be called with model
-    // layer indices (not cache-internal positions).
-    int max_layer = -1;
-    for (const auto & L : cache->layers) {
-        if (L.layer > max_layer) max_layer = L.layer;
-    }
-    cache->layer_to_managed_idx.assign(max_layer + 1, -1);
-    for (size_t i = 0; i < cache->layers.size(); ++i) {
-        cache->layer_to_managed_idx[cache->layers[i].layer] = (int32_t) i;
-    }
-    LLAMA_LOG_INFO("%s: live (temporal-1) MoE predictor enabled\n", __func__);
-}
-
-void llama_moe_expert_cache_record_router(
-        llama_moe_expert_cache * cache,
-        int layer,
-        const int32_t * ids,
-        int n_ids) {
-    if (!cache || !cache->predictor_enabled || !ids || n_ids <= 0) {
-        return;
-    }
-    if (layer < 0 || layer >= (int) cache->layer_to_managed_idx.size()) {
-        return;
-    }
-    const int idx = cache->layer_to_managed_idx[layer];
-    if (idx < 0) {
-        return; // not a managed layer
-    }
-    auto & buf = cache->last_selected_experts[idx];
-    buf.assign(ids, ids + n_ids);
-}
-
-void llama_moe_expert_cache_predictor_prefill(llama_moe_expert_cache * cache) {
-    if (!cache || !cache->predictor_enabled) {
-        return;
-    }
-    bool any_fill = false;
-    for (size_t i = 0; i < cache->layers.size(); ++i) {
-        auto & L = cache->layers[i];
-        const auto & ids = cache->last_selected_experts[i];
-        // Cold start: no observations yet → skip; the first decode runs with whatever
-        // is in the cache (empty + slot_map_host all-zero → garbage substitute on the
-        // first decode; the predictor catches up from the second decode onward).
-        if (ids.empty()) {
-            continue;
-        }
-        for (int32_t e : ids) {
-            if (e < 0 || e >= L.n_expert) {
-                continue;
-            }
-            const int existing = L.expert_to_slot[e];
-            if (existing >= 0 && L.slot_valid[existing]) {
-                cache->n_hits++;
-                L.slot_lru[existing] = ++L.lru_counter;
-                continue;
-            }
-            cache->n_misses++;
-            if (llama_moe_expert_cache_fill_sync(cache, L.layer, e)) {
-                any_fill = true;
-            }
-        }
-    }
-    if (any_fill) {
-        llama_moe_expert_cache_upload_slot_maps(cache);
-    }
-    if (cache->async_fill && cache->fill_event && cache->copy_backend) {
-        ggml_backend_event_record(cache->fill_event, cache->copy_backend);
-    }
+    if (accuracy < 0.0f) accuracy = 0.0f;
+    if (accuracy > 1.0f) accuracy = 1.0f;
+    cache->predictor_accuracy = accuracy;
+    LLAMA_LOG_INFO("%s: predictor accuracy set to %.3f%s\n", __func__, accuracy,
+                   accuracy >= 0.9999f ? " (perfect oracle)" : " (oracle with synthetic degradation)");
 }

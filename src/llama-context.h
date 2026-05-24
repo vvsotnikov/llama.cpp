@@ -252,10 +252,7 @@ public:
     void moe_oracle_wait_fills();
     void moe_cache_clear();
     void moe_cache_warmup_all();
-    void moe_predictor_enable();
-    void moe_record_router(int layer, const int32_t * ids, int n_ids);
-    void moe_predictor_prefill();
-    void moe_predictor_observe();
+    void moe_predictor_set_accuracy(float accuracy);
 
 private:
     llm_graph_params graph_params(

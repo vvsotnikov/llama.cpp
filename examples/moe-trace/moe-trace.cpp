@@ -32,8 +32,6 @@ struct trace_state {
     FILE *           out             = nullptr;
     int32_t          call_idx        = 0;
     long             n_rec           = 0;
-    struct llama_context * ctx       = nullptr;  // for live predictor: route topk → cache observation
-    bool             predictor_mode  = false;
 };
 
 // llama.cpp's graph callback names per-layer tensors "<base>-<layer>"
@@ -103,14 +101,6 @@ static bool moe_trace_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         fwrite(data, 1, nbytes, st->out);
         st->n_rec++;
     }
-
-    // Live predictor observation (only on the topk records). For prefill (ne1 > 1),
-    // record the LAST token's selection — most recent and most informative for the
-    // upcoming decode step.
-    if (st->predictor_mode && tid == 2 && dtype == 1 && st->ctx) {
-        const int32_t * src = (const int32_t *) data + (size_t)(ne1 - 1) * ne0;
-        llama_moe_record_router(st->ctx, layer, src, ne0);
-    }
     return true;
 }
 
@@ -126,7 +116,7 @@ int main(int argc, char ** argv) {
     int  moe_overfetch       = 0;   // -moeoverfetch M: capture top-(K+M) for predictor over-fetch
     std::string oracle_path  = "";  // --oracle path: replay MOE2 trace to drive selective fills
     int  lookahead           = 0;   // --lookahead K: speculative prefill K steps ahead each iter
-    bool live_predictor      = false; // --live-predictor: temporal-1 predictor (no trace file)
+    float predictor_accuracy = 1.0f; // --predictor-accuracy: degrade oracle to this accuracy (1=perfect)
     bool wrap                = true; // wrap prompt in the Qwen chat template
     bool no_mmap             = false;
     bool no_trace            = false;
@@ -148,7 +138,7 @@ int main(int argc, char ** argv) {
         else if (a == "-moeoverfetch" || a == "--moe-expert-overfetch") moe_overfetch = atoi(next("-moeoverfetch"));
         else if (a == "--oracle")    oracle_path = next("--oracle");
         else if (a == "--lookahead") lookahead  = atoi(next("--lookahead"));
-        else if (a == "--live-predictor") live_predictor = true;
+        else if (a == "--predictor-accuracy") predictor_accuracy = (float) atof(next("--predictor-accuracy"));
         else if (a == "--raw")       wrap       = false;
         else if (a == "--no-mmap")   no_mmap    = true;
         else if (a == "--no-trace")  no_trace   = true;
@@ -157,7 +147,8 @@ int main(int argc, char ** argv) {
     if (model_path.empty()) {
         fprintf(stderr,
             "usage: %s -m model.gguf [-p prompt] [-o out.bin] [-n n_predict] [-ngl n] [-t threads] "
-            "[-ncmoe N] [-moecache C] [--oracle trace.bin] [--raw] [--no-mmap] [--no-trace]\n",
+            "[-ncmoe N] [-moecache C] [--oracle trace.bin] [--lookahead K] "
+            "[--predictor-accuracy A] [--raw] [--no-mmap] [--no-trace]\n",
             argv[0]);
         return 1;
     }
@@ -210,17 +201,12 @@ int main(int argc, char ** argv) {
         if (!st.out) { fprintf(stderr, "cannot open %s\n", out_path.c_str()); return 1; }
         fwrite("MOE2", 1, 4, st.out);
     }
-    st.predictor_mode = false; // live predictor now uses the batched-observe path,
-                               // not cb_eval. cb_eval is only installed for trace.
-
     llama_context_params cp     = llama_context_default_params();
     cp.n_ctx                    = n_prompt + n_predict + 16;
     cp.n_batch                  = n_prompt > 2048 ? n_prompt : 2048;
     cp.n_ubatch                 = cp.n_batch;
     cp.n_threads                = n_threads;
     cp.n_threads_batch          = n_threads;
-    // cb_eval is only for trace recording now. Live predictor observation uses the
-    // post-decode batched read (llama_moe_predictor_observe).
     if (!no_trace) {
         cp.cb_eval              = moe_trace_cb;
         cp.cb_eval_user_data    = &st;
@@ -231,17 +217,15 @@ int main(int argc, char ** argv) {
 
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) { fprintf(stderr, "failed to create context\n"); return 1; }
-    st.ctx = ctx;
 
-    // [EXPERIMENTAL] MoE expert prefill setup.
+    // [EXPERIMENTAL] MoE expert prefill setup. Only the oracle path remains.
     if (moe_cache_size > 0) {
-        if (live_predictor) {
-            llama_moe_predictor_enable(ctx);
-        } else if (!oracle_path.empty()) {
+        if (!oracle_path.empty()) {
             if (!llama_moe_oracle_load(ctx, oracle_path.c_str())) {
                 fprintf(stderr, "failed to load oracle '%s'\n", oracle_path.c_str());
                 return 1;
             }
+            llama_moe_predictor_set_accuracy(ctx, predictor_accuracy);
             // Pre-issue fills for step 1 (+ lookahead). These run on the copy stream
             // while the host walks into the first decode call.
             llama_moe_oracle_prefill(ctx, 1);
@@ -278,36 +262,20 @@ int main(int argc, char ** argv) {
         if (n > 0) { fwrite(buf, 1, n, stderr); }
 
         st.call_idx = call;
-        if (live_predictor) {
-            // Temporal-1 prefill: use observations from the PREVIOUS decode (or
-            // prompt prefill on the first iter) to predict this step's experts.
-            // Synchronous slot-map upload inside the call ensures the new mapping
-            // is visible before decode runs.
-            llama_moe_predictor_prefill(ctx);
-            llama_moe_oracle_wait_fills(ctx);
-        } else if (!oracle_path.empty()) {
-            // Queue the compute-stream wait for fills issued at the END of the
-            // PREVIOUS iteration (which were for step `call`). The slot-map upload
-            // those fills triggered also sits on the same copy stream, so the wait
-            // covers both — by the time decode starts, both the expert slabs AND
-            // the matching slot map are in place.
+        if (!oracle_path.empty()) {
+            // Wait for the previous iteration's queued prefills (= fills for step
+            // `call`) to land before submitting decode.
             llama_moe_oracle_wait_fills(ctx);
         }
         if (llama_decode(ctx, llama_batch_get_one(&id, 1))) {
             fprintf(stderr, "decode failed at step %d\n", n_decode);
             break;
         }
-        if (live_predictor) {
-            // Batched observation: one H<-D copy of the cache's persistent topk
-            // buffer, then update last_selected_experts for every managed layer.
-            // Replaces 48 mid-graph cb_eval syncs from the previous design.
-            llama_moe_predictor_observe(ctx);
-        } else if (!oracle_path.empty()) {
+        if (!oracle_path.empty()) {
             // Issue prefills for the NEXT step (and any further lookahead). Submitted
-            // AFTER decode(call) has been queued, so the slot-map upload they trigger
-            // does NOT overwrite step `call`'s slot map before its kernels read it.
-            // The fills run on the copy stream while the host loops back to sample
-            // the next token and the GPU finishes decode `call`'s compute.
+            // AFTER decode(call) so the slot-map upload doesn't race with the current
+            // decode's read. The fills run on the copy stream while the host loops
+            // back to sample the next token.
             llama_moe_oracle_prefill(ctx, call + 1 + lookahead);
         }
         n_decode++;
@@ -323,9 +291,10 @@ int main(int argc, char ** argv) {
         no_trace ? "" : (std::string(" (trace -> ") + out_path + ", "
                           + std::to_string(st.n_rec) + " records)").c_str());
     fprintf(stderr,
-        "config: ngl=%d ncmoe=%d moecache=%d mmap=%d trace=%d oracle=%s\n",
+        "config: ngl=%d ncmoe=%d moecache=%d mmap=%d trace=%d oracle=%s pred_acc=%.3f\n",
         ngl, n_cpu_moe, moe_cache_size, !no_mmap, !no_trace,
-        oracle_path.empty() ? "(none)" : oracle_path.c_str());
+        oracle_path.empty() ? "(none)" : oracle_path.c_str(),
+        predictor_accuracy);
 
     llama_sampler_free(smpl);
     llama_free(ctx);

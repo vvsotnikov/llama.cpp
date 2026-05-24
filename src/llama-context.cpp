@@ -3376,32 +3376,11 @@ void llama_context::moe_cache_warmup_all() {
     llama_moe_expert_cache_warmup_all(moe_expert_cache.get());
 }
 
-void llama_context::moe_predictor_enable() {
+void llama_context::moe_predictor_set_accuracy(float accuracy) {
     if (!moe_expert_cache) {
         return;
     }
-    llama_moe_expert_cache_enable_predictor(moe_expert_cache.get());
-}
-
-void llama_context::moe_record_router(int layer, const int32_t * ids, int n_ids) {
-    if (!moe_expert_cache) {
-        return;
-    }
-    llama_moe_expert_cache_record_router(moe_expert_cache.get(), layer, ids, n_ids);
-}
-
-void llama_context::moe_predictor_prefill() {
-    if (!moe_expert_cache) {
-        return;
-    }
-    llama_moe_expert_cache_predictor_prefill(moe_expert_cache.get());
-}
-
-void llama_context::moe_predictor_observe() {
-    if (!moe_expert_cache) {
-        return;
-    }
-    llama_moe_expert_cache_observe_routers(moe_expert_cache.get());
+    llama_moe_expert_cache_set_predictor_accuracy(moe_expert_cache.get(), accuracy);
 }
 
 bool llama_moe_oracle_load(struct llama_context * ctx, const char * path) {
@@ -3439,24 +3418,9 @@ void llama_moe_cache_warmup_all(struct llama_context * ctx) {
     ctx->moe_cache_warmup_all();
 }
 
-void llama_moe_predictor_enable(struct llama_context * ctx) {
+void llama_moe_predictor_set_accuracy(struct llama_context * ctx, float accuracy) {
     if (!ctx) return;
-    ctx->moe_predictor_enable();
-}
-
-void llama_moe_record_router(struct llama_context * ctx, int layer, const int32_t * ids, int n_ids) {
-    if (!ctx) return;
-    ctx->moe_record_router(layer, ids, n_ids);
-}
-
-void llama_moe_predictor_prefill(struct llama_context * ctx) {
-    if (!ctx) return;
-    ctx->moe_predictor_prefill();
-}
-
-void llama_moe_predictor_observe(struct llama_context * ctx) {
-    if (!ctx) return;
-    ctx->moe_predictor_observe();
+    ctx->moe_predictor_set_accuracy(accuracy);
 }
 
 llama_context_params llama_context_default_params() {

@@ -86,13 +86,7 @@ struct llama_moe_expert_cache_layer {
     std::vector<float>   cache_mask_host;
     struct ggml_tensor * cache_mask_gpu = nullptr;
 
-    // [EXPERIMENTAL] router-output capture slot. Shape [n_expert_used, 1] I32, a
-    // view into the cache-wide `topk_buffer` at this managed layer's column. In
-    // build_moe_ffn we insert a `ggml_cpy(selected_experts, topk_capture)` so the
-    // top-K expert ids land in a persistent GPU location; after llama_decode
-    // returns the whole topk_buffer is read host-side in a single tensor_get.
-    // Replaces the cb_eval-per-layer sync observation path for the live predictor.
-    struct ggml_tensor * topk_capture = nullptr;
+    // (former topk_capture view removed — temporal-1 capture path retired)
 
     // Per-slot validity (size C). 1 iff slot s currently holds a valid expert.
     std::vector<uint8_t> slot_valid;
@@ -145,13 +139,13 @@ struct llama_moe_expert_cache {
     std::vector<int32_t>                                    oracle_layer_to_idx; // size = n_layer
     int32_t                                                 oracle_max_step = 0;
 
-    // Live (temporal) predictor: most-recently-observed router output per managed
-    // layer. Updated by `record_router` (from the user's cb_eval) and consumed by
-    // `predictor_prefill_from_observations` to drive fills for the next decode.
-    // Empty inner vector means "no observation yet" (cold start).
-    bool                                                    predictor_enabled = false;
-    std::vector<std::vector<int32_t>>                       last_selected_experts; // [managed_idx]
-    std::vector<int32_t>                                    layer_to_managed_idx;  // size n_layer, -1 if not managed
+    // Accuracy-degradation knob for benchmarking. 1.0 = perfect oracle; values in
+    // [0, 1) corrupt each oracle prediction with probability (1 - accuracy),
+    // replacing it with a random non-correct expert. Used to characterize the
+    // prefetch mechanism's tok/s curve at synthetic predictor accuracies (so we
+    // can decide whether to invest in a real cross-layer predictor).
+    float                                                   predictor_accuracy = 1.0f;
+    uint64_t                                                rng_state = 0xDEADBEEFCAFE;
 
     // Stats (for diagnostics / bench reporting).
     uint64_t n_hits      = 0;
@@ -190,19 +184,6 @@ struct ggml_tensor * llama_moe_expert_cache_get_slot_map (const llama_moe_expert
 // 0.0 for missed. Multiplied into router weights pre-normalization so that
 // substitute-and-go reads (slot 0 for a missed expert) contribute zero.
 struct ggml_tensor * llama_moe_expert_cache_get_mask     (const llama_moe_expert_cache * cache, int layer);
-// Per-layer topk-capture tensor (I32 [n_expert_used, 1]); the graph copies
-// `selected_experts` into this view so the router output ends up in a persistent
-// GPU location. Read in batch via `llama_moe_expert_cache_observe_routers`.
-// Returns nullptr if the layer isn't cache-managed or capture isn't allocated.
-struct ggml_tensor * llama_moe_expert_cache_get_topk_capture(
-        const llama_moe_expert_cache * cache, int layer);
-
-// Read the entire topk_buffer host-side in a single sync H<-D copy and update
-// `last_selected_experts` for each managed layer. Called from the user (e.g.
-// moe-trace) right after `llama_decode` returns, replacing the cb_eval-per-layer
-// path for live predictor observation.
-void llama_moe_expert_cache_observe_routers(llama_moe_expert_cache * cache);
-
 // Push any pending host-side slot map changes to the GPU. Called from the public
 // llama_moe_oracle_prefill wrapper after a fill batch updates the host-side maps,
 // so the upcoming compute graph sees the new mapping. Uses synchronous host→device
@@ -262,23 +243,11 @@ void llama_moe_expert_cache_wait_fills(
         llama_moe_expert_cache * cache,
         ggml_backend_t compute_backend);
 
-// Live (temporal-1) predictor mode. Call once at setup; replaces the oracle path.
-void llama_moe_expert_cache_enable_predictor(llama_moe_expert_cache * cache);
-
-// Record an observed router output for `layer` (called from cb_eval when an
-// ffn_moe_topk tensor is read). The cache stashes the ids so the predictor can
-// use them as the prediction for the next decode step.
-void llama_moe_expert_cache_record_router(
-        llama_moe_expert_cache * cache,
-        int layer,
-        const int32_t * ids,
-        int n_ids);
-
-// Issue fills for the experts the temporal predictor expects to be needed next
-// (i.e. "the same experts the router picked last time, per layer"). Same async
-// fill + event-record semantics as `prefill_step`. Idempotent — already-cached
-// experts just get an LRU bump.
-void llama_moe_expert_cache_predictor_prefill(llama_moe_expert_cache * cache);
+// Set predictor accuracy in [0, 1]. 1.0 = perfect oracle (no degradation).
+// Values < 1.0 corrupt each oracle-predicted expert with probability (1 - acc):
+// the predicted id is replaced with a random non-correct expert. Used in
+// prefill_step to characterize the cache mechanism at synthetic accuracies.
+void llama_moe_expert_cache_set_predictor_accuracy(llama_moe_expert_cache * cache, float accuracy);
 
 // Fill EVERY expert slot of EVERY managed layer. Equivalent to "copy all the CPU
 // expert tensors to GPU once". Lets us A/B-test the cache plumbing against a known-
