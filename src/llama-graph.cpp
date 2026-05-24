@@ -1394,11 +1394,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // decode — a different working set). Prefill keeps using the model's CPU-resident
     // expert tensors; decode reads from the cache.
     ggml_tensor * cache_slot_map = nullptr;
+    ggml_tensor * cache_hit_mask = nullptr;
     if (moe_cache && n_tokens == 1) {
         if (ggml_tensor * cu = llama_moe_expert_cache_get_up(moe_cache, il))   { up_exps   = cu; }
         if (ggml_tensor * cg = llama_moe_expert_cache_get_gate(moe_cache, il)) { gate_exps = cg; }
         if (ggml_tensor * cd = llama_moe_expert_cache_get_down(moe_cache, il)) { down_exps = cd; }
         cache_slot_map = llama_moe_expert_cache_get_slot_map(moe_cache, il);
+        cache_hit_mask = llama_moe_expert_cache_get_mask(moe_cache, il);
     }
 
     ggml_tensor * logits = nullptr;
@@ -1517,6 +1519,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
+    // [EXPERIMENTAL] cache-miss handling: when an expert the router picked isn't in
+    // the cache, the slot_map "substitute-and-go" default sends mul_mat_id to slot 0
+    // — its kernel still reads SOMEONE's expert weights, just the wrong ones. To stop
+    // that garbage from corrupting the moe sum, zero out the router weight for missed
+    // experts right here (before the existing norm_w block, which will then
+    // re-normalize the surviving cached experts' weights to sum to 1).
+    if (cache_hit_mask) {
+        const int64_t n_ids = (int64_t) n_expert_used * n_tokens;
+        ggml_tensor * sel_c    = ggml_cont(ctx0, selected_experts);
+        ggml_tensor * sel_flat = ggml_reshape_3d(ctx0, sel_c, n_ids, 1, 1);
+        ggml_tensor * mask_r   = ggml_get_rows(ctx0, cache_hit_mask, sel_flat); // F32 [1, n_ids, 1, 1]
+        ggml_tensor * mask_c   = ggml_cont(ctx0, mask_r);
+        ggml_tensor * mask     = ggml_reshape_3d(ctx0, mask_c, 1, n_expert_used, n_tokens);
+        weights = ggml_mul(ctx0, weights, mask);
+        cb(weights, "ffn_moe_weights_masked", il);
+    }
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);

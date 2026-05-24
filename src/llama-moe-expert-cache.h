@@ -77,6 +77,15 @@ struct llama_moe_expert_cache_layer {
     // Shape [1, n_expert], type F32.
     struct ggml_tensor * slot_map_gpu = nullptr;
 
+    // [EXPERIMENTAL] cache-hit mask. cache_mask_host[e] = 1.0f iff expert e is
+    // currently in the cache, else 0.0f. Read in the graph via ggml_get_rows and
+    // multiplied into the router weights BEFORE the existing renormalization step,
+    // so a missed expert (substitute-and-go reads garbage from slot 0) contributes
+    // zero to moe_out instead of corrupting it. The renormalization rescales the
+    // surviving cached experts' weights to sum to 1.
+    std::vector<float>   cache_mask_host;
+    struct ggml_tensor * cache_mask_gpu = nullptr;
+
     // Per-slot validity (size C). 1 iff slot s currently holds a valid expert.
     std::vector<uint8_t> slot_valid;
 
@@ -159,6 +168,10 @@ struct ggml_tensor * llama_moe_expert_cache_get_down     (const llama_moe_expert
 // ggml_get_rows(slot_map, selected_experts) → ggml_cast(I32) to translate router
 // expert ids into cache slot ids before mul_mat_id. Returns nullptr if not managed.
 struct ggml_tensor * llama_moe_expert_cache_get_slot_map (const llama_moe_expert_cache * cache, int layer);
+// Cache-hit mask tensor for layer L (F32 [1, n_expert]). 1.0 for cached experts,
+// 0.0 for missed. Multiplied into router weights pre-normalization so that
+// substitute-and-go reads (slot 0 for a missed expert) contribute zero.
+struct ggml_tensor * llama_moe_expert_cache_get_mask     (const llama_moe_expert_cache * cache, int layer);
 
 // Push any pending host-side slot map changes to the GPU. Called from the public
 // llama_moe_oracle_prefill wrapper after a fill batch updates the host-side maps,

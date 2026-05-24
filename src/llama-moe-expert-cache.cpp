@@ -136,8 +136,8 @@ void llama_moe_expert_cache_allocate(
     }
 
     // Phase 2: cache shape `[n_embd, n_ff, C]` (or transpose for down). Each managed
-    // layer contributes 3 cache tensors (up / gate / down) + 1 slot map tensor.
-    const size_t n_tensors_max = managed_layers.size() * 4;
+    // layer contributes 3 cache tensors (up / gate / down) + 1 slot_map + 1 mask.
+    const size_t n_tensors_max = managed_layers.size() * 5;
 
     ggml_init_params ip{};
     ip.mem_size   = ggml_tensor_overhead() * (n_tensors_max + 8);
@@ -197,6 +197,14 @@ void llama_moe_expert_cache_allocate(
             // Allocate the staging ring (each entry = a stable snapshot for one
             // in-flight async upload). See MOE_SLOT_MAP_STAGING_RING comment.
             L.slot_map_staging.assign(MOE_SLOT_MAP_STAGING_RING, std::vector<float>(L.n_expert, 0.0f));
+        }
+        // Cache-hit mask: parallel to slot_map, 1.0 iff cached.
+        {
+            char name[64];
+            snprintf(name, sizeof(name), "moe_cache_mask_%d", il);
+            L.cache_mask_gpu = ggml_new_tensor_2d(cache->ctx.get(), GGML_TYPE_F32, 1, L.n_expert);
+            ggml_set_name(L.cache_mask_gpu, name);
+            L.cache_mask_host.assign(L.n_expert, 0.0f);
         }
 
         L.expert_to_slot.assign(L.n_expert, -1);
@@ -287,6 +295,11 @@ ggml_tensor * llama_moe_expert_cache_get_slot_map(const llama_moe_expert_cache *
     return L ? L->slot_map_gpu : nullptr;
 }
 
+ggml_tensor * llama_moe_expert_cache_get_mask(const llama_moe_expert_cache * cache, int layer) {
+    const auto * L = find_layer(cache, layer);
+    return L ? L->cache_mask_gpu : nullptr;
+}
+
 // Mutable variant of find_layer for fill paths.
 static llama_moe_expert_cache_layer * find_layer_mut(llama_moe_expert_cache * cache, int layer) {
     if (!cache) {
@@ -340,6 +353,7 @@ bool llama_moe_expert_cache_fill_sync(
             if (evicted_expert >= 0) {
                 L->expert_to_slot[evicted_expert] = -1;
                 L->slot_map_host[evicted_expert]  = 0.0f; // substitute-and-go default
+                L->cache_mask_host[evicted_expert] = 0.0f; // mark as missed
                 cache->n_evictions++;
             }
             slot = victim;
@@ -376,6 +390,7 @@ bool llama_moe_expert_cache_fill_sync(
     L->slot_valid[slot]       = 1;
     L->slot_lru[slot]         = ++L->lru_counter;
     L->slot_map_host[expert]  = (float) slot;
+    L->cache_mask_host[expert] = 1.0f; // expert is now cached
     cache->n_fills++;
     return true;
 }
@@ -412,6 +427,7 @@ void llama_moe_expert_cache_invalidate_all(llama_moe_expert_cache * cache) {
         std::fill(L.slot_valid.begin(),     L.slot_valid.end(),     0);
         std::fill(L.slot_lru.begin(),       L.slot_lru.end(),       0);
         std::fill(L.slot_map_host.begin(),  L.slot_map_host.end(),  0.0f);
+        std::fill(L.cache_mask_host.begin(),L.cache_mask_host.end(),0.0f);
         L.lru_counter = 0;
     }
 }
@@ -446,11 +462,11 @@ void llama_moe_expert_cache_upload_slot_maps(llama_moe_expert_cache * cache) {
         // cudaStreamPerThread followed by cudaStreamSynchronize. The sync blocks
         // until the upload completes, so no host-buffer race even when the host
         // calls upload_slot_maps in rapid succession (e.g. lookahead). Trade-off:
-        // each upload serializes the host through cudaStreamPerThread's queue —
-        // ~512 B × 28 layers per upload, dominated by launch overhead, ~10-50 us
-        // each. Acceptable; the async path with a staging ring tried earlier
-        // produced regressions at small C that we couldn't track down in-session.
+        // each upload serializes the host through cudaStreamPerThread's queue.
         ggml_backend_tensor_set(L.slot_map_gpu, L.slot_map_host.data(), 0, bytes);
+        if (L.cache_mask_gpu) {
+            ggml_backend_tensor_set(L.cache_mask_gpu, L.cache_mask_host.data(), 0, bytes);
+        }
     }
 }
 
