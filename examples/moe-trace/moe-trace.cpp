@@ -208,7 +208,8 @@ int main(int argc, char ** argv) {
         if (!st.out) { fprintf(stderr, "cannot open %s\n", out_path.c_str()); return 1; }
         fwrite("MOE2", 1, 4, st.out);
     }
-    st.predictor_mode = live_predictor;
+    st.predictor_mode = false; // live predictor now uses the batched-observe path,
+                               // not cb_eval. cb_eval is only installed for trace.
 
     llama_context_params cp     = llama_context_default_params();
     cp.n_ctx                    = n_prompt + n_predict + 16;
@@ -216,9 +217,9 @@ int main(int argc, char ** argv) {
     cp.n_ubatch                 = cp.n_batch;
     cp.n_threads                = n_threads;
     cp.n_threads_batch          = n_threads;
-    // Install cb_eval whenever we need to observe tensors — for trace recording AND
-    // for the live predictor's router observation.
-    if (!no_trace || live_predictor) {
+    // cb_eval is only for trace recording now. Live predictor observation uses the
+    // post-decode batched read (llama_moe_predictor_observe).
+    if (!no_trace) {
         cp.cb_eval              = moe_trace_cb;
         cp.cb_eval_user_data    = &st;
     }
@@ -275,10 +276,10 @@ int main(int argc, char ** argv) {
 
         st.call_idx = call;
         if (live_predictor) {
-            // Temporal-1 prefill: use the router observations stashed by cb_eval
-            // during the previous decode (or during prompt prefill on the first
-            // iter) to predict this step's experts. Synchronous slot-map upload
-            // inside ensures the new mapping is visible before decode runs.
+            // Temporal-1 prefill: use observations from the PREVIOUS decode (or
+            // prompt prefill on the first iter) to predict this step's experts.
+            // Synchronous slot-map upload inside the call ensures the new mapping
+            // is visible before decode runs.
             llama_moe_predictor_prefill(ctx);
             llama_moe_oracle_wait_fills(ctx);
         } else if (!oracle_path.empty()) {
@@ -293,7 +294,12 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "decode failed at step %d\n", n_decode);
             break;
         }
-        if (!oracle_path.empty()) {
+        if (live_predictor) {
+            // Batched observation: one H<-D copy of the cache's persistent topk
+            // buffer, then update last_selected_experts for every managed layer.
+            // Replaces 48 mid-graph cb_eval syncs from the previous design.
+            llama_moe_predictor_observe(ctx);
+        } else if (!oracle_path.empty()) {
             // Issue prefills for the NEXT step (and any further lookahead). Submitted
             // AFTER decode(call) has been queued, so the slot-map upload they trigger
             // does NOT overwrite step `call`'s slot map before its kernels read it.

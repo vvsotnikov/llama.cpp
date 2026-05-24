@@ -135,9 +135,10 @@ void llama_moe_expert_cache_allocate(
         return;
     }
 
-    // Phase 2: cache shape `[n_embd, n_ff, C]` (or transpose for down). Each managed
-    // layer contributes 3 cache tensors (up / gate / down) + 1 slot_map + 1 mask.
-    const size_t n_tensors_max = managed_layers.size() * 5;
+    // Phase 2: cache shape `[n_embd, n_ff, C]` (or transpose for down). Per managed
+    // layer: 3 cache tensors (up/gate/down) + 1 slot_map + 1 mask + 1 topk view = 6.
+    // Plus 1 cache-wide topk buffer.
+    const size_t n_tensors_max = managed_layers.size() * 6 + 4;
 
     ggml_init_params ip{};
     ip.mem_size   = ggml_tensor_overhead() * (n_tensors_max + 8);
@@ -213,6 +214,31 @@ void llama_moe_expert_cache_allocate(
         L.slot_lru.assign(L.C, 0);
 
         cache->layers.push_back(std::move(L));
+    }
+
+    // Cache-wide topk capture buffer. Shape [n_expert_used, n_managed_layers] I32.
+    // Each managed layer writes its `selected_experts` here via an inserted ggml_cpy
+    // in build_moe_ffn; live predictor observation reads the whole thing in one go.
+    {
+        const int n_eu     = (int) hparams.n_expert_used;
+        const int n_layers = (int) cache->layers.size();
+        cache->n_expert_used_cap = n_eu;
+        cache->topk_buffer       = ggml_new_tensor_2d(cache->ctx.get(), GGML_TYPE_I32, n_eu, n_layers);
+        ggml_set_name(cache->topk_buffer, "moe_cache_topk_buffer");
+        cache->topk_buffer_host.assign(n_eu * n_layers, 0);
+
+        // Per-layer view (a slice of one column).
+        for (int i = 0; i < n_layers; ++i) {
+            auto & L = cache->layers[i];
+            const size_t offset = (size_t) i * cache->topk_buffer->nb[1];
+            L.topk_capture = ggml_view_2d(cache->ctx.get(), cache->topk_buffer,
+                                          n_eu, 1,
+                                          cache->topk_buffer->nb[1],
+                                          offset);
+            char name[64];
+            snprintf(name, sizeof(name), "moe_cache_topk_view_%d", L.layer);
+            ggml_set_name(L.topk_capture, name);
+        }
     }
 
     // Allocate one backend buffer covering every cache tensor.
@@ -298,6 +324,28 @@ ggml_tensor * llama_moe_expert_cache_get_slot_map(const llama_moe_expert_cache *
 ggml_tensor * llama_moe_expert_cache_get_mask(const llama_moe_expert_cache * cache, int layer) {
     const auto * L = find_layer(cache, layer);
     return L ? L->cache_mask_gpu : nullptr;
+}
+
+ggml_tensor * llama_moe_expert_cache_get_topk_capture(const llama_moe_expert_cache * cache, int layer) {
+    const auto * L = find_layer(cache, layer);
+    return L ? L->topk_capture : nullptr;
+}
+
+void llama_moe_expert_cache_observe_routers(llama_moe_expert_cache * cache) {
+    if (!cache || !cache->topk_buffer || !cache->predictor_enabled) {
+        return;
+    }
+    const size_t bytes = cache->topk_buffer_host.size() * sizeof(int32_t);
+    // One sync H<-D copy for ALL managed layers' router outputs.
+    ggml_backend_tensor_get(cache->topk_buffer, cache->topk_buffer_host.data(), 0, bytes);
+    // Fan out to per-layer record_router (host-side fast path; no more sync points).
+    const int n_eu = cache->n_expert_used_cap;
+    for (size_t i = 0; i < cache->layers.size(); ++i) {
+        const int layer = cache->layers[i].layer;
+        const int32_t * src = cache->topk_buffer_host.data() + i * n_eu;
+        // Reuse the existing record_router path (updates last_selected_experts).
+        llama_moe_expert_cache_record_router(cache, layer, src, n_eu);
+    }
 }
 
 // Mutable variant of find_layer for fill paths.

@@ -482,6 +482,11 @@ extern "C" {
     LLAMA_API void llama_moe_predictor_enable  (struct llama_context * ctx);
     LLAMA_API void llama_moe_record_router     (struct llama_context * ctx, int layer, const int32_t * ids, int n_ids);
     LLAMA_API void llama_moe_predictor_prefill (struct llama_context * ctx);
+    // Batched router-output observation: read the cache's persistent topk buffer
+    // (filled by inserted ggml_cpy ops in build_moe_ffn) in a single H<-D copy and
+    // update all managed layers' `last_selected_experts`. Call once per decode in
+    // place of per-layer cb_eval recording.
+    LLAMA_API void llama_moe_predictor_observe (struct llama_context * ctx);
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 

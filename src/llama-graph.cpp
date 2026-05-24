@@ -1485,6 +1485,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // [EXPERIMENTAL] live-predictor capture: clone selected_experts into the cache's
+    // persistent topk buffer so the predictor can observe router output via a single
+    // post-decode batched tensor_get (instead of 48 cb_eval sync points). Inserted
+    // unconditionally when the cache layer is active — the cpy is cheap on GPU and
+    // lets the predictor turn observation on/off without re-reserving the graph.
+    if (moe_cache && n_tokens == 1) {
+        if (ggml_tensor * topk_cap = llama_moe_expert_cache_get_topk_capture(moe_cache, il)) {
+            ggml_tensor * captured = ggml_cpy(ctx0, selected_experts, topk_cap);
+            ggml_build_forward_expand(gf, captured);
+        }
+    }
+
     // [EXPERIMENTAL] Phase 2 expert-cache slot remap. `mm_ids` is what feeds
     // mul_mat_id when reading from the smaller cache; the original
     // `selected_experts` (expert ids) is preserved for the ops that index

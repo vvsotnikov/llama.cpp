@@ -86,6 +86,14 @@ struct llama_moe_expert_cache_layer {
     std::vector<float>   cache_mask_host;
     struct ggml_tensor * cache_mask_gpu = nullptr;
 
+    // [EXPERIMENTAL] router-output capture slot. Shape [n_expert_used, 1] I32, a
+    // view into the cache-wide `topk_buffer` at this managed layer's column. In
+    // build_moe_ffn we insert a `ggml_cpy(selected_experts, topk_capture)` so the
+    // top-K expert ids land in a persistent GPU location; after llama_decode
+    // returns the whole topk_buffer is read host-side in a single tensor_get.
+    // Replaces the cb_eval-per-layer sync observation path for the live predictor.
+    struct ggml_tensor * topk_capture = nullptr;
+
     // Per-slot validity (size C). 1 iff slot s currently holds a valid expert.
     std::vector<uint8_t> slot_valid;
 
@@ -118,6 +126,15 @@ struct llama_moe_expert_cache {
 
     // One entry per ncmoe-managed MoE layer (sorted by layer index).
     std::vector<llama_moe_expert_cache_layer> layers;
+
+    // [EXPERIMENTAL] persistent capture buffer for router outputs (live predictor
+    // observation path). Shape [n_expert_used, n_managed_layers] I32 — one column
+    // per managed layer's selected_experts. Filled inside the compute graph by
+    // ggml_cpy ops emitted from build_moe_ffn; read once host-side via
+    // `llama_moe_expert_cache_observe_routers` after llama_decode returns.
+    struct ggml_tensor * topk_buffer       = nullptr;
+    std::vector<int32_t> topk_buffer_host;     // staging for the post-decode read
+    int32_t              n_expert_used_cap = 0; // size of each column
 
     // Oracle: per-layer per-decode-step list of expert ids the router selected.
     // Indexed as oracle_experts[layer_idx_in_oracle][step_idx]. layer_to_oracle maps
@@ -172,6 +189,18 @@ struct ggml_tensor * llama_moe_expert_cache_get_slot_map (const llama_moe_expert
 // 0.0 for missed. Multiplied into router weights pre-normalization so that
 // substitute-and-go reads (slot 0 for a missed expert) contribute zero.
 struct ggml_tensor * llama_moe_expert_cache_get_mask     (const llama_moe_expert_cache * cache, int layer);
+// Per-layer topk-capture tensor (I32 [n_expert_used, 1]); the graph copies
+// `selected_experts` into this view so the router output ends up in a persistent
+// GPU location. Read in batch via `llama_moe_expert_cache_observe_routers`.
+// Returns nullptr if the layer isn't cache-managed or capture isn't allocated.
+struct ggml_tensor * llama_moe_expert_cache_get_topk_capture(
+        const llama_moe_expert_cache * cache, int layer);
+
+// Read the entire topk_buffer host-side in a single sync H<-D copy and update
+// `last_selected_experts` for each managed layer. Called from the user (e.g.
+// moe-trace) right after `llama_decode` returns, replacing the cb_eval-per-layer
+// path for live predictor observation.
+void llama_moe_expert_cache_observe_routers(llama_moe_expert_cache * cache);
 
 // Push any pending host-side slot map changes to the GPU. Called from the public
 // llama_moe_oracle_prefill wrapper after a fill batch updates the host-side maps,

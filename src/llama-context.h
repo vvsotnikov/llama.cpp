@@ -255,6 +255,7 @@ public:
     void moe_predictor_enable();
     void moe_record_router(int layer, const int32_t * ids, int n_ids);
     void moe_predictor_prefill();
+    void moe_predictor_observe();
 
 private:
     llm_graph_params graph_params(

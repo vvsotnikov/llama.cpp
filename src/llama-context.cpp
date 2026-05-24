@@ -3396,6 +3396,13 @@ void llama_context::moe_predictor_prefill() {
     llama_moe_expert_cache_predictor_prefill(moe_expert_cache.get());
 }
 
+void llama_context::moe_predictor_observe() {
+    if (!moe_expert_cache) {
+        return;
+    }
+    llama_moe_expert_cache_observe_routers(moe_expert_cache.get());
+}
+
 bool llama_moe_oracle_load(struct llama_context * ctx, const char * path) {
     if (!ctx) {
         return false;
@@ -3444,6 +3451,11 @@ void llama_moe_record_router(struct llama_context * ctx, int layer, const int32_
 void llama_moe_predictor_prefill(struct llama_context * ctx) {
     if (!ctx) return;
     ctx->moe_predictor_prefill();
+}
+
+void llama_moe_predictor_observe(struct llama_context * ctx) {
+    if (!ctx) return;
+    ctx->moe_predictor_observe();
 }
 
 llama_context_params llama_context_default_params() {
