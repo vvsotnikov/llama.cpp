@@ -82,15 +82,236 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
-void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
-    GGML_ASSERT(        src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
-    GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12050
+typedef CUresult (*ggml_cuda_tmap_encode_t)(CUtensorMap *, CUtensorMapDataType, cuuint32_t, void *, const cuuint64_t *,
+    const cuuint64_t *, const cuuint32_t *, const cuuint32_t *, CUtensorMapInterleave, CUtensorMapSwizzle,
+    CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+
+// cuTensorMapEncodeTiled through the runtime, so that no driver library needs to be linked
+static ggml_cuda_tmap_encode_t ggml_cuda_get_tmap_encode() {
+    static ggml_cuda_tmap_encode_t fn = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        void * ptr = nullptr;
+        cudaDriverEntryPointQueryResult status;
+        if (cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &ptr, 12000, cudaEnableDefault, &status) == cudaSuccess &&
+                status == cudaDriverEntryPointSuccess) {
+            fn = (ggml_cuda_tmap_encode_t) ptr;
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
+    return fn;
+}
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12050
+
+bool ggml_cuda_mmq_encode_tmap_nvfp4(const ggml_tensor * src0, const int cc, ggml_cuda_tmap & tmap) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12050
+    if (src0->type != GGML_TYPE_NVFP4 || !blackwell_mma_available(cc)) {
+        return false;
+    }
+    // 144 byte boxes need 16 byte aligned row spans: K % 256 == 0; rows of all channels and samples are one
+    // strided 2D array, so the tensor has to be contiguous
+    const int64_t row_bytes = ggml_row_size(src0->type, src0->ne[0]);
+    const int64_t nrows     = src0->ne[1]*src0->ne[2]*src0->ne[3];
+    if (src0->ne[0] % 256 != 0 || (size_t) row_bytes != src0->nb[1] || !ggml_is_contiguous(src0) ||
+            reinterpret_cast<uintptr_t>(src0->data) % 16 != 0 || nrows > INT32_MAX) {
+        return false;
+    }
+    const ggml_cuda_tmap_encode_t encode = ggml_cuda_get_tmap_encode();
+    if (!encode) {
+        return false;
+    }
+    const cuuint64_t global_dim[2]     = { (cuuint64_t) row_bytes, (cuuint64_t) nrows };
+    const cuuint64_t global_stride[1]  = { (cuuint64_t) row_bytes };
+    const cuuint32_t box_dim[2]        = { MMQ_FP4_TMA_BOX_BYTES, (cuuint32_t) ggml_cuda_mmq_get_I(GGML_TYPE_NVFP4, 8, false, cc) };
+    const cuuint32_t element_stride[2] = { 1, 1 };
+    const CUresult res = encode(&tmap, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, src0->data, global_dim, global_stride, box_dim,
+        element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    return res == CUDA_SUCCESS;
+#else
+    GGML_UNUSED(src0);
+    GGML_UNUSED(cc);
+    GGML_UNUSED(tmap);
+    return false;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12050
+}
+
+// src1 quantized to the MMQ layout of src0_type: fp4 blocks with per row scales, or q8_1 blocks
+struct mmq_src1_q {
+    ggml_cuda_pool_alloc<char>  data;
+    ggml_cuda_pool_alloc<float> scale;
+    bool                        native_fp4 = false;
+    int64_t                     s12        = 0; // strides of the quantized tensor in ints
+    int64_t                     s13        = 0;
+
+    mmq_src1_q(ggml_cuda_pool & pool) : data(pool), scale(pool) {}
+};
+
+static void ggml_cuda_mmq_quantize_src1(
+        ggml_backend_cuda_context & ctx, const ggml_type type_src0, const ggml_tensor * src1,
+        const ggml_cuda_mmq_glu_src1 * glu_src1, mmq_src1_q & q, cudaStream_t stream) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+    const size_t  ts_src1 = ggml_type_size(src1->type);
+    GGML_ASSERT(src1->nb[0] == ts_src1);
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+
+    q.native_fp4 = blackwell_mma_available(cc) && (type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4);
+    const size_t y_block_size       = q.native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
+    const size_t y_values_per_block = q.native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
+
+    // the tail padding covers the largest J tile of either fallback variant, so that the buffer can be shared
+    // by mul_mats with different row counts
+    const size_t pad = std::max(ggml_cuda_mmq_get_J_max(type_src0, false, cc, ne11),
+                                ggml_cuda_mmq_get_J_max(type_src0, true,  cc, ne11)) * sizeof(block_q8_1_mmq);
+    q.data.alloc(ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + pad);
+    if (type_src0 == GGML_TYPE_NVFP4 && q.native_fp4) {
+        q.scale.alloc(ne13*ne12*ne11);
+    }
+
+    const int64_t s11 = src1->nb[1] / ts_src1;
+    const int64_t s12 = src1->nb[2] / ts_src1;
+    const int64_t s13 = src1->nb[3] / ts_src1;
+    const float * src1_d = (const float *) src1->data;
+    if (q.native_fp4) {
+        static constexpr size_t align_float8 = 32;
+        static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
+        if (glu_src1) {
+            GGML_ASSERT(type_src0 == GGML_TYPE_NVFP4);
+            const auto aligned = [&](const float * ptr) {
+                return reinterpret_cast<uintptr_t>(ptr) % align_float8 == 0 &&
+                    (glu_src1->s01*ts_src1) % align_float8 == 0 &&
+                    (glu_src1->s02*ts_src1) % align_float8 == 0 &&
+                    (glu_src1->s03*ts_src1) % align_float8 == 0;
+            };
+            const bool use_aligned_float8 = aligned(glu_src1->gate) && aligned(glu_src1->up);
+            quantize_mmq_nvfp4_glu_cuda(glu_src1->gate, glu_src1->up, glu_src1->op, q.data.get(), q.scale.ptr, use_aligned_float8,
+                                        ne10, glu_src1->s01, glu_src1->s02, glu_src1->s03, ne10_padded, ne11, ne12, ne13, stream);
+        } else {
+            const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
+            quantize_mmq_fp4_cuda(src1_d, nullptr, q.data.get(), q.scale.ptr, type_src0, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
+                                    ne11, ne12, ne13, stream);
+        }
+    } else {
+        GGML_ASSERT(!glu_src1);
+        quantize_mmq_q8_1_cuda(src1_d, nullptr, q.data.get(), type_src0, ne10, s11, s12, s13, ne10_padded,
+                               ne11, ne12, ne13, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    // Stride depends on quantization format
+    q.s12 = q.native_fp4 ?
+        ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
+        ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    q.s13 = ne12*q.s12;
+}
+
+// dst = src0 * src1 with src1 already quantized into q
+static void ggml_cuda_mmq_launch_quantized(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const mmq_src1_q & q, cudaStream_t stream, const ggml_tensor * output_scale) {
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    GGML_ASSERT(nb00 == ts_src0);
+    GGML_ASSERT(nb0  == ts_dst);
+
+    const char * src0_d = (const char *) src0->data;
+    float      * dst_d  = (float       *)  dst->data;
+
+    // If src0 is a temporary compute buffer, clear any potential padding.
+    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        const size_t size_data  = ggml_nbytes(src0);
+        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+        if (size_alloc > size_data) {
+            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+            GGML_ASSERT(!src0->view_src);
+            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+        }
+    }
+
+    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s1  =  dst->nb[1] / ts_dst;
+    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s2  =  dst->nb[2] / ts_dst;
+    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s3  =  dst->nb[3] / ts_dst;
+
+    ggml_cuda_tmap tmap_x;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool use_tmap = ggml_cuda_mmq_encode_tmap_nvfp4(src0, cc, tmap_x);
+
+    const float * output_scale_d = nullptr;
+    if (output_scale) {
+        GGML_ASSERT(output_scale->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(output_scale));
+        GGML_ASSERT(ggml_nelements(output_scale) == 1);
+        output_scale_d = (const float *) output_scale->data;
+    }
+
+    const mmq_args args = {
+        src0_d, src0->type, (const int *) q.data.ptr, nullptr, nullptr, dst_d,
+        src0->type == GGML_TYPE_NVFP4 && q.native_fp4 ? q.scale.ptr : nullptr,
+        output_scale_d,
+        use_tmap ? &tmap_x : nullptr,
+        ne00, ne01, ne1, s01, ne11, s1,
+        ne02, ne12, s02, q.s12, s2,
+        ne03, ne13, s03, q.s13, s3,
+        ne1};
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+}
+
+void ggml_cuda_mul_mat_q_shared_src1(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_tensor ** dsts, const int n_dst) {
+    GGML_ASSERT(n_dst > 0);
     cudaStream_t stream = ctx.stream();
+
+    const ggml_type type_src0 = dsts[0]->src[0]->type;
+    mmq_src1_q q(ctx.pool());
+    ggml_cuda_mmq_quantize_src1(ctx, type_src0, src1, nullptr, q, stream);
+
+    for (int i = 0; i < n_dst; ++i) {
+        GGML_ASSERT(dsts[i]->src[0]->type == type_src0);
+        GGML_ASSERT(dsts[i]->src[1] == src1);
+        GGML_ASSERT(dsts[i]->src[2] == nullptr);
+        ggml_cuda_mmq_launch_quantized(ctx, dsts[i]->src[0], src1, dsts[i], q, stream, nullptr);
+    }
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mmq_glu_src1 * glu_src1, const ggml_tensor * output_scale) {
+    GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+    GGML_ASSERT(!output_scale || (!ids && src0->type == GGML_TYPE_NVFP4));
+
+    cudaStream_t stream = ctx.stream();
+
+    if (!ids) {
+        mmq_src1_q q(ctx.pool());
+        ggml_cuda_mmq_quantize_src1(ctx, src0->type, src1, glu_src1, q, stream);
+        ggml_cuda_mmq_launch_quantized(ctx, src0, src1, dst, q, stream, output_scale);
+        return;
+    }
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     const size_t ts_src0 = ggml_type_size(src0->type);
@@ -100,7 +321,7 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(        nb00       == ts_src0);
     GGML_ASSERT(        nb10       == ts_src1);
     GGML_ASSERT(        nb0        == ts_dst);
-    GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
+    GGML_ASSERT(ids->nb[0] == ggml_type_size(ids->type));
 
     const char  * src0_d = (const char  *) src0->data;
     const float * src1_d = (const float *) src1->data;
@@ -132,50 +353,7 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
-    if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
-        ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
-        if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
-            src1_scale.alloc(ne13*ne12*ne11);
-        }
-
-        {
-            const int64_t s11 = src1->nb[1] / ts_src1;
-            const int64_t s12 = src1->nb[2] / ts_src1;
-            const int64_t s13 = src1->nb[3] / ts_src1;
-            if (use_native_fp4) {
-                static constexpr size_t align_float8 = 32;
-                const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
-                static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
-                                        ne11, ne12, ne13, stream);
-
-            } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
-                                       ne11, ne12, ne13, stream);
-            }
-            CUDA_CHECK(cudaGetLastError());
-        }
-
-        // Stride depends on quantization format
-        const int64_t s12 = use_native_fp4 ?
-                                ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
-                                ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
-        const int64_t s13 = ne12*s12;
-
-        const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
-            src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
-            ne00, ne01, ne1, s01, ne11, s1,
-            ne02, ne12, s02, s12, s2,
-            ne03, ne13, s03, s13, s3,
-            ne1};
-        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
-        return;
-    }
-
+    GGML_ASSERT(!glu_src1); // not used with mul_mat_id
     GGML_ASSERT(ne13 == 1);
     GGML_ASSERT(nb12 % nb11 == 0);
     GGML_ASSERT(nb2  % nb1  == 0);
@@ -245,9 +423,14 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+    ggml_cuda_tmap tmap_x;
+    const bool use_tmap = ggml_cuda_mmq_encode_tmap_nvfp4(src0, cc, tmap_x);
+
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
+        nullptr,
+        use_tmap ? &tmap_x : nullptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,

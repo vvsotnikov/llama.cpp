@@ -139,6 +139,76 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+
+// dim 0 concat where src1 is stored transposed (contiguous along dim 1, e.g. a transposed token-major matrix).
+// The generic kernel would read src1 with one row per block, uncoalesced. Here a 32x32 tile is read along dim 1
+// and written along dim 0 through shared memory, so both sides are coalesced. src0 is expected to be narrow
+// (the leading dst columns), it is read through the same tile with lanes along dim 1.
+#define CUDA_CONCAT_TILE 32
+#define CUDA_CONCAT_TILE_ROWS 8
+
+template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_TILE*CUDA_CONCAT_TILE_ROWS)
+    concat_transposed_src1(
+        const char * src0,
+        const char * src1,
+              char * dst,
+           int64_t   ne00,
+          uint64_t   nb00,
+          uint64_t   nb01,
+          uint64_t   nb02,
+          uint64_t   nb03,
+          uint64_t   nb10,
+          uint64_t   nb11,
+          uint64_t   nb12,
+          uint64_t   nb13,
+           int64_t   ne0,
+           int64_t   ne1,
+           int64_t   ne2,
+          uint64_t   nb1,
+          uint64_t   nb2,
+          uint64_t   nb3) {
+    __shared__ T tile[CUDA_CONCAT_TILE][CUDA_CONCAT_TILE + 1];
+
+    const int64_t i3  = blockIdx.z / ne2;
+    const int64_t i2  = blockIdx.z % ne2;
+    const int64_t i0b = (int64_t) blockIdx.x * CUDA_CONCAT_TILE;
+    const int64_t i1b = (int64_t) blockIdx.y * CUDA_CONCAT_TILE;
+    const int     tx  = threadIdx.x;
+    const int     ty  = threadIdx.y;
+
+    // load: lanes run along dim 1, which is the contiguous direction of src1
+    const int64_t i1 = i1b + tx;
+    if (i1 < ne1) {
+#pragma unroll
+        for (int j = 0; j < CUDA_CONCAT_TILE; j += CUDA_CONCAT_TILE_ROWS) {
+            const int64_t i0 = i0b + ty + j;
+            if (i0 >= ne0) {
+                break;
+            }
+            const char * x = i0 < ne00 ?
+                src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00 :
+                src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10;
+            tile[tx][ty + j] = *(const T *) x;
+        }
+    }
+
+    __syncthreads();
+
+    // store: lanes run along dim 0, contiguous in dst
+    const int64_t i0 = i0b + tx;
+    if (i0 < ne0) {
+#pragma unroll
+        for (int j = 0; j < CUDA_CONCAT_TILE; j += CUDA_CONCAT_TILE_ROWS) {
+            const int64_t i1s = i1b + ty + j;
+            if (i1s >= ne1) {
+                break;
+            }
+            *(T *) (dst + i3*nb3 + i2*nb2 + i1s*nb1 + i0*sizeof(T)) = tile[ty + j][tx];
+        }
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -160,6 +230,16 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (dim == 0 && !ggml_is_quantized(src0->type) && src1->nb[1] == sizeof(T) && dst->nb[0] == sizeof(T)) {
+        const dim3 grid_dim((dst->ne[0] + CUDA_CONCAT_TILE - 1) / CUDA_CONCAT_TILE,
+                            (dst->ne[1] + CUDA_CONCAT_TILE - 1) / CUDA_CONCAT_TILE,
+                            dst->ne[2] * dst->ne[3]);
+        const dim3 block_dim(CUDA_CONCAT_TILE, CUDA_CONCAT_TILE_ROWS, 1);
+        concat_transposed_src1<T><<<grid_dim, block_dim, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->ne[0], dst->ne[1], dst->ne[2], dst->nb[1], dst->nb[2], dst->nb[3]);
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 

@@ -1884,6 +1884,79 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+// true when ggml_cuda_mul_mat would dispatch to MMQ; mirrors the branch order above and must be kept in sync
+static bool ggml_cuda_mul_mat_uses_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+        return false;
+    }
+    if (ne01 == 1 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1 && src0->type == GGML_TYPE_F32) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        return false;
+    }
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        return false;
+    }
+    return ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
+}
+
+// glu -> mul_mat where the GLU output is only read by the mul_mat: the NVFP4 activation quantizer of MMQ can
+// apply the GLU while reading gate and up, so the F32 GLU output is never written. Fills glu_src1 on success.
+static bool ggml_cuda_can_fuse_glu_into_mmq(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, const ggml_tensor * mm,
+        ggml_cuda_mmq_glu_src1 & glu_src1) {
+    if (glu->op != GGML_OP_GLU || mm->op != GGML_OP_MUL_MAT || mm->src[1] != glu || mm->src[2] != nullptr) {
+        return false;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const ggml_tensor * a = glu->src[0];
+    const ggml_tensor * b = glu->src[1]; // null: gate and up are the two halves of a
+    if (a->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(a) || a->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (b && (b->type != GGML_TYPE_F32 || !ggml_are_same_layout(a, b))) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (mm->src[0]->type != GGML_TYPE_NVFP4 || !blackwell_mma_available(cc)) {
+        return false;
+    }
+    if (!ggml_cuda_mul_mat_uses_mmq(ctx, mm->src[0], glu, mm)) {
+        return false;
+    }
+
+    const int64_t nc      = glu->ne[0];
+    const bool    swapped = ggml_get_op_params_i32(glu, 1) != 0;
+    const float * a_d     = (const float *) a->data;
+
+    glu_src1.gate = b ? a_d : a_d + (swapped ? nc : 0);
+    glu_src1.up   = b ? (const float *) b->data : a_d + (swapped ? 0 : nc);
+    glu_src1.op   = GGML_GLU_OP_SWIGLU;
+    glu_src1.s01  = a->nb[1] / sizeof(float);
+    glu_src1.s02  = a->nb[2] / sizeof(float);
+    glu_src1.s03  = a->nb[3] / sizeof(float);
+    return true;
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -3647,6 +3720,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // consecutive mul_mats (MMQ) reading the same src1: quantize the activations once. View-like nodes
+    // in between are no-ops for this backend and are skipped along with the group.
+    if (node->op == GGML_OP_MUL_MAT && node->src[2] == nullptr && node->src[1]->type == GGML_TYPE_F32 &&
+            ggml_cuda_mul_mat_uses_mmq(*cuda_ctx, node->src[0], node->src[1], node)) {
+        ggml_tensor * members[8] = { node };
+        int n_members = 1;
+        int last      = i;
+        for (int j = i + 1; j < cgraph->n_nodes && n_members < 8; ++j) {
+            ggml_tensor * cand = cgraph->nodes[j];
+            if (cand->op == GGML_OP_RESHAPE || cand->op == GGML_OP_VIEW || cand->op == GGML_OP_PERMUTE || cand->op == GGML_OP_TRANSPOSE) {
+                continue;
+            }
+            if (cand->op != GGML_OP_MUL_MAT || cand->src[1] != node->src[1] || cand->src[2] != nullptr ||
+                    cand->src[0]->type != node->src[0]->type || cand->type != GGML_TYPE_F32 ||
+                    !ggml_cuda_mul_mat_uses_mmq(*cuda_ctx, cand->src[0], cand->src[1], cand)) {
+                break;
+            }
+            members[n_members++] = cand;
+            last = j;
+        }
+        if (n_members > 1) {
+            ggml_cuda_mul_mat_q_shared_src1(*cuda_ctx, node->src[1], members, n_members);
+            return last - i;
+        }
+    }
+
+    // glu -> mul_mat (MMQ): the activation quantizer applies the GLU, the GLU node is not executed
+    if (node->op == GGML_OP_GLU && ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_GLU, GGML_OP_MUL_MAT }, { i + 1 })) {
+        ggml_tensor * mm = cgraph->nodes[i + 1];
+        const int out_nodes[] = { i + 1 };
+        ggml_cuda_mmq_glu_src1 glu_src1;
+        if (ggml_cuda_can_fuse_glu_into_mmq(*cuda_ctx, node, mm, glu_src1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+            ggml_cuda_mul_mat_q(*cuda_ctx, mm->src[0], node, nullptr, mm, &glu_src1);
+            return 1;
+        }
+    }
+
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
 
@@ -4083,6 +4194,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_mm_fusion_args_host fusion_data{};
             fusion_data.x_bias  = bias;
             fusion_data.x_scale = scale;
+
+            if (!with_bias && op == GGML_OP_MUL_MAT && src0->type == GGML_TYPE_NVFP4 &&
+                    ggml_cuda_mul_mat_uses_mmq(*cuda_ctx, src0, src1, mm_node)) {
+                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, nullptr, out_node, nullptr, scale);
+                return n_ops - 1;
+            }
+
+            if (!with_bias && op == GGML_OP_MUL_MAT && src0->type == GGML_TYPE_F8_E4M3 &&
+                    ggml_cuda_mul_mat_fp8(*cuda_ctx, src0, src1, out_node, scale)) {
+                return n_ops - 1;
+            }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);

@@ -388,42 +388,67 @@ static void ggml_cpy_f32_iq4_nl_cuda(
 
 // check if a same-type copy reduces to a 2D strided copy (height rows of width
 // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
-static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
-        size_t & width, size_t & height, size_t & spitch, size_t & dpitch) {
-    // require matching shape: a reshaped copy maps elements by flat order, which the
-    // prefix walk below does not handle
-    if (src0->type != src1->type || !ggml_are_same_shape(src0, src1)) {
-        return false;
-    }
-
-    // grow the contiguous prefix block shared by both tensors
-    size_t block_nb = ggml_element_size(src0);
+// the leading dims of t that are stored contiguously form a block of block_nb bytes; the dims above it must
+// then be a regular grid of such blocks at a fixed pitch (a strided 2D matrix in flattened form)
+static bool ggml_cuda_cpy_contiguous_block(const ggml_tensor * t, size_t & block_nb, size_t & pitch) {
+    block_nb = ggml_element_size(t);
     int d = 0;
     for (; d < GGML_MAX_DIMS; ++d) {
-        if (src0->nb[d] != block_nb || src1->nb[d] != block_nb) {
+        if (t->nb[d] != block_nb) {
             break;
         }
-        block_nb *= src0->ne[d];
+        block_nb *= t->ne[d];
     }
 
-    // d == 0: nothing contiguous; d == GGML_MAX_DIMS: fully contiguous (handled by memcpy)
-    if (d == 0 || d == GGML_MAX_DIMS) {
-        return false;
+    if (d == GGML_MAX_DIMS) {
+        pitch = block_nb;
+        return true;
     }
 
-    // dim d carries the rows; everything above it must be a single element
     for (int i = d + 1; i < GGML_MAX_DIMS; ++i) {
-        if (src0->ne[i] != 1) {
+        if (t->ne[i] != 1 && t->nb[i] != t->nb[i - 1]*t->ne[i - 1]) {
             return false;
         }
     }
 
-    width  = block_nb;
-    height = src0->ne[d];
-    spitch = src0->nb[d];
-    dpitch = src1->nb[d];
+    pitch = t->nb[d];
+    return pitch >= block_nb;
+}
 
-    return spitch >= width && dpitch >= width;
+static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
+        size_t & width, size_t & height, size_t & spitch, size_t & dpitch) {
+    if (src0->type != src1->type) {
+        return false;
+    }
+
+    // a copy maps elements by flat order, so it is a strided 2D copy whenever both tensors decompose into
+    // equally sized contiguous blocks at a fixed pitch; a fully contiguous side takes the block of the other
+    size_t sblock = 0;
+    size_t dblock = 0;
+    if (!ggml_cuda_cpy_contiguous_block(src0, sblock, spitch) ||
+        !ggml_cuda_cpy_contiguous_block(src1, dblock, dpitch)) {
+        return false;
+    }
+
+    const size_t nbytes = ggml_nelements(src0) * ggml_element_size(src0);
+    if (sblock == nbytes && dblock == nbytes) {
+        return false; // handled by memcpy
+    }
+    if (sblock == nbytes) {
+        sblock = dblock;
+        spitch = dblock;
+    } else if (dblock == nbytes) {
+        dblock = sblock;
+        dpitch = sblock;
+    }
+    if (sblock != dblock) {
+        return false;
+    }
+
+    width  = sblock;
+    height = nbytes / sblock;
+
+    return true;
 }
 
 void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * src1) {
