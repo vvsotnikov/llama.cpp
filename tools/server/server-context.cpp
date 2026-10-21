@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -42,6 +43,13 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// SPEC-TIMING: optional wall-clock tracing of the speculative host round-trip
+// cycle (LLAMA_SPEC_TIMING=1). Measurement only, no behavior change.
+static bool srv_spec_timing_enabled() {
+    static const bool enabled = getenv("LLAMA_SPEC_TIMING") != nullptr;
+    return enabled;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
@@ -3794,8 +3802,13 @@ private:
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
             if (ctx_dft) {
+                const int64_t sp_t0 = srv_spec_timing_enabled() ? ggml_time_us() : 0;
                 if (use_ckpt_dft) {
                     GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                }
+                if (srv_spec_timing_enabled()) {
+                    SRV_INF("SPEC-TIMING ckpt_load_dft: wall=%.3fms size=%.3fMiB",
+                            (ggml_time_us() - sp_t0) / 1000.0, (double) ckpt.data_dft.size() / 1024.0 / 1024.0);
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -3814,7 +3827,12 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
+                    const int64_t sp_t1 = srv_spec_timing_enabled() ? ggml_time_us() : 0;
                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (srv_spec_timing_enabled()) {
+                        SRV_INF("SPEC-TIMING ckpt_update_tgt: wall=%.3fms size=%.3fMiB",
+                                (ggml_time_us() - sp_t1) / 1000.0, (double) ckpt.size() / 1024.0 / 1024.0);
+                    }
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3826,7 +3844,12 @@ private:
                 }
 
                 if (use_ckpt_dft) {
+                    const int64_t sp_t2 = srv_spec_timing_enabled() ? ggml_time_us() : 0;
                     ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (srv_spec_timing_enabled()) {
+                        SRV_INF("SPEC-TIMING ckpt_update_dft: wall=%.3fms",
+                                (ggml_time_us() - sp_t2) / 1000.0);
+                    }
                 }
             }
         });
@@ -4557,9 +4580,14 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            const int64_t sp_t0 = srv_spec_timing_enabled() ? ggml_time_us() : 0;
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
+            }
+            if (srv_spec_timing_enabled() && batch.view.size() <= 64) {
+                SRV_INF("SPEC-TIMING target_decode: n_tokens=%d wall=%.3fms",
+                        batch.view.size(), (ggml_time_us() - sp_t0) / 1000.0);
             }
         });
 
@@ -4798,6 +4826,9 @@ private:
 
             // verify and try to accept the draft
             {
+                // SPEC-TIMING: wall time of target sampling + draft verification
+                const int64_t sp_t0 = srv_spec_timing_enabled() ? ggml_time_us() : 0;
+
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
@@ -4822,6 +4853,11 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                if (srv_spec_timing_enabled()) {
+                    SRV_INF("SPEC-TIMING sample_accept: n_draft=%zu accepted=%zu wall=%.3fms",
+                            n_draft, accepted.size(), (ggml_time_us() - sp_t0) / 1000.0);
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
