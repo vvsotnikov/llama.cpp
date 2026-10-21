@@ -29,6 +29,18 @@
 #define SPC_ERR(fmt, ...) LOG_ERR("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
+// SPEC-TIMING: optional per-phase wall-clock tracing of the speculative host
+// round-trip cycle (target decode -> extract -> gather -> inject -> noise decode
+// -> lattice read -> sample). Enabled with LLAMA_SPEC_TIMING=1. Measurement
+// only: prints timing lines, no behavior change.
+static bool spec_timing_enabled() {
+    static const bool enabled = getenv("LLAMA_SPEC_TIMING") != nullptr;
+    return enabled;
+}
+
+#define SPC_TIMING(fmt, ...) do { if (spec_timing_enabled()) { LOG_INF("SPEC-TIMING " fmt, __VA_ARGS__); } } while (0)
+
+
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
@@ -1217,6 +1229,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // SPEC-TIMING: accumulate per-phase wall time over the chunk loop
+        const bool sp_timing = spec_timing_enabled();
+        const int64_t sp_t0  = sp_timing ? ggml_time_us() : 0;
+        int64_t sp_extract_us = 0;
+        int64_t sp_gather_us  = 0;
+        int64_t sp_inject_us  = 0;
+        int64_t sp_n_chunk    = 0;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1236,15 +1256,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
+                ++sp_n_chunk;
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                    const int64_t tk0 = sp_timing ? ggml_time_us() : 0;
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                    if (sp_timing) {
+                        sp_extract_us += ggml_time_us() - tk0;
+                    }
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
+                    const int64_t tg0 = sp_timing ? ggml_time_us() : 0;
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                    }
+                    if (sp_timing) {
+                        sp_gather_us += ggml_time_us() - tg0;
                     }
                 }
 
@@ -1254,7 +1283,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
                     batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                 }
+                const int64_t ti0 = sp_timing ? ggml_time_us() : 0;
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                if (sp_timing) {
+                    sp_inject_us += ggml_time_us() - ti0;
+                }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1281,11 +1314,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        if (sp_timing && sp_n_chunk > 0) {
+            SPC_TIMING("process: n_chunk=%d wall=%.3fms extract=%.3fms gather=%.3fms inject=%.3fms",
+                    (int) sp_n_chunk, (ggml_time_us() - sp_t0) / 1000.0,
+                    sp_extract_us / 1000.0, sp_gather_us / 1000.0, sp_inject_us / 1000.0);
+        }
+
         return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        const bool sp_timing = spec_timing_enabled();
+        const int64_t sp_t0 = sp_timing ? ggml_time_us() : 0;
+        int64_t sp_build_us = 0;
+        int64_t sp_decode_us = 0;
+        int64_t sp_lattice_us = 0;
+        int64_t sp_walk_us   = 0;
 
         batch.clear();
 
@@ -1308,6 +1354,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
+            const int64_t tb0 = sp_timing ? ggml_time_us() : 0;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2 && !is_lilicorr);
                 if (is_lilicorr) {
@@ -1317,14 +1364,24 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch.set_embd_state(idx, { lilicorr_embd.data() + slot * (size_t) n_embd_dec, 1, (size_t) n_embd_dec });
                 }
             }
+            if (sp_timing) {
+                sp_build_us += ggml_time_us() - tb0;
+            }
         }
 
         if (batch.size() == 0) {
+            if (sp_timing) {
+                SPC_TIMING("draft: empty (wall=%.3fms)", (ggml_time_us() - sp_t0) / 1000.0);
+            }
             return;
         }
 
         // decode all sequence's noise block in a single batch
+        const int64_t td0 = sp_timing ? ggml_time_us() : 0;
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (sp_timing) {
+            sp_decode_us += ggml_time_us() - td0;
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;
@@ -1345,7 +1402,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dflash2 || is_lilicorr) {
                 // Both DFlash and LiliCorr greedily walk the candidate lattice.
+                const int64_t tl0 = sp_timing ? ggml_time_us() : 0;
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                if (sp_timing) {
+                    sp_lattice_us += ggml_time_us() - tl0;
+                }
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
@@ -1363,6 +1424,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::vector<float>   probs;
                 std::vector<int32_t> sorted_idx;
 
+                const int64_t tw0 = sp_timing ? ggml_time_us() : 0;
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
@@ -1418,6 +1480,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (sample) {
                         dp.result_q->clear();
                     }
+                }
+                if (sp_timing) {
+                    sp_walk_us += ggml_time_us() - tw0;
                 }
                 continue;
             }
@@ -1478,6 +1543,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+        }
+
+        if (sp_timing) {
+            SPC_TIMING("draft: build=%.3fms noise_decode=%.3fms lattice_sync=%.3fms walk=%.3fms wall=%.3fms",
+                    sp_build_us / 1000.0, sp_decode_us / 1000.0, sp_lattice_us / 1000.0,
+                    sp_walk_us / 1000.0, (ggml_time_us() - sp_t0) / 1000.0);
         }
     }
 

@@ -16,10 +16,18 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+// SPEC-TIMING: optional per-phase timing of the speculative host round-trip cycle
+// (LLAMA_SPEC_TIMING=1). Measurement only, no behavior change.
+static bool llama_spec_timing_enabled() {
+    static const bool enabled = getenv("LLAMA_SPEC_TIMING") != nullptr;
+    return enabled;
+}
 #include <unordered_map>
 
 //
@@ -1837,6 +1845,8 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    const int64_t t_spec_start = llama_spec_timing_enabled() ? ggml_time_us() : 0;
+
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2234,6 +2244,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // SPEC-TIMING: per-decode wall time (LLAMA_SPEC_TIMING=1, small batches only so
+    // prefill stays quiet). Measurement only, no behavior change.
+    if (llama_spec_timing_enabled() && n_tokens_all <= 64) {
+        LLAMA_LOG_INFO("SPEC-TIMING decode: ctx=%p n_tokens=%d wall=%.3fms\n",
+                (void *) this, (int) n_tokens_all, (ggml_time_us() - t_spec_start) / 1000.0);
+    }
 
     return 0;
 }
