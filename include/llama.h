@@ -1197,6 +1197,26 @@ extern "C" {
     LLAMA_API llama_token * llama_get_sampled_candidates_ith      (struct llama_context * ctx, int32_t i);
     LLAMA_API uint32_t      llama_get_sampled_candidates_count_ith(struct llama_context * ctx, int32_t i);
 
+    // Read all backend sampled data for the ith token with a single context
+    // synchronization, instead of one per llama_get_sampled_*_ith getter.
+    // Equivalent to calling the individual getters above (same pointers, counts
+    // and fallbacks), plus the sampled token itself.
+    // full_logits is set only when no backend probabilities/logits exist; it is
+    // the same pointer llama_get_logits_ith() would return (NULL if the graph
+    // produced no logits). The pointers stay valid until the next decode on
+    // this context.
+    struct llama_sampled_data {
+        llama_token         sampled_token; // LLAMA_TOKEN_NULL if no backend-sampled token
+        const float *       probs;         // NULL if no backend probabilities
+        const float *       logits;        // NULL if no backend logits
+        const llama_token * candidates;    // token ids matching probs/logits
+        uint32_t            probs_count;
+        uint32_t            logits_count;
+        uint32_t            candidates_count;
+        const float *       full_logits;   // NULL when backend-sampled data exists
+    };
+    LLAMA_API struct llama_sampled_data llama_get_sampled_ith(struct llama_context * ctx, int32_t i);
+
     //
     // Vocab
     //

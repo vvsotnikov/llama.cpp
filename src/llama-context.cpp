@@ -4370,6 +4370,27 @@ uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }
 
+struct llama_sampled_data llama_get_sampled_ith(llama_context * ctx, int32_t i) {
+    // the single synchronization that all the individual getters would perform
+    ctx->synchronize();
+
+    llama_sampled_data out = {};
+
+    out.sampled_token    = ctx->get_sampled_token_ith(i);
+    out.probs            = ctx->get_sampled_probs_ith(i);
+    out.logits           = ctx->get_sampled_logits_ith(i);
+    out.candidates       = ctx->get_sampled_candidates_ith(i);
+    out.probs_count      = static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
+    out.logits_count     = static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
+    out.candidates_count = static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
+
+    if (!out.probs && !out.logits) {
+        out.full_logits = ctx->get_logits_ith(i);
+    }
+
+    return out;
+}
+
 struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,
         uint32_t n_tokens,
