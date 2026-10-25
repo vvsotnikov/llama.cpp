@@ -1862,6 +1862,11 @@ bool ggml_cuda_should_use_mmvq_batched(const ggml_tensor * src0, const ggml_tens
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
+    if (!MMVQ_BATCHED_ENABLED) {
+        // Disabled by measurement: see the note next to MMVQ_BATCHED_ENABLED
+        // in mmvq.cuh.
+        return false;
+    }
     const int64_t ne11 = src1->ne[1];
     if (ne11 < MMVQ_BATCHED_MIN_ROWS || ne11 > MMVQ_BATCHED_MAX_ROWS) {
         return false;

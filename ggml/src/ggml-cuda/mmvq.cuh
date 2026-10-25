@@ -5,8 +5,18 @@
 // Row range for the batched multi-row Q4_K decode tile (mmvq-batched): below
 // the minimum the single-row-optimized MMVQ kernels win, above the maximum
 // the tile's row staging (pad to 32 mma rows) no longer pays off.
+//
+// Dispatch is DISABLED by measurement (DGX Spark, 27B Q4_K_M blend, greedy
+// llama-server parallel-slot decode, ABBA vs master): the tile lost aggregate
+// decode throughput at every covered row count (-25..-33% at ne11 = 2..4,
+// ~-10..-20% at ne11 = 8..32). llama.cpp's MMVQ already reads the weights
+// once for up to 8 rows with far higher block parallelism than the tile's
+// serial-K blocks, and MMQ covers the wider rows with an int8-mma GEMM.
+// The kernel is kept for follow-up work (split-K, occupancy, per-shape
+// plans); flip MMVQ_BATCHED_ENABLED to 1 to re-enable dispatch.
 #define MMVQ_BATCHED_MIN_ROWS 2
 #define MMVQ_BATCHED_MAX_ROWS 32
+#define MMVQ_BATCHED_ENABLED 0
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
