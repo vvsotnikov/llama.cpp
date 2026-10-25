@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "mma.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -1615,4 +1616,335 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+}
+
+// ---------------------------------------------------------------------------
+// Batched multi-row decode GEMV tile for Q4_K, DGX Spark (sm_121) only.
+//
+// Port of the splash-cuda batched decode tile (q4DecodeMmaKernel) to llama.cpp's
+// GGUF block formats. Instead of streaming the weight matrix through the L2
+// per small row group, a block stages a 128- or 256-output-column slab of
+// Q4_K super-blocks in shared memory (cp.async, double buffered) and serves
+// every token row of the decode batch from one staging pass, computing the
+// products with int8 tensor-core mma on the q8_1 activations that the
+// mul_mat_vec_q path already quantizes.
+//
+// Per Q4_K sub-block g (32 elements) the contribution is accumulated with the
+// same term structure as vec_dot_q4_K_q8_1:
+//   acc_d[m][n] += d8(m,g) * float(dot_g(m,n)) * sc(n,g)   // dot_g: exact int32 mma
+//   acc_m[m][n] += d8(m,g) * float(sum8(m,g) * m(n,g))     // sum8: exact int8 row sum
+// and the epilogue applies the per-column super-block scales:
+//   dst[m][n] = d(n) * acc_d[m][n] - dmin(n) * acc_m[m][n].
+// Every product combines exact integers with the same fp32 scale factors
+// mmvq uses; only the summation order differs (mul_mat_vec_q re-reduces its
+// per-thread fp32 partials across threads), so near-ties can flip under
+// greedy decoding. The splash-cuda lane classified this divergence class as
+// benign reassociation tie-flips within the tile's parity bound.
+
+// Q4_K 6-bit sub-block scale/min extraction (same bit layout as
+// get_scale_min_k4 in dequantize.cuh, kept local to avoid including the whole
+// dequant header here).
+static __device__ __forceinline__ void mmvq_batched_get_scale_min_k4(int j, const uint8_t * q, uint8_t & d, uint8_t & m) {
+    if (j < 4) {
+        d = q[j] & 63; m = q[j + 4] & 63;
+    } else {
+        d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+        m = (q[j+4] >>  4) | ((q[j-0] >> 6) << 4);
+    }
+}
+
+static __device__ __forceinline__ void mmvq_batched_cp_async_16(void * shared_dst, const void * global_src) {
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+        :: "r"((uint32_t) __cvta_generic_to_shared(shared_dst)), "l"(global_src));
+#else
+    GGML_UNUSED_VARS(shared_dst, global_src);
+    NO_DEVICE_CODE;
+#endif
+}
+
+static __device__ __forceinline__ void mmvq_batched_cp_async_commit() {
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    asm volatile("cp.async.commit_group;");
+#endif
+}
+
+template <int pending>
+static __device__ __forceinline__ void mmvq_batched_cp_async_wait() {
+#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    asm volatile("cp.async.wait_group %0;" :: "n"(pending));
+#else
+    GGML_UNUSED(pending);
+    NO_DEVICE_CODE;
+#endif
+}
+
+template <int nwarps, int nrows_pad>
+static __global__ void __launch_bounds__(nwarps*ggml_cuda_get_physical_warp_size(), 512/(nwarps*ggml_cuda_get_physical_warp_size()))
+mul_mat_vec_q_batched_q4_K(
+        const char * GGML_CUDA_RESTRICT vx, const block_q8_1 * GGML_CUDA_RESTRICT vy, float * GGML_CUDA_RESTRICT dst,
+        const int ne11, const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
+
+    ggml_cuda_pdl_sync();
+
+    constexpr int ct_cols     = nwarps*ggml_cuda_get_physical_warp_size(); // output columns per block
+    constexpr int nrowtiles   = nrows_pad/16;                              // mma row tiles per warp
+    constexpr int stage_bytes = ct_cols*sizeof(block_q4_K);
+
+    extern __shared__ char shared_dynamic[];
+    char * stage[2] = { shared_dynamic, shared_dynamic + stage_bytes };
+
+    const int warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    const int r4   = lane / 4; // mma row / B fragment column within an 8-column tile
+    const int c4   = lane % 4; // thread-in-group
+    const int col_base = blockIdx.x*ct_cols;
+
+    float acc_d[nrowtiles][4][4] = {};
+    float acc_m[nrowtiles][4][4] = {};
+
+    const int nsb = stride_row_x; // Q4_K super-blocks along the reduction dim
+    const char * last_sbuf = stage[0]; // stays valid after the loop for the epilogue
+
+    // Stage one super-block slab: ct_cols Q4_K blocks (144 B each) as 16 B chunks.
+    auto stage_sb = [&](const int buf, const int sb) {
+        for (int c = threadIdx.x; c < ct_cols*9; c += nwarps*32) {
+            const int blk = c/9;
+            const int off = (c % 9)*16;
+            const size_t src = ((size_t)(col_base + blk)*stride_row_x + sb)*sizeof(block_q4_K) + off;
+            mmvq_batched_cp_async_16(stage[buf] + blk*sizeof(block_q4_K) + off, vx + src);
+        }
+    };
+
+    stage_sb(0, 0);
+    mmvq_batched_cp_async_commit();
+
+    for (int sb = 0; sb < nsb; ++sb) {
+        const int buf = sb & 1;
+        if (sb + 1 < nsb) {
+            stage_sb(buf ^ 1, sb + 1);
+            mmvq_batched_cp_async_commit();
+            mmvq_batched_cp_async_wait<1>(); // the current super-block is complete
+        } else {
+            mmvq_batched_cp_async_wait<0>();
+        }
+        __syncthreads();
+
+        const char * sbuf = stage[buf];
+        last_sbuf = sbuf;
+
+        for (int g = 0; g < 8; ++g) {
+            // A operand: the q8_1 sub-block (row, sb, g), loaded straight from global
+            // (the activations are tiny next to the weight stream). Padded rows clamp
+            // to row 0; their accumulators are never written out.
+            ggml_cuda_mma::tile<16, 8, int> A[nrowtiles];
+            float d8s[nrowtiles][2]; // activation quant scale per fragment row half
+            int   rss[nrowtiles][2]; // per-thread quarter of the int8 row sum
+#pragma unroll
+            for (int t = 0; t < nrowtiles; ++t) {
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    // A fragment element l: row (l/2)*8 + r4 within the tile, k-int32 2*c4 + (l%2)
+                    const int row  = t*16 + (l/2)*8 + r4;
+                    const int rowc = min(row, ne11 - 1);
+                    const block_q8_1 * b8 = vy + (size_t)rowc*stride_col_y + sb*8 + g;
+                    A[t].x[l] = ((const int *) b8->qs)[2*c4 + (l%2)];
+                    if (l < 2) {
+                        d8s[t][0] = __low2float(b8->ds);
+                        rss[t][0] = ggml_cuda_dp4a(A[t].x[1], 0x01010101, ggml_cuda_dp4a(A[t].x[0], 0x01010101, 0));
+                    } else {
+                        d8s[t][1] = __low2float(b8->ds);
+                        rss[t][1] = ggml_cuda_dp4a(A[t].x[3], 0x01010101, ggml_cuda_dp4a(A[t].x[2], 0x01010101, 0));
+                    }
+                }
+            }
+            // The four lanes of a row group hold a quarter of the row's 32 int8
+            // values each; two shuffles give every lane the exact full row sum.
+#pragma unroll
+            for (int t = 0; t < nrowtiles; ++t) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    rss[t][h] += __shfl_xor_sync(0xFFFFFFFFu, rss[t][h], 1);
+                    rss[t][h] += __shfl_xor_sync(0xFFFFFFFFu, rss[t][h], 2);
+                }
+            }
+
+#pragma unroll
+            for (int f = 0; f < 4; ++f) {
+                // The mma B fragment: this thread's column n_frag = warp*32 + f*8 + r4,
+                // k-int32 c4 (elements 4*c4 .. 4*c4+3) and c4+4 (elements 4*c4+16 .. +19).
+                // Q4_K nibble layout: sub-block g's elements sit in bytes [(g>>1)*32, +32)
+                // of qs, as the low (g even) or high (g odd) nibble of byte g_offset+k.
+                const int n_frag = warp*32 + f*8 + r4;
+                const char * blk_frag = sbuf + (size_t)n_frag*sizeof(block_q4_K);
+                ggml_cuda_mma::tile<8, 8, int> B;
+                const uint32_t * q4s = (const uint32_t *) (blk_frag + 16);
+#pragma unroll
+                for (int l = 0; l < 2; ++l) {
+                    const uint32_t w = q4s[(g >> 1)*8 + 4*l + c4];
+                    B.x[l] = (g & 1) ? ((w >> 4) & 0x0F0F0F0F) : (w & 0x0F0F0F0F);
+                }
+
+                // Per-column super-block factors for the two C-fragment columns.
+                float dmx[2], dmy[2], scf[2], mf[2];
+#pragma unroll
+                for (int j2 = 0; j2 < 2; ++j2) {
+                    const char * blk_col = sbuf + (size_t)(warp*32 + f*8 + 2*c4 + j2)*sizeof(block_q4_K);
+                    const half2 dm = *((const half2 *) blk_col);
+                    dmx[j2] = __low2float(dm);
+                    dmy[j2] = __high2float(dm);
+                    uint8_t sc, m;
+                    mmvq_batched_get_scale_min_k4(g, (const uint8_t *) blk_col + 4, sc, m);
+                    scf[j2] = (float) sc;
+                    mf[j2]  = (float) m;
+                }
+
+#pragma unroll
+                for (int t = 0; t < nrowtiles; ++t) {
+                    ggml_cuda_mma::tile<16, 8, int> D;
+                    ggml_cuda_mma::mma(D, A[t], B);
+#pragma unroll
+                    for (int l = 0; l < 4; ++l) {
+                        const int j2 = l % 2;
+                        acc_d[t][f][l] += d8s[t][l/2] * (__int2float_rn(D.x[l]) * scf[j2]);
+                        acc_m[t][f][l] += d8s[t][l/2] * __int2float_rn(rss[t][l/2] * (int) mf[j2]);
+                    }
+                }
+            }
+        }
+        __syncthreads(); // the stage buffer is reused by the next prefetch
+    }
+
+    // Epilogue: apply the per-column super-block scales and write the real rows.
+#pragma unroll
+    for (int t = 0; t < nrowtiles; ++t) {
+#pragma unroll
+        for (int f = 0; f < 4; ++f) {
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int row = t*16 + (l/2)*8 + r4;
+                if (row >= ne11) {
+                    continue;
+                }
+                const int n_col = col_base + warp*32 + f*8 + 2*c4 + (l % 2);
+                const char * blk_col = last_sbuf + (size_t)(n_col - col_base)*sizeof(block_q4_K);
+                const half2 dm = *((const half2 *) blk_col);
+                dst[(size_t)n_col*stride_col_dst + row] =
+                    __low2float(dm)*acc_d[t][f][l] - __high2float(dm)*acc_m[t][f][l];
+            }
+        }
+    }
+}
+
+bool ggml_cuda_should_use_mmvq_batched(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+    if (src0->type != GGML_TYPE_Q4_K) {
+        return false;
+    }
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc != GGML_CUDA_CC_DGX_SPARK ||
+        ggml_cuda_highest_compiled_arch(cc) != GGML_CUDA_CC_DGX_SPARK) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int64_t ne11 = src1->ne[1];
+    if (ne11 < MMVQ_BATCHED_MIN_ROWS || ne11 > MMVQ_BATCHED_MAX_ROWS) {
+        return false;
+    }
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    if (ne01 <= 0 || ne00 % QK_K != 0 || (ne01 % 256 != 0 && ne01 % 128 != 0)) {
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (src0->nb[0] != ggml_type_size(src0->type) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    // cp.async needs 16 B aligned global addresses; the staged blocks are read
+    // at 144 B strides off the tensor base.
+    if (!ggml_cuda_is_aligned(src0, 16)) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_mul_mat_vec_q_batched(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_should_use_mmvq_batched(src0, src1, dst, ggml_cuda_info().devices[ctx.device].cc));
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    cudaStream_t stream = ctx.stream();
+
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    const size_t ts_src1 = ggml_type_size(src1->type);
+    const size_t ts_dst  = ggml_type_size(dst->type);
+
+    GGML_ASSERT(nb00 == ts_src0);
+    GGML_ASSERT(nb10 == ts_src1);
+    GGML_ASSERT(nb0  == ts_dst);
+
+    const float * src1_d = (const float *) src1->data;
+    float       *  dst_d = (float *) dst->data;
+
+    // If src0 is a temporary compute buffer, clear any potential padding.
+    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        const size_t size_data  = ggml_nbytes(src0);
+        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+        if (size_alloc > size_data) {
+            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+            GGML_ASSERT(!src0->view_src);
+            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+        }
+    }
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    {
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+    }
+
+    const int stride_row_x   = ne00 / QK_K;
+    const int stride_col_y   = ne10_padded / QK8_1;
+    const int stride_col_dst = dst->nb[1] / ts_dst;
+
+    const bool ct256      = ne01 % 256 == 0;
+    const int  nwarps     = ct256 ? 8 : 4;
+    const int  ct         = ct256 ? 256 : 128;
+    const int  nrows_pad  = ne11 <= 16 ? 16 : 32;
+    const int  shmem      = 2*ct*sizeof(block_q4_K);
+
+    const dim3 grid(ne01 / ct, 1, 1);
+
+#define MMVQ_BATCHED_LAUNCH(nw, nr)                                                             \
+    do {                                                                                        \
+        constexpr auto kernel = mul_mat_vec_q_batched_q4_K<nw, nr>;                             \
+        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, shmem);                                            \
+        ggml_cuda_kernel_launch(kernel,                                                         \
+            ggml_cuda_kernel_launch_params(grid, dim3(nw*32), shmem, stream),                   \
+            (const char *) src0->data, (const block_q8_1 *) src1_q8_1.get(), dst_d,             \
+            (int) ne11, stride_row_x, stride_col_y, stride_col_dst);                            \
+    } while (0)
+
+    if (ct256) {
+        if (nrows_pad == 32) {
+            MMVQ_BATCHED_LAUNCH(8, 32);
+        } else {
+            MMVQ_BATCHED_LAUNCH(8, 16);
+        }
+    } else {
+        if (nrows_pad == 32) {
+            MMVQ_BATCHED_LAUNCH(4, 32);
+        } else {
+            MMVQ_BATCHED_LAUNCH(4, 16);
+        }
+    }
+#undef MMVQ_BATCHED_LAUNCH
 }
