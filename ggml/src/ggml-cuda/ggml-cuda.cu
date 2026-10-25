@@ -2017,6 +2017,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (ggml_cuda_should_use_mmvq_batched(src0, src1, dst, cc)) {
+        ggml_cuda_mul_mat_vec_q_batched(ctx, src0, src1, dst);
+        return;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;

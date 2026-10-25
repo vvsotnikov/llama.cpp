@@ -1630,11 +1630,11 @@ void ggml_cuda_op_mul_mat_vec_q(
 // mul_mat_vec_q path already quantizes.
 //
 // Per Q4_K sub-block g (32 elements) the contribution is accumulated with the
-// same term structure as vec_dot_q4_K_q8_1:
-//   acc_d[m][n] += d8(m,g) * float(dot_g(m,n)) * sc(n,g)   // dot_g: exact int32 mma
-//   acc_m[m][n] += d8(m,g) * float(sum8(m,g) * m(n,g))     // sum8: exact int8 row sum
-// and the epilogue applies the per-column super-block scales:
-//   dst[m][n] = d(n) * acc_d[m][n] - dmin(n) * acc_m[m][n].
+// same term structure as vec_dot_q4_K_q8_1 (d/dmin applied per super-block,
+// like the mmvq path applies them inside vec_dot):
+//   acc[m][n] += d8(m,g) * float(dot_g(m,n)) * (d(n,sb) * sc(n,g))
+//   acc[m][n] -= d8(m,g) * float(sum8(m,g) * m(n,g)) * dmin(n,sb)
+// with dot_g an exact int32 tensor-core dot and sum8 the exact int8 row sum.
 // Every product combines exact integers with the same fp32 scale factors
 // mmvq uses; only the summation order differs (mul_mat_vec_q re-reduces its
 // per-thread fp32 partials across threads), so near-ties can flip under
@@ -1682,10 +1682,14 @@ static __device__ __forceinline__ void mmvq_batched_cp_async_wait() {
 template <int nwarps, int nrows_pad>
 static __global__ void __launch_bounds__(nwarps*ggml_cuda_get_physical_warp_size(), 512/(nwarps*ggml_cuda_get_physical_warp_size()))
 mul_mat_vec_q_batched_q4_K(
-        const char * GGML_CUDA_RESTRICT vx, const block_q8_1 * GGML_CUDA_RESTRICT vy, float * GGML_CUDA_RESTRICT dst,
+        const char * vx_ptr, const block_q8_1 * vy_ptr, float * dst_ptr,
         const int ne11, const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
 
     ggml_cuda_pdl_sync();
+
+    const char * GGML_CUDA_RESTRICT vx = vx_ptr;
+    const block_q8_1 * GGML_CUDA_RESTRICT vy = vy_ptr;
+    float * GGML_CUDA_RESTRICT dst = dst_ptr;
 
     constexpr int ct_cols     = nwarps*ggml_cuda_get_physical_warp_size(); // output columns per block
     constexpr int nrowtiles   = nrows_pad/16;                              // mma row tiles per warp
@@ -1700,11 +1704,9 @@ mul_mat_vec_q_batched_q4_K(
     const int c4   = lane % 4; // thread-in-group
     const int col_base = blockIdx.x*ct_cols;
 
-    float acc_d[nrowtiles][4][4] = {};
-    float acc_m[nrowtiles][4][4] = {};
+    float acc[nrowtiles][4][4] = {};
 
     const int nsb = stride_row_x; // Q4_K super-blocks along the reduction dim
-    const char * last_sbuf = stage[0]; // stays valid after the loop for the epilogue
 
     // Stage one super-block slab: ct_cols Q4_K blocks (144 B each) as 16 B chunks.
     auto stage_sb = [&](const int buf, const int sb) {
@@ -1719,6 +1721,7 @@ mul_mat_vec_q_batched_q4_K(
     stage_sb(0, 0);
     mmvq_batched_cp_async_commit();
 
+
     for (int sb = 0; sb < nsb; ++sb) {
         const int buf = sb & 1;
         if (sb + 1 < nsb) {
@@ -1731,32 +1734,31 @@ mul_mat_vec_q_batched_q4_K(
         __syncthreads();
 
         const char * sbuf = stage[buf];
-        last_sbuf = sbuf;
 
         for (int g = 0; g < 8; ++g) {
             // A operand: the q8_1 sub-block (row, sb, g), loaded straight from global
             // (the activations are tiny next to the weight stream). Padded rows clamp
-            // to row 0; their accumulators are never written out.
+            // to row 0; their accumulators are never written out. Fragment layout is
+            // the hardware mma.m16n8k32.s8 A layout (probed on device):
+            //   a0 = (row r4,     k-int32 c4),  a1 = (row r4+8, k-int32 c4)
+            //   a2 = (row r4,     k-int32 c4+4), a3 = (row r4+8, k-int32 c4+4)
             ggml_cuda_mma::tile<16, 8, int> A[nrowtiles];
-            float d8s[nrowtiles][2]; // activation quant scale per fragment row half
-            int   rss[nrowtiles][2]; // per-thread quarter of the int8 row sum
+            float d8s[nrowtiles][2]; // activation quant scale per fragment row
+            int   rss[nrowtiles][2]; // per-thread half of the int8 row sum
 #pragma unroll
             for (int t = 0; t < nrowtiles; ++t) {
-#pragma unroll
-                for (int l = 0; l < 4; ++l) {
-                    // A fragment element l: row (l/2)*8 + r4 within the tile, k-int32 2*c4 + (l%2)
-                    const int row  = t*16 + (l/2)*8 + r4;
-                    const int rowc = min(row, ne11 - 1);
-                    const block_q8_1 * b8 = vy + (size_t)rowc*stride_col_y + sb*8 + g;
-                    A[t].x[l] = ((const int *) b8->qs)[2*c4 + (l%2)];
-                    if (l < 2) {
-                        d8s[t][0] = __low2float(b8->ds);
-                        rss[t][0] = ggml_cuda_dp4a(A[t].x[1], 0x01010101, ggml_cuda_dp4a(A[t].x[0], 0x01010101, 0));
-                    } else {
-                        d8s[t][1] = __low2float(b8->ds);
-                        rss[t][1] = ggml_cuda_dp4a(A[t].x[3], 0x01010101, ggml_cuda_dp4a(A[t].x[2], 0x01010101, 0));
-                    }
-                }
+                const int row0 = min(t*16 + r4, ne11 - 1);
+                const int row1 = min(t*16 + 8 + r4, ne11 - 1);
+                const block_q8_1 * b80 = vy + (size_t)row0*stride_col_y + sb*8 + g;
+                const block_q8_1 * b81 = vy + (size_t)row1*stride_col_y + sb*8 + g;
+                A[t].x[0] = ((const int *) b80->qs)[c4];
+                A[t].x[1] = ((const int *) b81->qs)[c4];
+                A[t].x[2] = ((const int *) b80->qs)[4 + c4];
+                A[t].x[3] = ((const int *) b81->qs)[4 + c4];
+                d8s[t][0] = __low2float(b80->ds);
+                d8s[t][1] = __low2float(b81->ds);
+                rss[t][0] = ggml_cuda_dp4a(A[t].x[2], 0x01010101, ggml_cuda_dp4a(A[t].x[0], 0x01010101, 0));
+                rss[t][1] = ggml_cuda_dp4a(A[t].x[3], 0x01010101, ggml_cuda_dp4a(A[t].x[1], 0x01010101, 0));
             }
             // The four lanes of a row group hold a quarter of the row's 32 int8
             // values each; two shuffles give every lane the exact full row sum.
@@ -1774,7 +1776,7 @@ mul_mat_vec_q_batched_q4_K(
                 // The mma B fragment: this thread's column n_frag = warp*32 + f*8 + r4,
                 // k-int32 c4 (elements 4*c4 .. 4*c4+3) and c4+4 (elements 4*c4+16 .. +19).
                 // Q4_K nibble layout: sub-block g's elements sit in bytes [(g>>1)*32, +32)
-                // of qs, as the low (g even) or high (g odd) nibble of byte g_offset+k.
+                // of qs, as the low (g even) or high (g odd) nibble of byte offset k.
                 const int n_frag = warp*32 + f*8 + r4;
                 const char * blk_frag = sbuf + (size_t)n_frag*sizeof(block_q4_K);
                 ggml_cuda_mma::tile<8, 8, int> B;
@@ -1785,7 +1787,8 @@ mul_mat_vec_q_batched_q4_K(
                     B.x[l] = (g & 1) ? ((w >> 4) & 0x0F0F0F0F) : (w & 0x0F0F0F0F);
                 }
 
-                // Per-column super-block factors for the two C-fragment columns.
+                // Per-column super-block factors for the two C-fragment columns: the
+                // super-block scale d and min dmin plus the 6-bit sub-block scale/min.
                 float dmx[2], dmy[2], scf[2], mf[2];
 #pragma unroll
                 for (int j2 = 0; j2 < 2; ++j2) {
@@ -1803,11 +1806,26 @@ mul_mat_vec_q_batched_q4_K(
                 for (int t = 0; t < nrowtiles; ++t) {
                     ggml_cuda_mma::tile<16, 8, int> D;
                     ggml_cuda_mma::mma(D, A[t], B);
+#if MMVQ_BATCHED_DBG == 7
+                    if (g == 0 && t == 0 && f == 0) {
+                        const int idx = (warp*32 + lane)*8;
+                        mmvq_dbg[idx+0] = D.x[0]; mmvq_dbg[idx+1] = D.x[1];
+                        mmvq_dbg[idx+2] = D.x[2]; mmvq_dbg[idx+3] = D.x[3];
+                        mmvq_dbg[idx+4] = (int) B.x[0];
+                        mmvq_dbg[idx+5] = rss[0][0];
+                        mmvq_dbg[idx+6] = A[0].x[0];
+                        mmvq_dbg[idx+7] = (int) __float_as_uint(d8s[0][0]);
+                    }
+#endif
 #pragma unroll
                     for (int l = 0; l < 4; ++l) {
                         const int j2 = l % 2;
-                        acc_d[t][f][l] += d8s[t][l/2] * (__int2float_rn(D.x[l]) * scf[j2]);
-                        acc_m[t][f][l] += d8s[t][l/2] * __int2float_rn(rss[t][l/2] * (int) mf[j2]);
+                        // Same term structure as vec_dot_q4_K_q8_1, with the super-block
+                        // d/dmin applied per super-block like the mmvq path does:
+                        //   += d8 * (dot_g * sc) * d    [dot_g: exact int32 mma]
+                        //   -= d8 * (sum8_g * m) * dmin [sum8: exact int8 row sum]
+                        acc[t][f][l] += d8s[t][l/2] * __int2float_rn(D.x[l]) * (dmx[j2]*scf[j2]);
+                        acc[t][f][l] -= d8s[t][l/2] * __int2float_rn(rss[t][l/2] * (int) mf[j2]) * dmy[j2];
                     }
                 }
             }
@@ -1815,7 +1833,7 @@ mul_mat_vec_q_batched_q4_K(
         __syncthreads(); // the stage buffer is reused by the next prefetch
     }
 
-    // Epilogue: apply the per-column super-block scales and write the real rows.
+    // Write the real rows.
 #pragma unroll
     for (int t = 0; t < nrowtiles; ++t) {
 #pragma unroll
@@ -1827,10 +1845,7 @@ mul_mat_vec_q_batched_q4_K(
                     continue;
                 }
                 const int n_col = col_base + warp*32 + f*8 + 2*c4 + (l % 2);
-                const char * blk_col = last_sbuf + (size_t)(n_col - col_base)*sizeof(block_q4_K);
-                const half2 dm = *((const half2 *) blk_col);
-                dst[(size_t)n_col*stride_col_dst + row] =
-                    __low2float(dm)*acc_d[t][f][l] - __high2float(dm)*acc_m[t][f][l];
+                dst[(size_t)row*stride_col_dst + n_col] = acc[t][f][l];
             }
         }
     }
