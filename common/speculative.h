@@ -79,6 +79,11 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // per-round draft width set by the adaptive width policy (-1 disabled)
+    // narrows n_max for the current round only; never widens it
+    // note: keep last - callers initialize this struct positionally
+    int32_t n_max_adaptive = -1;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

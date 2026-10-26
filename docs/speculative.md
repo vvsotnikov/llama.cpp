@@ -250,6 +250,14 @@ Use exactly one of these options:
 --spec-draft-n-ubatch                   N
                                         physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH)
+--spec-draft-width                      {fixed,adaptive}
+                                        draft width policy: fixed drafts --spec-draft-n-max tokens every round,
+                                        adaptive narrows the width per round from measured per-position draft
+                                        acceptance (host-side; never changes the output distribution, only how many
+                                        tokens are drafted and verified per round). intended for draft-model
+                                        drafters with position-structured acceptance such as draft-dflash
+                                        (default: fixed)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_WIDTH)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)

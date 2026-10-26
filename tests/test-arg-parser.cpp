@@ -265,6 +265,20 @@ static void test(void) {
     assert(params.speculative.draft.n_max == 123);
 
     {
+        common_params width_params;
+        argv = {"binary_name", "--spec-draft-width", "adaptive"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), width_params, LLAMA_EXAMPLE_SERVER));
+        assert(width_params.speculative.draft_width_adaptive == true);
+    }
+
+    {
+        common_params width_params;
+        argv = {"binary_name", "--spec-draft-width", "fixed"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), width_params, LLAMA_EXAMPLE_SERVER));
+        assert(width_params.speculative.draft_width_adaptive == false);
+    }
+
+    {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));

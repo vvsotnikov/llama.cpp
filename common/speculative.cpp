@@ -29,6 +29,25 @@
 #define SPC_ERR(fmt, ...) LOG_ERR("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
+// SPEC-WIDTH: optional per-round tracing of the adaptive draft-width policy
+// (chosen width, acceptance estimate updates). Enabled with LLAMA_SPEC_WIDTH_TRACE=1.
+// Measurement only: prints one line per drafted round, no behavior change.
+static bool spec_width_trace_enabled() {
+    static const bool enabled = getenv("LLAMA_SPEC_WIDTH_TRACE") != nullptr;
+    return enabled;
+}
+
+#define SPC_WIDTH(fmt, ...) do { if (spec_width_trace_enabled()) { LOG_INF("SPEC-WIDTH " fmt, __VA_ARGS__); } } while (0)
+
+// effective per-round draft limit: the static configured max, narrowed by the
+// adaptive width policy when it is active (n_max_adaptive > 0)
+static int32_t spec_draft_n_max_round(const common_speculative_draft_params & dp, int32_t n_max) {
+    if (dp.n_max_adaptive > 0 && dp.n_max_adaptive < n_max) {
+        return dp.n_max_adaptive;
+    }
+    return n_max;
+}
+
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
@@ -438,7 +457,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if ((params.n_max <= (int) result.size()) ||
+                if ((spec_draft_n_max_round(dp, params.n_max) <= (int) result.size()) ||
                     (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -884,7 +903,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (spec_draft_n_max_round(dp, params.n_max) <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1304,7 +1323,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
+            // the adaptive width policy may narrow the block for this round; LiLiCorr always
+            // decodes its trained block (row-class cost), only the walked chain length varies
+            const int32_t n_draft = spec_draft_n_max_round(dp, params.n_max);
             const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
             n_block    [seq_id] = n_block_tokens;
@@ -1364,7 +1385,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::vector<int32_t> sorted_idx;
 
                 int32_t predecessor = 0;
-                for (int32_t i = 1; i < (is_dflash2 ? n_block_tokens : params.n_max + 1); ++i) {
+                for (int32_t i = 1; i < std::min(n_block_tokens, spec_draft_n_max_round(dp, params.n_max) + 1); ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const int32_t top_k = is_dflash2 ? selector_top_k : lilicorr_top_k;
                     const float * scores = row + top_k + (size_t) predecessor * top_k;
@@ -1861,7 +1882,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                if (spec_draft_n_max_round(dp, params.n_max) <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2353,6 +2374,102 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+// adaptive draft-width policy state for one sequence (host-side)
+//
+// Tracks an EMA of per-position draft acceptance (P(draft token at position i is
+// accepted | the chain reached position i)). Each round it drafts the largest
+// width whose expected marginal accepted token still pays for the extra draft
+// + verify row, using a chain-rule estimate of expected accepted tokens:
+//   R(i+1) = R(i) * p(i), R(0) = 1;  E[accepted | width w] = sum R(1..w)
+//   extend to w+1 while R(w+1) >= row_cost * (1 + E(w)) / (1 + w * row_cost)
+// Deep positions that the policy stopped drafting are refreshed by probing at
+// the full configured width every width_probe_rounds rounds.
+//
+// The policy only changes how many tokens are drafted per round: accepted draft
+// tokens are exactly the target's own greedy/sampled continuations, so the
+// output distribution is unchanged regardless of the width sequence.
+struct common_speculative_width_policy_seq {
+    std::vector<float>    p_pos; // EMA of per-position acceptance, optimistic prior
+    std::vector<uint32_t> n_obs; // observation count per position
+    uint32_t n_round  = 0;       // drafted rounds observed so far (this generation)
+    int32_t  w_last   = 0;       // width of the last drafted round (0 = none yet)
+    int32_t  a_last   = 0;       // drafts accepted from the last drafted round
+    bool     w_seen   = false;  // w_last has had its acceptance verdict already
+
+    void reset(int32_t n_max) {
+        p_pos.assign(std::max(0, n_max), width_prior);
+        n_obs.assign(std::max(0, n_max), 0);
+        n_round = 0;
+        w_last  = 0;
+        a_last  = 0;
+        w_seen  = false;
+    }
+
+    void observe(int32_t width, int32_t n_accepted) {
+        if (width <= 0 || p_pos.empty()) {
+            return;
+        }
+
+        const int32_t a = std::min(n_accepted, width);
+
+        for (int32_t i = 0; i < a && i < (int32_t) p_pos.size(); ++i) {
+            p_pos[i] += width_alpha * (1.0f - p_pos[i]);
+            n_obs[i]++;
+        }
+        if (a < width && a < (int32_t) p_pos.size()) {
+            p_pos[a] += width_alpha * (0.0f - p_pos[a]);
+            n_obs[a]++;
+        }
+
+        n_round++;
+        w_last = width;
+        a_last = a;
+        w_seen = true;
+    }
+
+    // pick the width for the next round; n_max is the configured upper bound
+    int32_t select(int32_t n_max, int32_t n_min) const {
+        if (n_max <= 0) {
+            return 0;
+        }
+
+        // periodic probe at the full width keeps deep position estimates fresh
+        if (n_round > 0 && n_round % width_probe_rounds == 0) {
+            return n_max;
+        }
+
+        int32_t w = std::min(n_max, std::max(1, n_min));
+
+        float reach = 1.0f; // P(the first i draft tokens were all accepted)
+        float e_acc = 0.0f; // E[accepted draft tokens] at the current width
+
+        for (int32_t i = 0; i < n_max && i < (int32_t) p_pos.size(); ++i) {
+            const float p = p_pos[i];
+            const float gain = reach * p; // marginal expected accepted tokens from position i
+
+            if (i >= w) {
+                // value of one more token vs cost of one more draft+verify row,
+                // both as a fraction of the current cycle
+                const float cost = width_row_cost * (1.0f + e_acc) / (1.0f + w * width_row_cost);
+                if (gain < cost) {
+                    break;
+                }
+                w = i + 1;
+            }
+
+            e_acc += gain;
+            reach  = gain;
+        }
+
+        return w;
+    }
+
+    static constexpr float width_alpha       = 0.25f;  // EMA memory of per-position acceptance
+    static constexpr float width_prior       = 0.9f;   // optimistic initial acceptance (explore wide first)
+    static constexpr float width_row_cost    = 0.05f;  // marginal draft+verify row cost, fraction of a cycle
+    static constexpr uint32_t width_probe_rounds = 64; // re-draft at full width this often
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -2363,6 +2480,12 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // adaptive draft-width policy (enabled by params.speculative.draft_width_adaptive)
+    bool width_adaptive = false;
+    int32_t width_n_max = 0; // policy upper bound (the configured draft n_max)
+    int32_t width_n_min = 0; // policy lower bound (the configured draft n_min)
+    std::vector<common_speculative_width_policy_seq> width_state;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -2901,6 +3024,21 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .synth_probs = */ {},
     });
 
+    if (params.draft_width_adaptive) {
+        result->width_adaptive = true;
+        result->width_n_max    = std::max(0, params.draft.n_max);
+        result->width_n_min    = std::max(0, params.draft.n_min);
+        result->width_state.resize(n_seq);
+        for (auto & st : result->width_state) {
+            st.reset(result->width_n_max);
+        }
+        SPC_INF("adaptive draft width enabled: n_max = %d, n_min = %d (per-position acceptance EMA, "
+                "row cost %.2f, probe every %u rounds)\n",
+                result->width_n_max, result->width_n_min,
+                common_speculative_width_policy_seq::width_row_cost,
+                common_speculative_width_policy_seq::width_probe_rounds);
+    }
+
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
     const auto rates = common_speculative_synth_rates_resolve(&params, n_max_effective);
@@ -2951,6 +3089,12 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         return;
     }
 
+    if (spec->width_adaptive && seq_id >= 0 && seq_id < (llama_seq_id) spec->width_state.size()) {
+        // a new generation starts with fresh acceptance estimates: the policy explores
+        // from the optimistic prior (full width) and narrows within a few rounds
+        spec->width_state[seq_id].reset(spec->width_n_max);
+    }
+
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
@@ -2995,6 +3139,28 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    // adaptive width policy: pick this round's width per drafting sequence and
+    // expose it to the implementations as a per-round narrowing of n_max
+    if (spec->width_adaptive) {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            auto & st = spec->width_state[seq_id];
+            int32_t w = st.select(spec->width_n_max, spec->width_n_min);
+            if (dp.n_max > 0 && w > dp.n_max) {
+                w = dp.n_max; // context/remaining-token limits always win
+            }
+            dp.n_max_adaptive = w;
+
+            SPC_WIDTH("seq=%d round=%u w=%d%s (last w=%d acc=%d)\n",
+                    seq_id, st.n_round, w, st.n_round > 0 && st.n_round % common_speculative_width_policy_seq::width_probe_rounds == 0 ? " probe" : "",
+                    st.w_last, st.a_last);
+        }
+    }
+
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -3017,16 +3183,30 @@ void common_speculative_draft(common_speculative * spec) {
             if (dp.drafting && !result.empty()) {
                 dp.drafting = false;
 
+                // effective round limit: context clamp (n_max) narrowed by the policy
+                int32_t n_round_max = -1;
                 if (dp.n_max > 0) {
-                    if (!result.empty() && (int) result.size() > dp.n_max) {
-                        SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
-                        result.resize(dp.n_max);
+                    n_round_max = dp.n_max;
+                }
+                if (dp.n_max_adaptive > 0 && (n_round_max < 0 || dp.n_max_adaptive < n_round_max)) {
+                    n_round_max = dp.n_max_adaptive;
+                }
 
-                        // trim the candidates only if the drafter produced them (n-gram drafters do not)
-                        if (dp.result_q && !dp.result_q->empty()) {
-                            dp.result_q->resize(dp.n_max);
-                        }
+                if (n_round_max >= 0 && (int) result.size() > n_round_max) {
+                    SPC_DBG("truncating draft to %d tokens\n", n_round_max);
+                    result.resize(n_round_max);
+
+                    // trim the candidates only if the drafter produced them (n-gram drafters do not)
+                    if (dp.result_q && !dp.result_q->empty()) {
+                        dp.result_q->resize(n_round_max);
                     }
+                }
+
+                if (spec->width_adaptive) {
+                    // a fresh draft of this width is now awaiting its acceptance verdict
+                    auto & st = spec->width_state[seq_id];
+                    st.w_last  = (int) result.size();
+                    st.w_seen  = false;
                 }
 
                 if (!result.empty()) {
@@ -3063,6 +3243,24 @@ void common_speculative_draft(common_speculative * spec) {
 }
 
 void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    if (spec->width_adaptive && seq_id >= 0 && seq_id < (llama_seq_id) spec->width_state.size()) {
+        // feed the round outcome to the width policy before the impl bookkeeping:
+        // w_last is the width of the draft this acceptance verdict belongs to
+        auto & st = spec->width_state[seq_id];
+        if (st.w_last > 0 && !st.w_seen) {
+            st.observe(st.w_last, (int) n_accepted);
+            SPC_WIDTH("seq=%d accepted=%d/%d p=[%s]\n", seq_id, (int) n_accepted, st.w_last,
+                    [&st]() {
+                        std::string s;
+                        for (size_t i = 0; i < st.p_pos.size(); ++i) {
+                            if (i > 0) s += " ";
+                            s += string_format("%.2f", st.p_pos[i]);
+                        }
+                        return s;
+                    }().c_str());
+        }
+    }
+
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -3166,5 +3364,22 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+    }
+
+    if (spec->width_adaptive) {
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) spec->width_state.size(); ++seq_id) {
+            const auto & st = spec->width_state[seq_id];
+            if (st.w_last == 0 && st.n_round == 0) {
+                continue;
+            }
+
+            std::string p_str;
+            for (size_t i = 0; i < st.p_pos.size(); ++i) {
+                p_str += string_format("%s%.2f/%u", i > 0 ? " " : "", st.p_pos[i], st.n_obs[i]);
+            }
+
+            SPC_INF("adaptive width seq %d: rounds = %u, per-position acceptance (p/n) = [%s]\n",
+                    seq_id, st.n_round, p_str.c_str());
+        }
     }
 }

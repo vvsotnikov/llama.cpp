@@ -382,6 +382,9 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
+    // adapt the number of drafted tokens per round from measured acceptance (host-side policy).
+    // only changes how many tokens are drafted per round, never the output distribution.
+    bool draft_width_adaptive = false;
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
