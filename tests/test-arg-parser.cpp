@@ -265,6 +265,19 @@ static void test(void) {
     assert(params.speculative.draft.n_max == 123);
 
     {
+        common_params ctx_params;
+        assert(ctx_params.speculative.draft.n_ctx == -1);
+
+        argv = {"binary_name", "--spec-draft-ctx", "512"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ctx_params, LLAMA_EXAMPLE_SERVER));
+        assert(ctx_params.speculative.draft.n_ctx == 512);
+
+        argv = {"binary_name", "--spec-draft-ctx", "0"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), ctx_params, LLAMA_EXAMPLE_SERVER));
+        assert(ctx_params.speculative.draft.n_ctx == 0);
+    }
+
+    {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));
