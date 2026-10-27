@@ -172,6 +172,50 @@ bool common_speculative_are_compatible(
 
 using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
 
+// keep the draft KV cache bounded: drop the oldest cells of a sequence once its position span
+// would exceed the retention window. positions stay absolute, so the drafter attends to the
+// most recent `window` tokens with exact rope geometry, and the per-round draft rollback
+// (which removes tail positions) is unaffected
+static void spec_draft_window_trim(llama_context * ctx_dft, const common_batch & batch, uint32_t window) {
+    auto * mem = llama_get_memory(ctx_dft);
+    if (mem == nullptr) {
+        return;
+    }
+
+    // incoming row count per sequence (rows carry the first sequence id, which is the one the
+    // draft implementations write to)
+    const int32_t n_seq = (int32_t) llama_n_seq_max(ctx_dft);
+    std::vector<int32_t> n_new(n_seq, 0);
+    for (const auto & t : batch.tokens) {
+        if (t.seq_id >= 0 && t.seq_id < n_seq) {
+            n_new[t.seq_id]++;
+        }
+    }
+
+    for (llama_seq_id seq_id = 0; seq_id < n_seq; ++seq_id) {
+        if (n_new[seq_id] == 0) {
+            continue;
+        }
+
+        const llama_pos pos_min = llama_memory_seq_pos_min(mem, seq_id);
+        const llama_pos pos_max = llama_memory_seq_pos_max(mem, seq_id);
+        if (pos_min < 0 || pos_max < pos_min) {
+            continue; // empty sequence
+        }
+
+        const int64_t span     = (int64_t) pos_max - pos_min + 1;
+        const int64_t overflow = span + n_new[seq_id] - (int64_t) window;
+        if (overflow <= 0) {
+            continue;
+        }
+
+        const llama_pos drop = (llama_pos) std::min<int64_t>(overflow, span);
+        if (!llama_memory_seq_rm(mem, seq_id, pos_min, pos_min + drop)) {
+            LOG_WRN("%s: failed to trim the draft context of seq %d\n", __func__, seq_id);
+        }
+    }
+}
+
 // state of an implementation of speculative decoding
 //
 // each implementation has a unique type and a state that is implementation-specific
@@ -2363,6 +2407,11 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // bounded draft context (see common_params_speculative_draft::n_ctx):
+    // the draft KV cache of each sequence is trimmed to the most recent ctx_window tokens
+    llama_context * ctx_dft    = nullptr;
+    uint32_t        ctx_window = 0; // per-sequence retention in tokens (0 = unbounded, legacy full-context draft)
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -2692,6 +2741,76 @@ common_params common_base_params_to_speculative(const common_params & params) {
     return result;
 }
 
+// bounded draft context (see common_params_speculative_draft::n_ctx)
+//
+// the draft KV cache does not need to be sized at the target's full context: like splash-cuda's
+// fixed 2048-token draft ring, drafting quality is carried by the most recent tokens of context.
+// llama.cpp keeps draft positions absolute and drops the oldest cells of a sequence once its
+// position span would exceed the window, so no rope re-encoding or position rebasing is needed
+// and the existing per-round draft rollback (which removes tail positions) is untouched.
+static constexpr uint32_t SPEC_DRAFT_WINDOW_AUTO = 2048;
+
+struct common_speculative_draft_window {
+    uint32_t window = 0; // per-sequence retention in tokens (0 = keep the draft context at the full target context)
+    uint32_t n_ctx  = 0; // total draft context size to create (0 = keep the legacy sizing)
+};
+
+// resolve the draft context geometry from the speculative params and the target context
+static common_speculative_draft_window common_speculative_draft_window_resolve(
+        const common_params_speculative_draft & spec, const llama_context * ctx_tgt) {
+    common_speculative_draft_window res;
+
+    if (spec.n_ctx == 0) {
+        return res; // full-context draft explicitly requested
+    }
+
+    const uint32_t n_ctx_tgt_seq = llama_n_ctx_seq(ctx_tgt);
+    const uint32_t window_req    = spec.n_ctx < 0 ? SPEC_DRAFT_WINDOW_AUTO : (uint32_t) spec.n_ctx;
+    const uint32_t window        = std::min(window_req, n_ctx_tgt_seq);
+
+    // in-flight draft tokens must fit next to the retained window, and the draft context must
+    // be able to ingest any single-sequence batch the target context can ingest
+    const uint32_t margin    = std::max(spec.n_max, 0) + 1;
+    const uint32_t chunk_max = std::min(llama_n_batch(ctx_tgt), n_ctx_tgt_seq);
+    const uint32_t n_ctx_seq = std::max(window + margin, chunk_max + margin);
+
+    if (n_ctx_seq >= n_ctx_tgt_seq) {
+        return res; // the target context is not larger than the window - nothing to save
+    }
+
+    res.window = window;
+    res.n_ctx  = n_ctx_seq * llama_n_seq_max(ctx_tgt);
+
+    return res;
+}
+
+// check that the draft memory can drop a prefix of a sequence's positions. must run while the
+// draft memory is still empty: dsv4-style caches reject partial removal of old positions
+// (p1 >= 0) and cannot be windowed, every other cache class removes the cells and returns true.
+static bool common_speculative_draft_window_supported(const llama_context * ctx_dft) {
+    return llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, 0, 1);
+}
+
+// create the draft context, falling back to the full target context when the draft memory
+// cannot maintain the window
+static llama_context * common_speculative_ctx_dft_create(
+        llama_model * model, llama_context_params & cparams,
+        const common_speculative_draft_window & window, const llama_context * ctx_tgt) {
+    llama_context * ctx_dft = llama_init_from_model(model, cparams);
+    if (ctx_dft == nullptr) {
+        return nullptr;
+    }
+
+    if (window.window > 0 && !common_speculative_draft_window_supported(ctx_dft)) {
+        LOG_WRN("%s: the draft memory cannot drop old positions - the draft context stays at the full target context\n", __func__);
+        cparams.n_ctx = llama_n_ctx(ctx_tgt);
+        llama_free(ctx_dft);
+        ctx_dft = llama_init_from_model(model, cparams);
+    }
+
+    return ctx_dft;
+}
+
 struct common_speculative_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -2721,6 +2840,13 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
+    // bounded draft context: decouple the draft KV size from the target context
+    const common_speculative_draft_window draft_window =
+        common_speculative_draft_window_resolve(params.speculative.draft, ctx_tgt);
+    if (draft_window.n_ctx > 0) {
+        cparams.n_ctx = draft_window.n_ctx;
+    }
+
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
@@ -2739,7 +2865,7 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
-        llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
+        llama_context * ctx_dft = common_speculative_ctx_dft_create(model_dft, cparams, draft_window, ctx_tgt);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
             return;
@@ -2751,7 +2877,7 @@ common_speculative_init_result::common_speculative_init_result(
 
         LOG_INF("%s: creating MTP draft context against the target model '%s'\n", __func__, model_path.c_str());
 
-        llama_context * ctx_dft = llama_init_from_model(model_tgt, cparams);
+        llama_context * ctx_dft = common_speculative_ctx_dft_create(model_tgt, cparams, draft_window, ctx_tgt);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);
             return;
@@ -2789,6 +2915,20 @@ common_speculative_output_limits common_speculative_get_output_limits(
 // initialization of the speculative decoding system
 //
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq) {
+    // bounded draft context (see common_params_speculative_draft::n_ctx). the window probe
+    // must run while the draft memory is still empty (both callers init before any processing);
+    // it mirrors the probe done during context creation, so a draft memory that cannot drop
+    // old positions resolves to the legacy full-context draft here as well
+    uint32_t ctx_window = 0;
+    if (params.draft.ctx_dft != nullptr && params.draft.ctx_tgt != nullptr) {
+        const auto draft_window = common_speculative_draft_window_resolve(params.draft, params.draft.ctx_tgt);
+        if (draft_window.window > 0 && common_speculative_draft_window_supported(params.draft.ctx_dft)) {
+            ctx_window = draft_window.window;
+            LOG_INF("%s: bounded draft context: window %u tokens per sequence (draft n_ctx %u, target n_ctx %u)\n",
+                    __func__, ctx_window, llama_n_ctx(params.draft.ctx_dft), llama_n_ctx(params.draft.ctx_tgt));
+        }
+    }
+
     // Compute the implementations to use based on the config and their order of preference
     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
     {
@@ -2901,6 +3041,9 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .synth_probs = */ {},
     });
 
+    result->ctx_dft    = params.draft.ctx_dft;
+    result->ctx_window = ctx_window;
+
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
     const auto rates = common_speculative_synth_rates_resolve(&params, n_max_effective);
@@ -2963,6 +3106,10 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
 
     if (spec == nullptr) {
         return result;
+    }
+
+    if (spec->ctx_window > 0 && spec->ctx_dft != nullptr) {
+        spec_draft_window_trim(spec->ctx_dft, batch, spec->ctx_window);
     }
 
     for (auto & impl : spec->impls) {

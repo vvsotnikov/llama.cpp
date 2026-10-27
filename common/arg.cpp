@@ -4213,6 +4213,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_UBATCH"));
     add_opt(common_arg(
+        {"--spec-draft-ctx"}, "N",
+        "draft context window in tokens per sequence; the draft KV cache retains only the most recent N tokens "
+        "of a sequence instead of being sized at the full target context (-1 = auto: 2048 tokens when the target "
+        "context is larger, 0 = full target context) (default: -1)",
+        [](common_params & params, int value) {
+            params.speculative.draft.n_ctx = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CTX"));
+    add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",
         [](common_params & params, const std::string & value) {

@@ -347,6 +347,13 @@ struct common_params_speculative_draft {
 
     int32_t n_ubatch = 0; // physical batch size of the draft context (0 - use the target's n_ubatch)
 
+    // draft context window per sequence: the draft KV cache retains only the most recent N tokens
+    // of a sequence instead of being sized at the full target context (the oldest positions are
+    // dropped as the sequence grows; draft positions stay absolute)
+    // -1 - auto: bound at 2048 tokens when the target context is larger
+    //  0 - size the draft context at the full target context (legacy behavior)
+    int32_t n_ctx = -1;
+
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
