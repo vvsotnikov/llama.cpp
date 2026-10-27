@@ -2377,13 +2377,25 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 // adaptive draft-width policy state for one sequence (host-side)
 //
 // Tracks an EMA of per-position draft acceptance (P(draft token at position i is
-// accepted | the chain reached position i)). Each round it drafts the largest
-// width whose expected marginal accepted token still pays for the extra draft
-// + verify row, using a chain-rule estimate of expected accepted tokens:
+// accepted | the chain reached position i)). Each decision point it drafts the
+// largest width whose expected marginal accepted token still pays for the extra
+// draft + verify row, using a chain-rule estimate of expected accepted tokens:
 //   R(i+1) = R(i) * p(i), R(0) = 1;  E[accepted | width w] = sum R(1..w)
 //   extend to w+1 while R(w+1) >= row_cost * (1 + E(w)) / (1 + w * row_cost)
-// Deep positions that the policy stopped drafting are refreshed by probing at
-// the full configured width every width_probe_rounds rounds.
+// Stability against single-round acceptance noise (measured on RTX Spark:
+// a one-round acceptance dip used to collapse the width to the floor and lock
+// it there until the rare full-width probe recovered it, costing up to 45 % of
+// the rounds of a prose request at width 2-3 while fixed width kept drafting 5):
+//   - the per-position EMA horizon is long (alpha 0.12, ~8-round memory),
+//   - the decision is held for width_hold_rounds rounds between re-computes,
+//   - growing past the held width requires a widened margin on the row-cost
+//     test (hysteresis); shrinking is immediate,
+//   - the width never drops below width_floor (measured per-class optima on
+//     the Spark width sweep are 5 for prose/code and 7 for json_short; width
+//     3 or below lost on every class),
+//   - deep positions are refreshed by a full-width probe every
+//     width_probe_rounds rounds (8, not 64: with a 64-round probe a collapsed
+//     width stayed collapsed for most of a 256-token request).
 //
 // The policy only changes how many tokens are drafted per round: accepted draft
 // tokens are exactly the target's own greedy/sampled continuations, so the
@@ -2392,6 +2404,7 @@ struct common_speculative_width_policy_seq {
     std::vector<float>    p_pos; // EMA of per-position acceptance, optimistic prior
     std::vector<uint32_t> n_obs; // observation count per position
     uint32_t n_round  = 0;       // drafted rounds observed so far (this generation)
+    int32_t  w_hold   = 0;       // width computed at the last decision point
     int32_t  w_last   = 0;       // width of the last drafted round (0 = none yet)
     int32_t  a_last   = 0;       // drafts accepted from the last drafted round
     bool     w_seen   = false;  // w_last has had its acceptance verdict already
@@ -2400,6 +2413,7 @@ struct common_speculative_width_policy_seq {
         p_pos.assign(std::max(0, n_max), width_prior);
         n_obs.assign(std::max(0, n_max), 0);
         n_round = 0;
+        w_hold  = 0;
         w_last  = 0;
         a_last  = 0;
         w_seen  = false;
@@ -2428,17 +2442,26 @@ struct common_speculative_width_policy_seq {
     }
 
     // pick the width for the next round; n_max is the configured upper bound
-    int32_t select(int32_t n_max, int32_t n_min) const {
+    int32_t select(int32_t n_max, int32_t n_min) {
         if (n_max <= 0) {
             return 0;
         }
 
         // periodic probe at the full width keeps deep position estimates fresh
         if (n_round > 0 && n_round % width_probe_rounds == 0) {
+            w_hold = n_max;
             return n_max;
         }
 
-        int32_t w = std::min(n_max, std::max(1, n_min));
+        // hold the decision between re-compute points so the drafter shape stays
+        // stable and single-round acceptance noise does not reach the width
+        if (n_round > 0 && (n_round % width_hold_rounds) != 0 && w_hold > 0) {
+            return std::min(w_hold, n_max);
+        }
+
+        const int32_t w_prev = w_hold > 0 ? std::min(w_hold, n_max) : 0;
+
+        int32_t w = std::min(n_max, std::max(width_floor, n_min));
 
         float reach = 1.0f; // P(the first i draft tokens were all accepted)
         float e_acc = 0.0f; // E[accepted draft tokens] at the current width
@@ -2449,9 +2472,10 @@ struct common_speculative_width_policy_seq {
 
             if (i >= w) {
                 // value of one more token vs cost of one more draft+verify row,
-                // both as a fraction of the current cycle
+                // both as a fraction of the current cycle; growing past the held
+                // width requires a widened margin (hysteresis)
                 const float cost = width_row_cost * (1.0f + e_acc) / (1.0f + w * width_row_cost);
-                if (gain < cost) {
+                if (gain < cost * (i + 1 > w_prev ? width_widen_margin : 1.0f)) {
                     break;
                 }
                 w = i + 1;
@@ -2461,13 +2485,17 @@ struct common_speculative_width_policy_seq {
             reach  = gain;
         }
 
+        w_hold = w;
         return w;
     }
 
-    static constexpr float width_alpha       = 0.25f;  // EMA memory of per-position acceptance
+    static constexpr float width_alpha       = 0.12f;  // EMA memory of per-position acceptance (~8 rounds)
     static constexpr float width_prior       = 0.9f;   // optimistic initial acceptance (explore wide first)
     static constexpr float width_row_cost    = 0.05f;  // marginal draft+verify row cost, fraction of a cycle
-    static constexpr uint32_t width_probe_rounds = 64; // re-draft at full width this often
+    static constexpr float width_widen_margin = 1.25f; // hysteresis margin for growing past the held width
+    static constexpr int32_t width_floor     = 4;      // never draft narrower than this (measured per-class optima)
+    static constexpr uint32_t width_hold_rounds  = 2;  // re-compute the width this often (rounds)
+    static constexpr uint32_t width_probe_rounds = 8;  // re-draft at full width this often
 };
 
 struct common_speculative {
@@ -3033,10 +3061,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             st.reset(result->width_n_max);
         }
         SPC_INF("adaptive draft width enabled: n_max = %d, n_min = %d (per-position acceptance EMA, "
-                "row cost %.2f, probe every %u rounds)\n",
+                "row cost %.2f, hold %u rounds, probe every %u rounds, floor %d)\n",
                 result->width_n_max, result->width_n_min,
                 common_speculative_width_policy_seq::width_row_cost,
-                common_speculative_width_policy_seq::width_probe_rounds);
+                common_speculative_width_policy_seq::width_hold_rounds,
+                common_speculative_width_policy_seq::width_probe_rounds,
+                common_speculative_width_policy_seq::width_floor);
     }
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
