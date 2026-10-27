@@ -4,6 +4,8 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <functional>
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_EMBEDDING_SCALE, hparams.f_embedding_scale, false);
@@ -359,6 +361,46 @@ ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
     return cur;
 }
 
+// fused draft pass input: the inject rows' target features and the noise rows' token ids
+// of a mixed ubatch (the deferred injection rows are a leading prefix, the noise block a
+// trailing suffix; see common_speculative_impl_draft_dflash)
+struct llm_graph_input_dflash_fused : llm_graph_input_i {
+    llm_graph_input_dflash_fused(int64_t n_embd_inp_enc) : n_embd_inp_enc(n_embd_inp_enc) {}
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_ASSERT(ubatch->is_mixed() && ubatch->type && "the fused draft pass needs a mixed ubatch");
+        GGML_ASSERT(feats && toks && "fused draft inputs were not built");
+
+        int64_t n_inj = 0;
+        for (int64_t i = 0; i < (int64_t) ubatch->n_tokens; ++i) {
+            if (ubatch->type[i]) {
+                n_inj++;
+            }
+        }
+        GGML_ASSERT(n_inj == feats->ne[1] && "fused draft inject row count changed");
+
+        ggml_backend_tensor_set(feats, ubatch->embd, 0, n_inj*n_embd_inp_enc*ggml_element_size(feats));
+        ggml_backend_tensor_set(toks,  ubatch->token + n_inj, 0, (ubatch->n_tokens - n_inj)*ggml_element_size(toks));
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        int64_t n_inj = 0;
+        if (params.ubatch.is_mixed() && params.ubatch.type) {
+            for (int64_t i = 0; i < (int64_t) params.ubatch.n_tokens; ++i) {
+                if (params.ubatch.type[i]) {
+                    n_inj++;
+                }
+            }
+        }
+        return feats && feats->ne[1] == n_inj && toks && toks->ne[0] == params.ubatch.n_tokens - n_inj;
+    }
+
+    ggml_tensor * feats = nullptr; // F32 [n_embd_inp_enc, n_inj]
+    ggml_tensor * toks  = nullptr; // I32 [n_dec]
+
+    const int64_t n_embd_inp_enc;
+};
+
 // DFlash Encoder: processes target model features through feature fusion layer
 template <>
 llama_model_dflash::graph<true>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
@@ -557,12 +599,11 @@ static ggml_tensor * build_dflash2_conv(
 
 // DFlash2 selector: top-k candidates per block position plus the pairwise
 // transition scores, packed into the nextn output slot for the CPU-side walk.
-static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens) {
+static void build_dflash2_selector(llm_graph_context & g, const llama_model & model, ggml_tensor * tokens, int64_t n_tokens) {
     ggml_context * ctx0 = g.ctx0;
     auto         & res  = g.res;
 
     const auto & hparams = g.hparams;
-    const int64_t n_tokens = g.n_tokens;
     const int64_t n_embd   = g.n_embd;
 
     const int64_t top_k    = hparams.dflash_selector_top_k;
@@ -849,21 +890,55 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                     ext_factor, attn_factor, beta_fast, beta_slow);
     };
 
-    // KV cache injection
-    ASSERT_EMBD_OR_TOKEN(ubatch);
-    if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    // tok_embd from the target model (shared via ctx_other)
+    auto * tok_embd = model.tok_embd;
+    if (tok_embd == nullptr) {
+        GGML_ASSERT(cparams.ctx_other != nullptr);
+        const auto * model_other = llama_get_model(cparams.ctx_other);
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
+        GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
+        tok_embd = model_other->tok_embd;
+    }
 
-        ggml_tensor * inp_target = inp->embd;
-        cb(inp_target, "inp_target_features", -1);
+    // fused draft pass: a mixed ubatch carries the deferred target-feature injection rows
+    // (leading embd rows, K/V-only) followed by the noise-block token rows, so the
+    // KV-injection decode and the noise decode run in one graph (see speculative.cpp).
+    // the injection rows are always a leading prefix of the ubatch: the draft context
+    // splits per sequence (embd_all), and the speculative side emits the inject rows first
+    const bool mixed = ubatch.embd && ubatch.token != nullptr;
+    int64_t n_inj = 0;
+    if (mixed) {
+        GGML_ASSERT(ubatch.type && "mixed ubatch without row types");
+        for (int64_t i = 0; i < (int64_t) ubatch.n_tokens; ++i) {
+            if (ubatch.type[i]) {
+                GGML_ASSERT(n_inj == i && "DFlash inject rows must be a leading prefix of the ubatch");
+                n_inj++;
+            }
+        }
+        GGML_ASSERT(n_inj < (int64_t) ubatch.n_tokens && "fused draft ubatch needs token rows");
+    }
+    const int64_t n_dec = ubatch.n_tokens - n_inj;
 
-        res->add_input(std::move(inp));
+    // positions of one row block: the pos input is section-major [s*n_tokens + i], so a
+    // suffix block needs one view per M-RoPE section, concatenated back together
+    auto pos_rows = [&](ggml_tensor * pos, int64_t beg, int64_t n_rows) -> ggml_tensor * {
+        const uint32_t n_pos = hparams.n_pos_per_embd();
+        ggml_tensor * res_pos = nullptr;
+        for (uint32_t s = 0; s < n_pos; ++s) {
+            ggml_tensor * v = ggml_view_1d(ctx0, pos, n_rows, (s*(int64_t) ubatch.n_tokens + beg)*ggml_element_size(pos));
+            res_pos = res_pos ? ggml_concat(ctx0, res_pos, v, 0) : v;
+        }
+        return res_pos;
+    };
 
-        // fuse the target features through the encoder
-        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+    // K/V-only cache injection: fuse `n_rows` target-feature rows through the encoder and
+    // write their per-layer K/V into the (sub-)caches at the cells given by the idx tensors.
+    // shared by the standalone injection pass (full ubatch idxs) and the fused draft pass
+    // (prefix views of the same idxs)
+    auto build_kv_inject = [&](int64_t n_rows, ggml_tensor * feats, ggml_tensor * pos_inj,
+            const std::function<ggml_tensor * (bool)> & k_idxs_of,
+            const std::function<ggml_tensor * (bool)> & v_idxs_of) -> ggml_tensor * {
+        ggml_tensor * inp_g = build_lora_mm(model.fc, feats, model.fc_s);
         inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
         cb(inp_g, "inp_g_embeddings", -1);
 
@@ -874,23 +949,21 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             const bool shared_kv = layer.wv == nullptr;
             ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, inp_g, layer.wv_s);
 
-            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_rows);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_rows);
 
             Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
             if (shared_kv) {
                 Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
             }
-            Kcur = build_rope(Kcur, inp_pos);
+            Kcur = build_rope(Kcur, pos_inj);
             cb(Kcur, "Kcur_injected", il);
             cb(Vcur, "Vcur_injected", il);
 
+            const bool is_swa = hparams.is_swa(il);
             if (use_iswa) {
                 // route each layer's K/V to its sub-cache: SWA layers -> sliding cache, full -> dense
-                const bool    is_swa = hparams.is_swa(il);
                 const auto  * kv     = is_swa ? inp_attn_iswa->mctx->get_swa() : inp_attn_iswa->mctx->get_base();
-                ggml_tensor * k_idxs = is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs();
-                ggml_tensor * v_idxs = is_swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs();
                 // rotate K/V into the cache's rotated space
                 ggml_tensor * k_rot  = is_swa ? inp_attn_iswa->self_k_rot_swa : inp_attn_iswa->self_k_rot;
                 ggml_tensor * v_rot  = is_swa ? inp_attn_iswa->self_v_rot_swa : inp_attn_iswa->self_v_rot;
@@ -900,8 +973,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 if (v_rot) {
                     Vcur = llama_mul_mat_hadamard(ctx0, Vcur, v_rot);
                 }
-                ggml_build_forward_expand(gf, kv->cpy_k(ctx0, Kcur, k_idxs, il));
-                ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs, il));
+                ggml_build_forward_expand(gf, kv->cpy_k(ctx0, Kcur, k_idxs_of(is_swa), il));
+                ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs_of(is_swa), il));
             } else {
                 // rotate K/V into the cache's rotated space
                 if (inp_attn->self_k_rot) {
@@ -910,10 +983,262 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 if (inp_attn->self_v_rot) {
                     Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
                 }
-                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
-                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, k_idxs_of(is_swa), il));
+                ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, v_idxs_of(is_swa), il));
             }
         }
+
+        return inp_g;
+    };
+
+    // idx tensors of one (sub-)cache, optionally restricted to a row range of the ubatch
+    auto idx_rows = [&](ggml_tensor * idxs, int64_t beg, int64_t n_rows) -> ggml_tensor * {
+        if (beg == 0 && n_rows == idxs->ne[0]) {
+            return idxs;
+        }
+        // a transposed (non-flash-attn) V cache carries n_embd_v_gqa entries per row
+        const int64_t rowsz = idxs->ne[0] / (int64_t) ubatch.n_tokens;
+        return ggml_view_1d(ctx0, idxs, n_rows*rowsz, beg*rowsz*ggml_element_size(idxs));
+    };
+
+    // decoder attention over the cache; the fused pass stores the noise rows' K/V and
+    // attends through suffix views of the idx and KQ mask tensors, so the noise rows see
+    // the inject rows' K/V written earlier in this same graph
+    auto build_attn_rows = [&](int il, ggml_tensor * Qcur, ggml_tensor * Kcur, ggml_tensor * Vcur) -> ggml_tensor * {
+        const auto & layer = model.layers[il];
+        if (!mixed) {
+            return use_iswa
+                ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+                : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+        }
+
+        const bool  is_swa     = use_iswa && hparams.is_swa(il);
+        auto * mctx_cur        = use_iswa ? (is_swa ? inp_attn_iswa->mctx->get_swa() : inp_attn_iswa->mctx->get_base()) : inp_attn->mctx;
+        ggml_tensor * k_rot    = use_iswa ? (is_swa ? inp_attn_iswa->self_k_rot_swa : inp_attn_iswa->self_k_rot) : inp_attn->self_k_rot;
+        ggml_tensor * v_rot    = use_iswa ? (is_swa ? inp_attn_iswa->self_v_rot_swa : inp_attn_iswa->self_v_rot) : inp_attn->self_v_rot;
+        ggml_tensor * k_all    = use_iswa ? (is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs()) : inp_attn->get_k_idxs();
+        ggml_tensor * v_all    = use_iswa ? (is_swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs()) : inp_attn->get_v_idxs();
+        ggml_tensor * mask_all = use_iswa ? (is_swa ? inp_attn_iswa->get_kq_mask_swa() : inp_attn_iswa->get_kq_mask()) : inp_attn->get_kq_mask();
+
+        if (k_rot) {
+            Qcur = llama_mul_mat_hadamard(ctx0, Qcur, k_rot);
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, k_rot);
+        }
+        if (v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, v_rot);
+        }
+
+        // these nodes are added to the graph together so that they are not reordered
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, idx_rows(k_all, n_inj, n_dec), il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, idx_rows(v_all, n_inj, n_dec), il));
+
+        ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+        ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+        GGML_ASSERT(mask_all->ne[3] == 1 && "the fused draft pass expects a single-stream ubatch");
+        // the suffix view of the mask is not contiguous (the inject rows sit in front of
+        // it), so materialize the noise rows' mask for the attention call
+        ggml_tensor * kq_mask = ggml_cont(ctx0, ggml_view_4d(ctx0, mask_all, mask_all->ne[0], n_dec, 1, 1,
+                mask_all->nb[0], mask_all->nb[1], mask_all->nb[2], n_inj*mask_all->nb[1]));
+
+        ggml_tensor * cur = build_attn_mha(Qcur, k, v, nullptr, kq_mask, layer.attn_sinks, nullptr, 0, kq_scale, il);
+        cb(cur, "kqv_out", il);
+
+        if (v_rot) {
+            cur = llama_mul_mat_hadamard(ctx0, cur, v_rot);
+        }
+
+        return build_lora_mm(layer.wo, cur, layer.wo_s);
+    };
+
+    // full noise-block decoder over `n_rows` token rows (shared by the plain noise decode
+    // and the fused draft pass)
+    auto build_decoder = [&](int64_t n_rows, ggml_tensor * inp_tokens, ggml_tensor * pos_dec, ggml_tensor * inp_anchor) {
+        ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
+        if (hparams.f_embedding_scale != 0.0f) {
+            inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
+        }
+        cb(inpL, "inp_noise_embd", -1);
+
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & layer = model.layers[il];
+
+            ggml_tensor * noise_norm = build_norm(inpL, layer.attn_norm, NULL, LLM_NORM_RMS, il);
+            cb(noise_norm, "noise_norm", il);
+
+            ggml_tensor * attn_dynamic = nullptr;
+            if (layer.dflash_attn_conv_proj) {
+                attn_dynamic = build_lora_mm(layer.dflash_attn_conv_proj, noise_norm);
+                noise_norm = build_dflash2_conv(*this, noise_norm, attn_dynamic, layer.dflash_attn_conv_base, 0);
+                cb(noise_norm, "attn_conv_in", il);
+            }
+
+            ggml_tensor * Qcur = build_lora_mm(layer.wq, noise_norm, layer.wq_s);
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, noise_norm, layer.wk_s);
+            const bool shared_kv = layer.wv == nullptr;
+            ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, noise_norm, layer.wv_s);
+
+            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_rows);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_rows);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_rows);
+
+            Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
+            Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
+            if (shared_kv) {
+                Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
+            }
+
+            Qcur = build_rope(Qcur, pos_dec);
+            Kcur = build_rope(Kcur, pos_dec);
+            cb(Qcur, "Qcur", il);
+            cb(Kcur, "Kcur", il);
+            cb(Vcur, "Vcur", il);
+
+            // cache-aware, non-causal attention
+            ggml_tensor * cur = build_attn_rows(il, Qcur, Kcur, Vcur);
+
+            if (hparams.f_attn_value_scale != 0.0f) {
+                cur = ggml_scale(ctx0, cur, hparams.f_attn_value_scale);
+                cb(cur, "attn_out_scaled", il);
+            }
+
+            if (attn_dynamic) {
+                cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
+                cb(cur, "attn_conv_out", il);
+            }
+
+            if (layer.attn_post_norm) {
+                cur = build_norm(cur, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
+                cb(cur, "attn_post_norm", il);
+            }
+
+            ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
+            cb(ffn_inp, "ffn_inp", il);
+
+            cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
+            cb(cur, "ffn_norm", il);
+
+            ggml_tensor * ffn_dynamic = nullptr;
+            if (layer.dflash_ffn_conv_proj) {
+                ffn_dynamic = build_lora_mm(layer.dflash_ffn_conv_proj, cur);
+                cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 0);
+                cb(cur, "ffn_conv_in", il);
+            }
+
+            cur = build_ffn(cur,
+                    layer.ffn_up,   NULL, layer.ffn_up_s,
+                    layer.ffn_gate, NULL, layer.ffn_gate_s,
+                    layer.ffn_down, NULL, layer.ffn_down_s,
+                    NULL,
+                    hparams.llm_ffn_op, LLM_FFN_PAR, il);
+            cb(cur, "ffn_out", il);
+
+            if (ffn_dynamic) {
+                cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 1);
+                cb(cur, "ffn_conv_out", il);
+            }
+
+            if (layer.ffn_post_norm) {
+                cur = build_norm(cur, layer.ffn_post_norm, NULL, LLM_NORM_RMS, il);
+                cb(cur, "ffn_post_norm", il);
+            }
+
+            cur = ggml_add(ctx0, cur, ffn_inp);
+            if (layer.out_scale) {
+                cur = ggml_mul(ctx0, cur, layer.out_scale);
+            }
+            cb(cur, "l_out", il);
+
+            inpL = cur;
+        }
+
+        ggml_tensor * cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1);
+        cb(cur, "result_norm", -1);
+
+        res->t_embd = cur;
+
+        // lm_head from the target model (shared via ctx_other)
+        auto * output   = model.output;
+        auto * output_s = model.output_s;
+        if (output == nullptr) {
+            GGML_ASSERT(cparams.ctx_other != nullptr);
+            const auto * model_other = llama_get_model(cparams.ctx_other);
+            GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
+            output   = model_other->output;
+            output_s = model_other->output_s;
+        }
+
+        cur = build_lora_mm(output, cur, output_s);
+
+        // DFlash2 feeds these logits to the selector, so they need the target's output
+        // transforms; DFlash1 and DSpark read them through the sampler instead
+        if (model.dflash_selector_hidden) {
+            if (hparams.f_logit_scale != 0.0f) {
+                cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
+            }
+            if (hparams.f_final_logit_softcapping > 0.0f) {
+                cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
+                cur = ggml_tanh(ctx0, cur);
+                cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
+            }
+        }
+
+        // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
+        if (model.d2t) {
+            const int64_t n_draft_vocab = cur->ne[0];
+            const int64_t n_outputs     = cur->ne[1];
+            const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
+
+            GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
+            GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
+
+            ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
+            cur = ggml_set_rows(ctx0, logits,
+                    ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
+                    ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+            cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
+        }
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+
+        // DSpark: bias the draft logits with the Markov head
+        if (model.dspark_markov_w1) {
+            build_dspark_markov_head(*this, model, inp_tokens);
+        }
+
+        if (model.dflash_selector_hidden) {
+            build_dflash2_selector(*this, model, inp_tokens, n_rows);
+        } else if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_rows == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
+            build_lilicorr_scores(*this, model, tok_embd, inp_anchor);
+        }
+    };
+
+    // KV cache injection (standalone pass: embd rows only)
+    if (ubatch.embd && !mixed) {
+        ASSERT_EMBD_OR_TOKEN(ubatch);
+
+        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+        ggml_set_input(inp->embd);
+
+        ggml_tensor * inp_target = inp->embd;
+        cb(inp_target, "inp_target_features", -1);
+
+        res->add_input(std::move(inp));
+
+        auto k_idxs_of = [&](bool swa) {
+            return use_iswa ? (swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs()) : inp_attn->get_k_idxs();
+        };
+        auto v_idxs_of = [&](bool swa) {
+            return use_iswa ? (swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs()) : inp_attn->get_v_idxs();
+        };
+
+        ggml_tensor * inp_g = build_kv_inject(n_tokens, inp_target, inp_pos, k_idxs_of, v_idxs_of);
 
         res->t_embd = inp_g;
         if (model.lilicorr_pass_hidden_proj) {
@@ -925,15 +1250,48 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         return;
     }
 
-    // tok_embd from the target model (shared via ctx_other)
-    auto * tok_embd = model.tok_embd;
-    if (tok_embd == nullptr) {
-        GGML_ASSERT(cparams.ctx_other != nullptr);
-        const auto * model_other = llama_get_model(cparams.ctx_other);
+    // fused draft pass: inject rows take the K/V-only encoder path, noise rows the decoder
+    if (mixed) {
+        auto inp = std::make_unique<llm_graph_input_dflash_fused>(n_embd_inp);
 
-        GGML_ASSERT(model_other->tok_embd != nullptr && "DFlash decoder requires the target model's token embeddings");
-        tok_embd = model_other->tok_embd;
+        inp->feats = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_inj);
+        ggml_set_input(inp->feats);
+        inp->toks = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_dec);
+        ggml_set_input(inp->toks);
+
+        ggml_tensor * feats_inj = inp->feats;
+        cb(feats_inj, "inp_target_features", -1);
+
+        ggml_tensor * dec_tokens = inp->toks;
+
+        res->add_input(std::move(inp));
+
+        auto k_idxs_of = [&](bool swa) {
+            ggml_tensor * all = use_iswa ? (swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs()) : inp_attn->get_k_idxs();
+            return idx_rows(all, 0, n_inj);
+        };
+        auto v_idxs_of = [&](bool swa) {
+            ggml_tensor * all = use_iswa ? (swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs()) : inp_attn->get_v_idxs();
+            return idx_rows(all, 0, n_inj);
+        };
+
+        // the encoder chain writes every layer's inject K/V before the decoder starts,
+        // so the noise rows' attention reads the fresh cells in-graph
+        build_kv_inject(n_inj, feats_inj, pos_rows(inp_pos, 0, n_inj), k_idxs_of, v_idxs_of);
+
+        res->t_inp_tokens = dec_tokens;
+        build_decoder(n_dec, dec_tokens, pos_rows(inp_pos, n_inj, n_dec), nullptr);
+
+        // the unmasked nextn extraction reads one row per ubatch row, so pad the lattice
+        // (the inject rows' slots stay unused)
+        if (res->t_h_nextn && n_dec < (int64_t) ubatch.n_tokens) {
+            res->t_h_nextn = ggml_pad(ctx0, res->t_h_nextn, 0, ubatch.n_tokens - n_dec, 0, 0);
+            ggml_build_forward_expand(gf, res->t_h_nextn);
+        }
+        return;
     }
+
+    ASSERT_EMBD_OR_TOKEN(ubatch);
 
     ggml_tensor * inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp_tokens);
@@ -954,165 +1312,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         res->add_input(std::move(inp));
     }
 
-    ggml_tensor * inpL = ggml_get_rows(ctx0, tok_embd, inp_tokens);
-    if (hparams.f_embedding_scale != 0.0f) {
-        inpL = ggml_scale(ctx0, inpL, hparams.f_embedding_scale);
-    }
-    cb(inpL, "inp_noise_embd", -1);
-
-    for (int il = 0; il < n_layer; ++il) {
-        const auto & layer = model.layers[il];
-
-        ggml_tensor * noise_norm = build_norm(inpL, layer.attn_norm, NULL, LLM_NORM_RMS, il);
-        cb(noise_norm, "noise_norm", il);
-
-        ggml_tensor * attn_dynamic = nullptr;
-        if (layer.dflash_attn_conv_proj) {
-            attn_dynamic = build_lora_mm(layer.dflash_attn_conv_proj, noise_norm);
-            noise_norm = build_dflash2_conv(*this, noise_norm, attn_dynamic, layer.dflash_attn_conv_base, 0);
-            cb(noise_norm, "attn_conv_in", il);
-        }
-
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, noise_norm, layer.wq_s);
-        ggml_tensor * Kcur = build_lora_mm(layer.wk, noise_norm, layer.wk_s);
-        const bool shared_kv = layer.wv == nullptr;
-        ggml_tensor * Vcur = shared_kv ? Kcur : build_lora_mm(layer.wv, noise_norm, layer.wv_s);
-
-        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
-        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
-
-        Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
-        Kcur = build_norm(Kcur, layer.attn_k_norm, NULL, LLM_NORM_RMS, il);
-        if (shared_kv) {
-            Vcur = ggml_rms_norm(ctx0, Vcur, hparams.f_norm_rms_eps);
-        }
-
-        Qcur = build_rope(Qcur, inp_pos);
-        Kcur = build_rope(Kcur, inp_pos);
-        cb(Qcur, "Qcur", il);
-        cb(Kcur, "Kcur", il);
-        cb(Vcur, "Vcur", il);
-
-        // cache-aware, non-causal attention
-        ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      layer.wo, NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
-
-        if (hparams.f_attn_value_scale != 0.0f) {
-            cur = ggml_scale(ctx0, cur, hparams.f_attn_value_scale);
-            cb(cur, "attn_out_scaled", il);
-        }
-
-        if (attn_dynamic) {
-            cur = build_dflash2_conv(*this, cur, attn_dynamic, layer.dflash_attn_conv_base, 1);
-            cb(cur, "attn_conv_out", il);
-        }
-
-        if (layer.attn_post_norm) {
-            cur = build_norm(cur, layer.attn_post_norm, NULL, LLM_NORM_RMS, il);
-            cb(cur, "attn_post_norm", il);
-        }
-
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpL);
-        cb(ffn_inp, "ffn_inp", il);
-
-        cur = build_norm(ffn_inp, layer.ffn_norm, NULL, LLM_NORM_RMS, il);
-        cb(cur, "ffn_norm", il);
-
-        ggml_tensor * ffn_dynamic = nullptr;
-        if (layer.dflash_ffn_conv_proj) {
-            ffn_dynamic = build_lora_mm(layer.dflash_ffn_conv_proj, cur);
-            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 0);
-            cb(cur, "ffn_conv_in", il);
-        }
-
-        cur = build_ffn(cur,
-                layer.ffn_up,   NULL, layer.ffn_up_s,
-                layer.ffn_gate, NULL, layer.ffn_gate_s,
-                layer.ffn_down, NULL, layer.ffn_down_s,
-                NULL,
-                hparams.llm_ffn_op, LLM_FFN_PAR, il);
-        cb(cur, "ffn_out", il);
-
-        if (ffn_dynamic) {
-            cur = build_dflash2_conv(*this, cur, ffn_dynamic, layer.dflash_ffn_conv_base, 1);
-            cb(cur, "ffn_conv_out", il);
-        }
-
-        if (layer.ffn_post_norm) {
-            cur = build_norm(cur, layer.ffn_post_norm, NULL, LLM_NORM_RMS, il);
-            cb(cur, "ffn_post_norm", il);
-        }
-
-        cur = ggml_add(ctx0, cur, ffn_inp);
-        if (layer.out_scale) {
-            cur = ggml_mul(ctx0, cur, layer.out_scale);
-        }
-        cb(cur, "l_out", il);
-
-        inpL = cur;
-    }
-
-    ggml_tensor * cur = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1);
-    cb(cur, "result_norm", -1);
-
-    res->t_embd = cur;
-
-    // lm_head from the target model (shared via ctx_other)
-    auto * output   = model.output;
-    auto * output_s = model.output_s;
-    if (output == nullptr) {
-        GGML_ASSERT(cparams.ctx_other != nullptr);
-        const auto * model_other = llama_get_model(cparams.ctx_other);
-        GGML_ASSERT(model_other->output != nullptr && "DFlash decoder requires the target model's output projection");
-        output   = model_other->output;
-        output_s = model_other->output_s;
-    }
-
-    cur = build_lora_mm(output, cur, output_s);
-
-    // DFlash2 feeds these logits to the selector, so they need the target's output
-    // transforms; DFlash1 and DSpark read them through the sampler instead
-    if (model.dflash_selector_hidden) {
-        if (hparams.f_logit_scale != 0.0f) {
-            cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
-        }
-        if (hparams.f_final_logit_softcapping > 0.0f) {
-            cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
-            cur = ggml_tanh(ctx0, cur);
-            cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
-        }
-    }
-
-    // reduced-draft-vocab exports: scatter the draft logits to the target vocabulary via d2t
-    if (model.d2t) {
-        const int64_t n_draft_vocab = cur->ne[0];
-        const int64_t n_outputs     = cur->ne[1];
-        const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
-
-        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
-        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
-
-        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
-        cur = ggml_set_rows(ctx0, logits,
-                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
-                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
-    }
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
-
-    // DSpark: bias the draft logits with the Markov head
-    if (model.dspark_markov_w1) {
-        build_dspark_markov_head(*this, model, inp_tokens);
-    }
-
-    if (model.dflash_selector_hidden) {
-        build_dflash2_selector(*this, model, inp_tokens);
-    } else if (model.lilicorr_pass_hidden_proj && ubatch.embd_state && n_tokens == (int64_t) hparams.dflash_block_size * ubatch.n_seqs_unq) {
-        build_lilicorr_scores(*this, model, tok_embd, inp_anchor);
-    }
+    build_decoder(n_tokens, inp_tokens, inp_pos, inp_anchor);
 }
 
 // DSV4 DSpark decoder, dual-mode by batch type (see the DFlash decoder above):

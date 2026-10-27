@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -39,6 +40,13 @@ static bool spec_timing_enabled() {
 }
 
 #define SPC_TIMING(fmt, ...) do { if (spec_timing_enabled()) { LOG_INF("SPEC-TIMING " fmt, __VA_ARGS__); } } while (0)
+
+// the fused draft pass (one decode per draft cycle instead of an injection decode plus a
+// noise decode) can be disabled for A/B measurement
+static bool spec_dflash_fusion_enabled() {
+    const char * env = getenv("LLAMA_SPEC_DFLASH_FUSION");
+    return env == nullptr || strcmp(env, "0") != 0;
+}
 
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -223,6 +231,10 @@ struct common_speculative_impl {
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+
+    // flush any per-sequence deferred work into the context at its current positions
+    // (called before a context shift moves a sequence's positions)
+    virtual bool flush(llama_seq_id /*seq_id*/) { return true; }
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -1030,6 +1042,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
+    // fused draft pass (dflash2): process() defers the KV-injection decode of a verify
+    // round into a per-sequence stash and draft() folds it into the noise-decode pass,
+    // so a cycle runs one draft pass instead of two
+    struct inject_stash {
+        std::vector<float>     feats; // [n_rows, n_embd_enc] gathered target features
+        std::vector<llama_pos> pos;   // [n_rows] ascending absolute positions
+    };
+    std::vector<inject_stash> stash;
+    const bool fuse_inject;
+
     // dspark speculators
     bool sample_from_anchor = true;
 
@@ -1044,6 +1066,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         : common_speculative_impl(type, n_seq, params.draft.n_max)
         , params(params.draft)
         , is_dspark(type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
+        , fuse_inject(type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && spec_dflash_fusion_enabled())
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -1120,6 +1143,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch        = common_batch(ctx_dft);
         batch_inject = common_batch(ctx_dft);
 
+        stash.resize(n_seq);
+
         // embd batches on an M-RoPE draft carry 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
 
@@ -1180,6 +1205,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // reseed per request rather than per round, or two identical requests differ
         dflash2_seed[seq_id] = -1;
 
+        // a new request replaces any injection rows left over by the previous one
+        stash[seq_id] = inject_stash();
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1191,6 +1219,46 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     "Drafts may degrade.\n",
                     __func__, (int) pos_max, N - 1);
         }
+    }
+
+    // inject stashed rows into the draft cache as a standalone pass; rows the caller has
+    // already rolled back (rejected candidates) or that lost their cache (released or
+    // restored sequence) are dropped
+    bool flush_inject(llama_seq_id seq_id) {
+        auto & st = stash[seq_id];
+        if (st.pos.empty()) {
+            return true;
+        }
+
+        auto * ctx_dft = params.ctx_dft;
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        if (pos_max < 0) {
+            st = inject_stash();
+            return true;
+        }
+
+        // stash positions are ascending, so the rolled-back tail drops off the back
+        size_t n_keep = st.pos.size();
+        while (n_keep > 0 && st.pos[n_keep - 1] > pos_max) {
+            --n_keep;
+        }
+        if (n_keep == 0) {
+            st = inject_stash();
+            return true;
+        }
+
+        batch_inject.clear();
+        for (size_t i = 0; i < n_keep; ++i) {
+            const llama_pos pos_arr[4] = { st.pos[i], st.pos[i], st.pos[i], 0 };
+            batch_inject.add_embd({ st.feats.data() + i * (size_t) n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+        }
+        const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+        st = inject_stash();
+        if (rc != 0) {
+            LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d)\n", __func__, rc, (int) n_keep);
+            return false;
+        }
+        return true;
     }
 
     bool process(const common_batch & batch_in) override {
@@ -1237,6 +1305,27 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         int64_t sp_inject_us  = 0;
         int64_t sp_n_chunk    = 0;
 
+        // safety valve: a stash that survived past its draft() call (no draft round,
+        // context shift) is flushed standalone before new rows are deferred
+        if (fuse_inject) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (!stash[seq_id].pos.empty()) {
+                    const int64_t tf0 = sp_timing ? ggml_time_us() : 0;
+                    if (!flush_inject(seq_id)) {
+                        return false;
+                    }
+                    if (sp_timing) {
+                        sp_inject_us += ggml_time_us() - tf0;
+                    }
+                }
+            }
+        }
+
+        // verify rounds are small token batches: defer their injection into the next
+        // draft() call, which folds them into the noise-decode pass; larger batches
+        // (prefill chunks) and image-embedding batches inject immediately
+        const bool defer = fuse_inject && has_tokens && n_tokens <= n_seq * (params.n_max + 1);
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1275,6 +1364,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (sp_timing) {
                         sp_gather_us += ggml_time_us() - tg0;
                     }
+                }
+
+                if (defer) {
+                    // stash the gathered rows; the next draft() call fuses them into the
+                    // noise-decode pass (bound the stash in case no draft round follows)
+                    auto & st = stash[seq_id];
+                    if (st.pos.size() + n_chunk > (size_t) std::max(4 * (params.n_max + 1), 32)) {
+                        const int64_t tf0 = sp_timing ? ggml_time_us() : 0;
+                        if (!flush_inject(seq_id)) {
+                            return false;
+                        }
+                        if (sp_timing) {
+                            sp_inject_us += ggml_time_us() - tf0;
+                        }
+                    }
+                    st.feats.insert(st.feats.end(), features_buf.begin(), features_buf.end());
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        st.pos.push_back(batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0]);
+                    }
+                    continue;
                 }
 
                 batch_inject.clear();
@@ -1333,68 +1442,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         int64_t sp_lattice_us = 0;
         int64_t sp_walk_us   = 0;
 
-        batch.clear();
-
-        // build one batch holding every drafting sequence's noise block into a single decode)
-        // record where each block starts and its size
-        std::vector<int32_t> i_block_beg(n_seq, -1);
-        std::vector<int32_t> n_block    (n_seq,  0);
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+        // finalize one sequence's draft from the context's nextn lattice / logits; shared
+        // by the fused per-sequence passes and the legacy single decode
+        auto finish_seq = [&](llama_seq_id seq_id, int32_t beg, int32_t n_block_tokens) {
             auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
-                continue;
-            }
-
-            common_sampler_reset(smpls[seq_id].get());
-
-            const int32_t n = (int32_t) dp.pos0;
-
-            const int32_t n_draft = params.n_max;
-            const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
-            i_block_beg[seq_id] = batch.size();
-            n_block    [seq_id] = n_block_tokens;
-            const int64_t tb0 = sp_timing ? ggml_time_us() : 0;
-            for (int32_t i = 0; i < n_block_tokens; ++i) {
-                const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2 && !is_lilicorr);
-                if (is_lilicorr) {
-                    // For LiliCorr drafting batch, set state embeddings for use in the associated transformer head.
-                    const llama_pos pos = dp.pos0 - 1;
-                    const size_t slot = (size_t) seq_id * lilicorr_rows + (size_t) pos % lilicorr_rows;
-                    batch.set_embd_state(idx, { lilicorr_embd.data() + slot * (size_t) n_embd_dec, 1, (size_t) n_embd_dec });
-                }
-            }
-            if (sp_timing) {
-                sp_build_us += ggml_time_us() - tb0;
-            }
-        }
-
-        if (batch.size() == 0) {
-            if (sp_timing) {
-                SPC_TIMING("draft: empty (wall=%.3fms)", (ggml_time_us() - sp_t0) / 1000.0);
-            }
-            return;
-        }
-
-        // decode all sequence's noise block in a single batch
-        const int64_t td0 = sp_timing ? ggml_time_us() : 0;
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-        if (sp_timing) {
-            sp_decode_us += ggml_time_us() - td0;
-        }
-        if (ret != 0) {
-            LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
-            return;
-        }
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] < 0) {
-                continue;
-            }
-            auto & dp = dparams[seq_id];
-
-            const int32_t beg            = i_block_beg[seq_id];
-            const int32_t n_block_tokens = n_block[seq_id];
 
             auto * smpl = smpls[seq_id].get();
 
@@ -1484,7 +1535,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (sp_timing) {
                     sp_walk_us += ggml_time_us() - tw0;
                 }
-                continue;
+                return;
             }
 
             if (is_dspark) {
@@ -1543,6 +1594,153 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+        };
+
+        if (!fuse_inject) {
+            batch.clear();
+
+            // build one batch holding every drafting sequence's noise block into a single decode)
+            // record where each block starts and its size
+            std::vector<int32_t> i_block_beg(n_seq, -1);
+            std::vector<int32_t> n_block    (n_seq,  0);
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                auto & dp = dparams[seq_id];
+                if (!dp.drafting) {
+                    continue;
+                }
+
+                common_sampler_reset(smpls[seq_id].get());
+
+                const int32_t n = (int32_t) dp.pos0;
+
+                const int32_t n_draft = params.n_max;
+                const int32_t n_block_tokens = is_lilicorr ? block_size : n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
+                i_block_beg[seq_id] = batch.size();
+                n_block    [seq_id] = n_block_tokens;
+                const int64_t tb0 = sp_timing ? ggml_time_us() : 0;
+                for (int32_t i = 0; i < n_block_tokens; ++i) {
+                    const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, !is_dflash2 && !is_lilicorr);
+                    if (is_lilicorr) {
+                        // For LiliCorr drafting batch, set state embeddings for use in the associated transformer head.
+                        const llama_pos pos = dp.pos0 - 1;
+                        const size_t slot = (size_t) seq_id * lilicorr_rows + (size_t) pos % lilicorr_rows;
+                        batch.set_embd_state(idx, { lilicorr_embd.data() + slot * (size_t) n_embd_dec, 1, (size_t) n_embd_dec });
+                    }
+                }
+                if (sp_timing) {
+                    sp_build_us += ggml_time_us() - tb0;
+                }
+            }
+
+            if (batch.size() == 0) {
+                if (sp_timing) {
+                    SPC_TIMING("draft: empty (wall=%.3fms)", (ggml_time_us() - sp_t0) / 1000.0);
+                }
+                return;
+            }
+
+            // decode all sequence's noise block in a single batch
+            const int64_t td0 = sp_timing ? ggml_time_us() : 0;
+            int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (sp_timing) {
+                sp_decode_us += ggml_time_us() - td0;
+            }
+            if (ret != 0) {
+                LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
+                return;
+            }
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] < 0) {
+                    continue;
+                }
+
+                finish_seq(seq_id, i_block_beg[seq_id], n_block[seq_id]);
+            }
+
+            if (sp_timing) {
+                SPC_TIMING("draft: build=%.3fms noise_decode=%.3fms lattice_sync=%.3fms walk=%.3fms wall=%.3fms",
+                        sp_build_us / 1000.0, sp_decode_us / 1000.0, sp_lattice_us / 1000.0,
+                        sp_walk_us / 1000.0, (ggml_time_us() - sp_t0) / 1000.0);
+            }
+            return;
+        }
+
+        // fused draft pass: one decode per sequence, each pass carrying the sequence's
+        // deferred injection rows (the accepted prefix, trimmed to pos < pos0) ahead of
+        // its noise block, so a cycle runs a single draft pass instead of an injection
+        // decode plus a noise decode. per-sequence decodes keep the lattice rows of every
+        // pass starting at row 0 (the inject rows' nextn slots stay unused) regardless of
+        // how the context splits the batch
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                // not drafting: still bring the draft cache up to date with any deferred rows
+                if (!stash[seq_id].pos.empty()) {
+                    const int64_t tf0 = sp_timing ? ggml_time_us() : 0;
+                    if (!flush_inject(seq_id)) {
+                        LOG_WRN("%s: failed to flush the deferred injection of seq %d\n", __func__, (int) seq_id);
+                    }
+                    if (sp_timing) {
+                        sp_decode_us += ggml_time_us() - tf0;
+                    }
+                }
+                continue;
+            }
+
+            common_sampler_reset(smpls[seq_id].get());
+
+            const int32_t n = (int32_t) dp.pos0;
+            const int32_t n_block_tokens = params.n_max + 1;
+
+            batch.clear();
+
+            const int64_t tb0 = sp_timing ? ggml_time_us() : 0;
+
+            // deferred injection rows: trim the rolled-back tail (the caller removes the
+            // rejected positions before drafting), then emit them as the leading prefix
+            {
+                auto & st = stash[seq_id];
+                while (!st.pos.empty() && st.pos.back() >= (llama_pos) dp.pos0) {
+                    st.pos.pop_back();
+                    st.feats.resize(st.pos.size() * (size_t) n_embd_enc);
+                }
+                if (!st.pos.empty()) {
+                    if (n_block_tokens + (int32_t) st.pos.size() > (int32_t) llama_n_ubatch(ctx_dft)) {
+                        // does not fit one ubatch: inject standalone, draft the plain block
+                        if (!flush_inject(seq_id)) {
+                            LOG_WRN("%s: failed to flush the deferred injection of seq %d\n", __func__, (int) seq_id);
+                            continue;
+                        }
+                    } else {
+                        for (size_t i = 0; i < st.pos.size(); ++i) {
+                            const llama_pos pos_arr[4] = { st.pos[i], st.pos[i], st.pos[i], 0 };
+                            batch.add_embd({ st.feats.data() + i * (size_t) n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                        }
+                        stash[seq_id] = inject_stash(); // consumed by this pass
+                    }
+                }
+            }
+
+            for (int32_t i = 0; i < n_block_tokens; ++i) {
+                batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, /*output*/ false);
+            }
+            if (sp_timing) {
+                sp_build_us += ggml_time_us() - tb0;
+            }
+
+            const int64_t td0 = sp_timing ? ggml_time_us() : 0;
+            const int32_t ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (sp_timing) {
+                sp_decode_us += ggml_time_us() - td0;
+            }
+            if (ret != 0) {
+                LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
+                continue;
+            }
+
+            finish_seq(seq_id, 0, n_block_tokens);
         }
 
         if (sp_timing) {
@@ -1550,6 +1748,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     sp_build_us / 1000.0, sp_decode_us / 1000.0, sp_lattice_us / 1000.0,
                     sp_walk_us / 1000.0, (ggml_time_us() - sp_t0) / 1000.0);
         }
+    }
+
+    bool flush(llama_seq_id seq_id) override {
+        return flush_inject(seq_id);
     }
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
@@ -3165,6 +3367,18 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     for (auto & impl_other : spec->impls) {
         if (impl_other.get() != impl) {
             impl_other->accept(seq_id, n_accepted, true);
+        }
+    }
+}
+
+void common_speculative_flush(common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (!impl->flush(seq_id)) {
+            LOG_ERR("%s: failed to flush seq %d\n", __func__, (int) seq_id);
         }
     }
 }

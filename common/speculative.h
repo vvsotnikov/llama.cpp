@@ -95,6 +95,10 @@ void common_speculative_draft(common_speculative * spec);
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
+// flushes any per-sequence deferred work into the context (e.g. the DFlash draft-side KV
+// injection) at pre-shift positions; call before shifting a sequence's memory positions
+void common_speculative_flush(common_speculative * spec, llama_seq_id seq_id);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

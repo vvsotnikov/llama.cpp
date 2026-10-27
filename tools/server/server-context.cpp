@@ -3718,6 +3718,11 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
+                // flush any deferred draft-side work at the pre-shift positions, so it shifts together with the caches
+                if (spec) {
+                    common_speculative_flush(spec.get(), slot.id);
+                }
+
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
