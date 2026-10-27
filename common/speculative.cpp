@@ -172,46 +172,37 @@ bool common_speculative_are_compatible(
 
 using common_speculative_draft_params_vec = std::vector<common_speculative_draft_params>;
 
-// keep the draft KV cache bounded: drop the oldest cells of a sequence once its position span
-// would exceed the retention window. positions stay absolute, so the drafter attends to the
-// most recent `window` tokens with exact rope geometry, and the per-round draft rollback
-// (which removes tail positions) is unaffected
+// keep the draft KV cache bounded: drop the cells of a sequence below the retention window
+// as the sequence grows. positions stay absolute, so the drafter attends to the most recent
+// `window` tokens with exact rope geometry, and the per-round draft rollback (which removes
+// tail positions) is unaffected. the cut is derived from the batch's own positions, so no
+// memory introspection is needed (a cache class may report a sub-cache's position range,
+// e.g. the iswa SWA lens)
 static void spec_draft_window_trim(llama_context * ctx_dft, const common_batch & batch, uint32_t window) {
     auto * mem = llama_get_memory(ctx_dft);
     if (mem == nullptr) {
         return;
     }
 
-    // incoming row count per sequence (rows carry the first sequence id, which is the one the
+    // newest position per sequence (rows carry the first sequence id, which is the one the
     // draft implementations write to)
     const int32_t n_seq = (int32_t) llama_n_seq_max(ctx_dft);
-    std::vector<int32_t> n_new(n_seq, 0);
+    std::vector<llama_pos> pos_max(n_seq, -1);
     for (const auto & t : batch.tokens) {
-        if (t.seq_id >= 0 && t.seq_id < n_seq) {
-            n_new[t.seq_id]++;
+        if (t.seq_id >= 0 && t.seq_id < n_seq && t.pos[0] > pos_max[t.seq_id]) {
+            pos_max[t.seq_id] = t.pos[0];
         }
     }
 
     for (llama_seq_id seq_id = 0; seq_id < n_seq; ++seq_id) {
-        if (n_new[seq_id] == 0) {
+        // drop everything below the window: [pos_max - window + 1, pos_max] is retained
+        const llama_pos cut = pos_max[seq_id] - (llama_pos) window + 1;
+        if (cut <= 0) {
             continue;
         }
 
-        const llama_pos pos_min = llama_memory_seq_pos_min(mem, seq_id);
-        const llama_pos pos_max = llama_memory_seq_pos_max(mem, seq_id);
-        if (pos_min < 0 || pos_max < pos_min) {
-            continue; // empty sequence
-        }
-
-        const int64_t span     = (int64_t) pos_max - pos_min + 1;
-        const int64_t overflow = span + n_new[seq_id] - (int64_t) window;
-        if (overflow <= 0) {
-            continue;
-        }
-
-        const llama_pos drop = (llama_pos) std::min<int64_t>(overflow, span);
-        if (!llama_memory_seq_rm(mem, seq_id, pos_min, pos_min + drop)) {
-            LOG_WRN("%s: failed to trim the draft context of seq %d\n", __func__, seq_id);
+        if (!llama_memory_seq_rm(mem, seq_id, 0, cut)) {
+            LOG_WRN("%s: failed to trim the draft context of seq %d below pos %d\n", __func__, seq_id, (int) cut);
         }
     }
 }
