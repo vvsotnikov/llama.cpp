@@ -2734,12 +2734,14 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
 // bounded draft context (see common_params_speculative_draft::n_ctx)
 //
-// the draft KV cache does not need to be sized at the target's full context: like splash-cuda's
-// fixed 2048-token draft ring, drafting quality is carried by the most recent tokens of context.
-// llama.cpp keeps draft positions absolute and drops the oldest cells of a sequence once its
-// position span would exceed the window, so no rope re-encoding or position rebasing is needed
-// and the existing per-round draft rollback (which removes tail positions) is untouched.
-static constexpr uint32_t SPEC_DRAFT_WINDOW_AUTO = 2048;
+// the draft KV cache does not need to be sized at the target's full context: drafting quality
+// is carried by the most recent tokens of context. llama.cpp keeps draft positions absolute and
+// drops the cells below the window as the sequence grows, so no rope re-encoding or position
+// rebasing is needed and the existing per-round draft rollback (which removes tail positions)
+// is untouched. the auto window is measured: at 4096 the drafter stays proposal-identical to a
+// full-context drafter on all measured workloads (16k-prompt decode bench and long-generation
+// GPQA); at 2048 the proposals diverge and long generations lose throughput.
+static constexpr uint32_t SPEC_DRAFT_WINDOW_AUTO = 4096;
 
 struct common_speculative_draft_window {
     uint32_t window = 0; // per-sequence retention in tokens (0 = keep the draft context at the full target context)

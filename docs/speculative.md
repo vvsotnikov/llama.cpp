@@ -235,7 +235,7 @@ Use exactly one of these options:
 ### Draft Model Parameters
 
 The drafter's KV cache is bounded by `--spec-draft-ctx` instead of being sized at the full
-target context: each sequence's draft context retains only the most recent tokens (2048 by
+target context: each sequence's draft context retains only the most recent tokens (4096 by
 default when the target context is larger; the oldest positions are dropped as the sequence
 grows). Draft quality is carried by the most recent tokens of context, and the accepted
 token stream is unchanged by verification; only the drafter's proposals (and therefore the
@@ -262,7 +262,7 @@ the draft context at the full target context (the behavior of earlier releases).
                                         draft context window in tokens per sequence; the draft KV cache retains only the most recent N tokens
                                         of a sequence instead of being sized at the full target context (draft quality is carried by the most
                                         recent tokens of context, and the accepted token stream is unchanged by verification)
-                                        (-1 = auto: 2048 tokens when the target context is larger, 0 = full target context) (default: -1)
+                                        (-1 = auto: 4096 tokens when the target context is larger, 0 = full target context) (default: -1)
                                         (env: LLAMA_ARG_SPEC_DRAFT_CTX)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)

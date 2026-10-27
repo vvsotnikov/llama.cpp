@@ -350,7 +350,7 @@ struct common_params_speculative_draft {
     // draft context window per sequence: the draft KV cache retains only the most recent N tokens
     // of a sequence instead of being sized at the full target context (the oldest positions are
     // dropped as the sequence grows; draft positions stay absolute)
-    // -1 - auto: bound at 2048 tokens when the target context is larger
+    // -1 - auto: bound at 4096 tokens when the target context is larger
     //  0 - size the draft context at the full target context (legacy behavior)
     int32_t n_ctx = -1;
 

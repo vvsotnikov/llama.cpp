@@ -4215,7 +4215,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-ctx"}, "N",
         "draft context window in tokens per sequence; the draft KV cache retains only the most recent N tokens "
-        "of a sequence instead of being sized at the full target context (-1 = auto: 2048 tokens when the target "
+        "of a sequence instead of being sized at the full target context (-1 = auto: 4096 tokens when the target "
         "context is larger, 0 = full target context) (default: -1)",
         [](common_params & params, int value) {
             params.speculative.draft.n_ctx = value;
