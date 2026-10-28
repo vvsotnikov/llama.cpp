@@ -1297,8 +1297,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // fused draft pass: inject rows take the K/V-only encoder path, noise rows the decoder
     if (mixed) {
-        LLAMA_LOG_WARN("SPEC-DBG fused graph n_inj=%lld n_dec=%lld n_tokens=%d\n",
-                (long long) n_inj, (long long) n_dec, (int) ubatch.n_tokens);
         auto inp = std::make_unique<llm_graph_input_dflash_fused>(n_embd_inp);
 
         inp->feats = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_inj);
