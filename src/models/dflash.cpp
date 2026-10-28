@@ -1365,7 +1365,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         // the encoder chain writes every layer's inject K/V before the decoder starts,
         // so the noise rows' attention reads the fresh cells in-graph
-        build_kv_inject(n_inj, feats_inj, pos_rows(inp_pos, 0, n_inj), k_idxs_of, v_idxs_of);
+        if (!getenv("LLAMA_SPEC_DEBUG_NOENCODER")) {
+            build_kv_inject(n_inj, feats_inj, pos_rows(inp_pos, 0, n_inj), k_idxs_of, v_idxs_of);
+        } else {
+            fprintf(stderr, "SPEC-DBG-STDERR encoder skipped\n");
+        }
 
         res->t_inp_tokens = dec_tokens;
         build_decoder(n_dec, dec_tokens, pos_rows(inp_pos, n_inj, n_dec), nullptr);
