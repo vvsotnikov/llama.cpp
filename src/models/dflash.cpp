@@ -897,6 +897,7 @@ static void build_lilicorr_scores(llm_graph_context & g, const llama_model & mod
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
 template <>
 llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+    LLAMA_LOG_INFO("SPEC-DBG dflash decode graph built (gtype=%d)\n", (int) params.gtype);
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
