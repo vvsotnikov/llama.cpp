@@ -1701,14 +1701,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int64_t tb0 = sp_timing ? ggml_time_us() : 0;
 
-            // deferred injection rows: the full verify batch rides along (fixed graph
-            // width); the rejected rows' cells are hidden from the noise rows' attention
-            // by the fused input and rolled back by the caller after the round
+            // deferred injection rows: trim the rolled-back tail (the caller removes the
+            // rejected positions before drafting), then emit them as the leading prefix
             {
                 auto & st = stash[seq_id];
-                // the stash must exactly continue the committed prefix: its first position
-                // is one past the cache's max position (the rows are not in the cache yet
-                // - they are what this pass injects); anything else is stale
+                while (!st.pos.empty() && st.pos.back() >= (llama_pos) dp.pos0) {
+                    st.pos.pop_back();
+                    st.feats.resize(st.pos.size() * (size_t) n_embd_enc);
+                }
+                // the trimmed stash must exactly continue the committed prefix: its first
+                // position is one past the cache's max position (the rows are not in the
+                // cache yet - they are what this pass injects); anything else is stale
                 if (!st.pos.empty()) {
                     const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
                     if (st.pos.front() != pos_max + 1) {
