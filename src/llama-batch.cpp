@@ -127,6 +127,10 @@ bool llama_batch_allocr::init(
             if (is_embd_vec[i]) {
                 const float * src = batch_inp.embd.data() + batch_inp.tokens[i].embd_off;
                 std::copy(src, src + n_embd, embd_vec.data() + (size_t) i*n_embd);
+                if (getenv("LLAMA_SPEC_DEBUG_DRAFT") && i < 2) {
+                    fprintf(stderr, "SPEC-DBG embdvec row %d off=%zu [%f %f %f]\n", i, batch_inp.tokens[i].embd_off,
+                            src[0], src[1], src[2]);
+                }
             }
         }
     } else if (has_embd) {
