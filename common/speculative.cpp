@@ -1788,7 +1788,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, false);
                 }
-                if (llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0) {
+                const int32_t cmp_rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                fprintf(stderr, "SPEC-DBG-STDERR cmp ref rc=%d\n", cmp_rc);
+                if (cmp_rc == 0) {
                     finish_seq(seq_id, 0, n_block_tokens);
                     const llama_tokens & ref = *dp.result;
                     bool eq = fused_result == ref;
