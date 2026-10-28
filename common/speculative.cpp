@@ -1711,6 +1711,38 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n = (int32_t) dp.pos0;
             const int32_t n_block_tokens = params.n_max + 1;
 
+            // debug: reference two-pass flow first (standalone inject + plain noise
+            // decode), then roll the cells back so the fused pass sees the same state
+            llama_tokens ref;
+            const bool dbg_cmp = getenv("LLAMA_SPEC_DEBUG_COMPARE") != nullptr;
+            if (dbg_cmp && !stash[seq_id].pos.empty()) {
+                inject_stash st_saved = stash[seq_id];
+                // the reference injects the accepted prefix only (what the fused pass
+                // would inject): trim the rolled-back tail
+                while (!st_saved.pos.empty() && st_saved.pos.back() >= (llama_pos) dp.pos0) {
+                    st_saved.pos.pop_back();
+                    st_saved.feats.resize(st_saved.pos.size() * (size_t) n_embd_enc);
+                }
+                stash[seq_id] = st_saved;
+                if (flush_inject(seq_id)) {
+                    batch.clear();
+                    for (int32_t i = 0; i < n_block_tokens; ++i) {
+                        batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, false);
+                    }
+                    const int32_t ref_rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    fprintf(stderr, "SPEC-DBG-STDERR ref rc=%d\n", ref_rc);
+                    if (ref_rc == 0) {
+                        llama_tokens * saved_res = dp.result;
+                        dp.result = &ref;
+                        finish_seq(seq_id, 0, n_block_tokens);
+                        dp.result = saved_res;
+                    }
+                }
+                // roll the reference cells back: the noise block and the injected rows
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, st_saved.pos.front(), -1);
+                stash[seq_id] = std::move(st_saved);
+            }
+
             batch.clear();
 
             const int64_t tb0 = sp_timing ? ggml_time_us() : 0;
@@ -1768,29 +1800,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         batch.size(), kinds.c_str(), batch.has_token(), batch.has_embd());
             }
             const int64_t td0 = sp_timing ? ggml_time_us() : 0;
-            // debug: reference two-pass flow first (standalone inject + plain noise
-            // decode), then roll the cells back so the fused pass sees the same state
-            llama_tokens ref;
-            const bool dbg_cmp = getenv("LLAMA_SPEC_DEBUG_COMPARE") != nullptr;
-            if (dbg_cmp && !stash[seq_id].pos.empty()) {
-                inject_stash st_saved = stash[seq_id];
-                if (flush_inject(seq_id)) {
-                    batch.clear();
-                    for (int32_t i = 0; i < n_block_tokens; ++i) {
-                        batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, false);
-                    }
-                    if (llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0) {
-                        llama_tokens * saved_res = dp.result;
-                        dp.result = &ref;
-                        finish_seq(seq_id, 0, n_block_tokens);
-                        dp.result = saved_res;
-                    }
-                }
-                // roll the reference cells back: the noise block and the injected rows
-                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, st_saved.pos.front(), -1);
-                stash[seq_id] = std::move(st_saved);
-            }
-
             const int32_t ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (sp_timing) {
                 sp_decode_us += ggml_time_us() - td0;
