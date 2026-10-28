@@ -1205,9 +1205,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // reseed per request rather than per round, or two identical requests differ
         dflash2_seed[seq_id] = -1;
 
-        // a new request replaces any injection rows left over by the previous one
-        stash[seq_id] = inject_stash();
-
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1242,7 +1239,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         while (n_keep > 0 && st.pos[n_keep - 1] > pos_max) {
             --n_keep;
         }
-        if (n_keep == 0) {
+        // the stash must exactly continue the committed prefix; anything else is a stale
+        // leftover of an earlier request or an abandoned round - drop it whole
+        if (n_keep == 0 || st.pos[n_keep - 1] != pos_max ||
+                st.pos[0] != pos_max - (llama_pos) n_keep + 1) {
             st = inject_stash();
             return true;
         }
@@ -1378,6 +1378,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         if (sp_timing) {
                             sp_inject_us += ggml_time_us() - tf0;
                         }
+                    }
+                    const llama_pos first_pos = batch_in.tokens[i_batch_beg[seq_id] + offset].pos[0];
+                    if (!st.pos.empty() && st.pos.back() + 1 != first_pos) {
+                        st = inject_stash(); // rows of another request or a gap: start over
                     }
                     st.feats.insert(st.feats.end(), features_buf.begin(), features_buf.end());
                     for (int32_t i = 0; i < n_chunk; ++i) {
@@ -1711,6 +1715,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 while (!st.pos.empty() && st.pos.back() >= (llama_pos) dp.pos0) {
                     st.pos.pop_back();
                     st.feats.resize(st.pos.size() * (size_t) n_embd_enc);
+                }
+                // the trimmed stash must exactly continue the committed prefix (the cache
+                // ends at pos0-1 after the caller's rollback); anything else is stale
+                if (!st.pos.empty()) {
+                    const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+                    if (st.pos.back() != pos_max || st.pos.front() != pos_max - (llama_pos) st.pos.size() + 1) {
+                        st = inject_stash();
+                    }
                 }
                 if (!st.pos.empty()) {
                     if (n_block_tokens + (int32_t) st.pos.size() > (int32_t) llama_n_ubatch(ctx_dft)) {
