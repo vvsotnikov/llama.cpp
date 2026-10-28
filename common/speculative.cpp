@@ -1546,9 +1546,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                         LOG_INF("SPEC-DBG lat%s\n", lat.c_str());
                     }
-                    LOG_INF("SPEC-DBG seq=%d pos0=%d n_block=%d draft0=%d draft1=%d n_result=%zu\n",
+                    LOG_INF("SPEC-DBG seq=%d pos0=%d n_block=%d draft0=%d(%s) draft1=%d n_result=%zu\n",
                             (int) seq_id, (int) dp.pos0, (int) n_block_tokens,
                             result.empty() ? -1 : (int) result[0],
+                            result.empty() ? "" : common_token_to_piece(ctx_dft, result[0]).c_str(),
                             result.size() > 1 ? (int) result[1] : -1, result.size());
                 }
                 return;
