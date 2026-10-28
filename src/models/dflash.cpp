@@ -440,8 +440,10 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
             };
             hide(k_idxs_base, kq_mask_base);
             hide(k_idxs_swa, kq_mask_swa);
-            fprintf(stderr, "SPEC-DBG-STDERR maskhide applied (base=%d swa=%d)\n",
-                    kq_mask_base != nullptr, kq_mask_swa != nullptr);
+            fprintf(stderr, "SPEC-DBG-STDERR maskhide base(buf=%d swa_buf=%d kidx_swa_buf=%d)\n",
+                    kq_mask_base && kq_mask_base->buffer != nullptr,
+                    kq_mask_swa && kq_mask_swa->buffer != nullptr,
+                    k_idxs_swa && k_idxs_swa->buffer != nullptr);
         }
     }
 
