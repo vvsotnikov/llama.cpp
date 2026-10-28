@@ -386,7 +386,8 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
         // debug: dump the cache cell ids assigned to the ubatch rows (after the attn
         // input's set_input has filled them), the noise token ids and the positions
         if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
-            fprintf(stderr, "SPEC-DBG ptrs: k_idxs=%p buf=%d mask=%p buf=%d feats=%p buf=%d\n",
+            fprintf(stderr, "SPEC-DBG ptrs: n_tokens=%d k_idxs=%p buf=%d mask=%p buf=%d feats=%p buf=%d\n",
+                    (int) ubatch->n_tokens,
                     (void *) k_idxs_base, k_idxs_base ? k_idxs_base->buffer != nullptr : -1,
                     (void *) kq_mask_base, kq_mask_base ? kq_mask_base->buffer != nullptr : -1,
                     (void *) feats, feats ? feats->buffer != nullptr : -1);
