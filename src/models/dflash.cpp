@@ -946,6 +946,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // KV-injection decode and the noise decode run in one graph (see speculative.cpp).
     // the injection rows are always a leading prefix of the ubatch: the draft context
     // splits per sequence (embd_all), and the speculative side emits the inject rows first
+    if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
+        LLAMA_LOG_INFO("SPEC-DBG dflash ubatch n_tokens=%d token=%d embd=%d mixed=%d n_seqs_unq=%d\n",
+                (int) ubatch.n_tokens, ubatch.token != nullptr, ubatch.embd != nullptr,
+                ubatch.is_mixed(), (int) ubatch.n_seqs_unq);
+    }
     const bool mixed = ubatch.embd && ubatch.token != nullptr;
     int64_t n_inj = 0;
     if (mixed) {
