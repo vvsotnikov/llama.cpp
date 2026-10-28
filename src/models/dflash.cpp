@@ -383,6 +383,40 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
         ggml_backend_tensor_set(feats, ubatch->embd, 0, n_inj*n_embd_inp_enc*ggml_element_size(feats));
         ggml_backend_tensor_set(toks,  ubatch->token + n_inj, 0, (ubatch->n_tokens - n_inj)*ggml_element_size(toks));
 
+        // the verify batch rides along at a fixed width: the rows at or past the first
+        // noise row's position are rejected candidates - their cells carry fresh K/V but
+        // must stay invisible to the noise rows' attention (the caller rolls them back)
+        if (k_idxs_swa && kq_mask_swa && kq_mask_swa->buffer && k_idxs_swa->buffer && n_inj > 0) {
+            const int64_t   n_kv   = kq_mask_swa->ne[0];
+            const int64_t * cells  = (const int64_t *) k_idxs_swa->data;
+            const llama_pos pos0   = ubatch->pos[n_inj*ubatch->n_pos];
+            int64_t n_rej = 0;
+            for (int64_t j = 0; j < n_inj; ++j) {
+                if (ubatch->pos[j*ubatch->n_pos] >= pos0) {
+                    ++n_rej;
+                }
+            }
+            if (n_rej > 0) {
+                const int64_t n_dec = ubatch->n_tokens - n_inj;
+                if (kq_mask_swa->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+                    for (int64_t r = 0; r < n_dec; ++r) {
+                        ggml_fp16_t * row = (ggml_fp16_t *) kq_mask_swa->data + (n_inj + r)*n_kv;
+                        for (int64_t j = n_inj - n_rej; j < n_inj; ++j) {
+                            row[cells[j]] = drop;
+                        }
+                    }
+                } else {
+                    for (int64_t r = 0; r < n_dec; ++r) {
+                        float * row = (float *) kq_mask_swa->data + (n_inj + r)*n_kv;
+                        for (int64_t j = n_inj - n_rej; j < n_inj; ++j) {
+                            row[cells[j]] = -INFINITY;
+                        }
+                    }
+                }
+            }
+        }
+
 
     }
 
@@ -400,6 +434,11 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
 
     ggml_tensor * feats = nullptr; // F32 [n_embd_inp_enc, n_inj]
     ggml_tensor * toks  = nullptr; // I32 [n_dec]
+
+    // (iswa caches) the idx and KQ-mask inputs of the sliding sub-cache, for the
+    // rejected-row mask patch in set_input; wired by the graph build
+    ggml_tensor * k_idxs_swa  = nullptr; // I64 [n_tokens]
+    ggml_tensor * kq_mask_swa = nullptr; // F16/F32 [n_kv, n_batch]
 
     // debug bisect hooks (filled by the graph build)
 
@@ -1266,6 +1305,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_set_input(inp->feats);
         inp->toks = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_dec);
         ggml_set_input(inp->toks);
+        inp->k_idxs_swa  = use_iswa ? inp_attn_iswa->get_k_idxs_swa() : nullptr;
+        inp->kq_mask_swa = use_iswa ? inp_attn_iswa->get_kq_mask_swa() : nullptr;
 
         ggml_tensor * feats_inj = inp->feats;
         cb(feats_inj, "inp_target_features", -1);
