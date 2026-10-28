@@ -1785,6 +1785,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     } else {
                         for (size_t i = 0; i < st.pos.size(); ++i) {
                             const llama_pos pos_arr[4] = { st.pos[i], st.pos[i], st.pos[i], 0 };
+                            if (getenv("LLAMA_SPEC_DEBUG_DRAFT") && seq_id == 0) {
+                                fprintf(stderr, "SPEC-DBG stashrow %zu pos=%d [%s]\n", i, (int) st.pos[i],
+                                        std::to_string(st.feats[i * (size_t) n_embd_enc]).c_str());
+                            }
                             batch.add_embd({ st.feats.data() + i * (size_t) n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                         }
                         stash[seq_id] = inject_stash(); // consumed by this pass
