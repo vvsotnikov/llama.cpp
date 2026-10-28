@@ -443,7 +443,8 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
             };
             hide(k_idxs_base, kq_mask_base);
             hide(k_idxs_swa, kq_mask_swa);
-            if (getenv("LLAMA_SPEC_DEBUG_DRAFT") && kq_mask_swa && kq_mask_swa->buffer && k_idxs_swa && k_idxs_swa->buffer) {
+        }
+        if (getenv("LLAMA_SPEC_DEBUG_DRAFT") && kq_mask_swa && kq_mask_swa->buffer && k_idxs_swa && k_idxs_swa->buffer) {
                 // dump the first noise row's SWA mask at the inject, noise and a few cache cells
                 const int64_t n_kv = kq_mask_swa->ne[0];
                 const int64_t * cells = (const int64_t *) k_idxs_swa->data;
