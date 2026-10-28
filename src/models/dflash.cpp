@@ -408,25 +408,34 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
 
         // debug bisect: hide the in-graph inject cells from the noise rows' attention, so
         // the noise block sees exactly the standalone-pass visibility (history only)
-        if (mask_hide && k_idxs_base && kq_mask_base && kq_mask_base->buffer) {
-            const int64_t n_kv = kq_mask_base->ne[0];
-            const int64_t * cells = (const int64_t *) k_idxs_base->data;
-            if (kq_mask_base->type == GGML_TYPE_F16) {
-                ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
-                for (int64_t r = 0; r < toks->ne[0]; ++r) {
-                    ggml_fp16_t * row = (ggml_fp16_t *) kq_mask_base->data + (n_inj_rows + r)*n_kv;
-                    for (int64_t j = 0; j < n_inj_rows; ++j) {
-                        row[cells[j]] = drop;
+        if (mask_hide) {
+            auto hide = [&](ggml_tensor * k_idxs, ggml_tensor * mask) {
+                if (!k_idxs || !mask || !mask->buffer || !k_idxs->buffer) {
+                    return;
+                }
+                const int64_t n_kv = mask->ne[0];
+                const int64_t * cells = (const int64_t *) k_idxs->data;
+                if (mask->type == GGML_TYPE_F16) {
+                    ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+                    for (int64_t r = 0; r < toks->ne[0]; ++r) {
+                        ggml_fp16_t * row = (ggml_fp16_t *) mask->data + (n_inj_rows + r)*n_kv;
+                        for (int64_t j = 0; j < n_inj_rows; ++j) {
+                            row[cells[j]] = drop;
+                        }
+                    }
+                } else {
+                    for (int64_t r = 0; r < toks->ne[0]; ++r) {
+                        float * row = (float *) mask->data + (n_inj_rows + r)*n_kv;
+                        for (int64_t j = 0; j < n_inj_rows; ++j) {
+                            row[cells[j]] = -INFINITY;
+                        }
                     }
                 }
-            } else {
-                for (int64_t r = 0; r < toks->ne[0]; ++r) {
-                    float * row = (float *) kq_mask_base->data + (n_inj_rows + r)*n_kv;
-                    for (int64_t j = 0; j < n_inj_rows; ++j) {
-                        row[cells[j]] = -INFINITY;
-                    }
-                }
-            }
+            };
+            hide(k_idxs_base, kq_mask_base);
+            hide(k_idxs_swa, kq_mask_swa);
+            fprintf(stderr, "SPEC-DBG-STDERR maskhide applied (base=%d swa=%d)\n",
+                    kq_mask_base != nullptr, kq_mask_swa != nullptr);
         }
     }
 
@@ -448,6 +457,8 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
     // debug bisect hooks (filled by the graph build)
     ggml_tensor * k_idxs_base = nullptr; // I64 [n_tokens], filled before this input
     ggml_tensor * kq_mask_base = nullptr;
+    ggml_tensor * k_idxs_swa  = nullptr;
+    ggml_tensor * kq_mask_swa = nullptr;
     int64_t  n_inj_rows = 0;
     bool     mask_hide  = false;
 
@@ -1323,6 +1334,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_set_input(inp->toks);
         inp->k_idxs_base = use_iswa ? inp_attn_iswa->get_k_idxs() : inp_attn->get_k_idxs();
         inp->kq_mask_base = use_iswa ? inp_attn_iswa->get_kq_mask() : inp_attn->get_kq_mask();
+        inp->k_idxs_swa  = use_iswa ? inp_attn_iswa->get_k_idxs_swa() : nullptr;
+        inp->kq_mask_swa = use_iswa ? inp_attn_iswa->get_kq_mask_swa() : nullptr;
         inp->n_inj_rows = n_inj;
         inp->mask_hide = getenv("LLAMA_SPEC_DEBUG_MASKHIDE") != nullptr;
 
