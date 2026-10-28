@@ -1781,6 +1781,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             // debug: compare the fused pass against the reference two-pass flow on the
             // same cache state (the plain noise decode re-reads the same cells)
             if (getenv("LLAMA_SPEC_DEBUG_COMPARE")) {
+                fprintf(stderr, "SPEC-DBG-STDERR cmp enter\n");
                 llama_tokens fused_result = *dp.result;
                 dp.result->clear();
                 batch.clear();
