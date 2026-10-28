@@ -1535,6 +1535,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (sp_timing) {
                     sp_walk_us += ggml_time_us() - tw0;
                 }
+                if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
+                    LOG_INF("SPEC-DBG seq=%d pos0=%d n_block=%d draft0=%d draft1=%d n_result=%zu\n",
+                            (int) seq_id, (int) dp.pos0, (int) n_block_tokens,
+                            result.empty() ? -1 : (int) result[0],
+                            result.size() > 1 ? (int) result[1] : -1, result.size());
+                }
                 return;
             }
 
