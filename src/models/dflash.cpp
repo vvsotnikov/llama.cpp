@@ -444,24 +444,23 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
             hide(k_idxs_base, kq_mask_base);
             hide(k_idxs_swa, kq_mask_swa);
         }
+        fprintf(stderr, "SPEC-DBG-STDERR maskhide base(buf=%d swa_buf=%d kidx_swa_buf=%d)\n",
+                kq_mask_base && kq_mask_base->buffer != nullptr,
+                kq_mask_swa && kq_mask_swa->buffer != nullptr,
+                k_idxs_swa && k_idxs_swa->buffer != nullptr);
         if (getenv("LLAMA_SPEC_DEBUG_DRAFT") && kq_mask_swa && kq_mask_swa->buffer && k_idxs_swa && k_idxs_swa->buffer) {
-                // dump the first noise row's SWA mask at the inject, noise and a few cache cells
-                const int64_t n_kv = kq_mask_swa->ne[0];
-                const int64_t * cells = (const int64_t *) k_idxs_swa->data;
-                const int64_t row0 = n_inj_rows*n_kv;
-                std::string d = "SPEC-DBG maskrow0:";
-                for (int64_t j = 0; j < ubatch->n_tokens; ++j) {
-                    float v = kq_mask_swa->type == GGML_TYPE_F16
-                        ? ggml_fp16_to_fp32(((ggml_fp16_t *) kq_mask_swa->data)[row0 + cells[j]])
-                        : ((float *) kq_mask_swa->data)[row0 + cells[j]];
-                    d += " " + std::to_string(cells[j]) + (ubatch->type[j] ? "E:" : "N:") + std::to_string(v);
-                }
-                fprintf(stderr, "%s\n", d.c_str());
+            // dump the first noise row's SWA mask at the inject and noise cells
+            const int64_t n_kv = kq_mask_swa->ne[0];
+            const int64_t * cells = (const int64_t *) k_idxs_swa->data;
+            const int64_t row0 = n_inj*n_kv;
+            std::string d = "SPEC-DBG maskrow0:";
+            for (int64_t j = 0; j < ubatch->n_tokens; ++j) {
+                float v = kq_mask_swa->type == GGML_TYPE_F16
+                    ? ggml_fp16_to_fp32(((ggml_fp16_t *) kq_mask_swa->data)[row0 + cells[j]])
+                    : ((float *) kq_mask_swa->data)[row0 + cells[j]];
+                d += " " + std::to_string(cells[j]) + (ubatch->type[j] ? "E:" : "N:") + std::to_string(v);
             }
-            fprintf(stderr, "SPEC-DBG-STDERR maskhide base(buf=%d swa_buf=%d kidx_swa_buf=%d)\n",
-                    kq_mask_base && kq_mask_base->buffer != nullptr,
-                    kq_mask_swa && kq_mask_swa->buffer != nullptr,
-                    k_idxs_swa && k_idxs_swa->buffer != nullptr);
+            fprintf(stderr, "%s\n", d.c_str());
         }
     }
 
