@@ -1381,14 +1381,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (!st.pos.empty() && st.pos.back() + 1 != first_pos) {
                         st = inject_stash(); // rows of another request or a gap: start over
                     }
-                    if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
-                        std::string fd = "SPEC-DBG gather:";
-                        for (int32_t i = 0; i < n_chunk; ++i) {
-                            fd += " ["; for (int c = 0; c < 3; ++c) fd += " " + std::to_string(features_buf[(size_t) i*n_embd_enc + c]);
-                            fd += "]";
-                        }
-                        fprintf(stderr, "%s\n", fd.c_str());
-                    }
                     st.feats.insert(st.feats.end(), features_buf.begin(), features_buf.end());
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         st.pos.push_back(batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0]);
@@ -1545,23 +1537,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (sp_timing) {
                     sp_walk_us += ggml_time_us() - tw0;
                 }
-                if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
-                    if (seq_id == 0) {
-                        std::string lat;
-                        for (int32_t r = 0; r < 3 && r < n_block_tokens; ++r) {
-                            lat += " |";
-                            for (int32_t c = 0; c < 6; ++c) {
-                                lat += " " + std::to_string(lattice[(size_t)(beg + r) * n_embd_dec + c]);
-                            }
-                        }
-                        LOG_INF("SPEC-DBG lat%s\n", lat.c_str());
-                    }
-                    LOG_INF("SPEC-DBG seq=%d pos0=%d n_block=%d draft0=%d(%s) draft1=%d n_result=%zu\n",
-                            (int) seq_id, (int) dp.pos0, (int) n_block_tokens,
-                            result.empty() ? -1 : (int) result[0],
-                            result.empty() ? "" : common_token_to_piece(ctx_dft, result[0]).c_str(),
-                            result.size() > 1 ? (int) result[1] : -1, result.size());
-                }
+
                 return;
             }
 
@@ -1739,9 +1715,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (!st.pos.empty()) {
                     const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
                     if (st.pos.front() != pos_max + 1) {
-                        fprintf(stderr, "SPEC-DBG-STDERR stash drop seq=%d front=%d back=%d n=%zu cache_pos_max=%d pos0=%d\n",
-                                (int) seq_id, (int) st.pos.front(), (int) st.pos.back(), st.pos.size(),
-                                (int) pos_max, (int) dp.pos0);
                         st = inject_stash();
                     }
                 }
@@ -1771,14 +1744,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 sp_build_us += ggml_time_us() - tb0;
             }
 
-            if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
-                std::string kinds;
-                for (int32_t i = 0; i < batch.size(); ++i) {
-                    kinds += batch.tokens[i].embd.data ? "E" : "T";
-                }
-                LOG_INF("SPEC-DBG batch n=%d kinds=%s has_tok=%d has_embd=%d\n",
-                        batch.size(), kinds.c_str(), batch.has_token(), batch.has_embd());
-            }
             const int64_t td0 = sp_timing ? ggml_time_us() : 0;
             const int32_t ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (sp_timing) {
