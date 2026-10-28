@@ -1368,8 +1368,18 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         res->t_inp_tokens = dec_tokens;
         build_decoder(n_dec, dec_tokens, pos_rows(inp_pos, n_inj, n_dec), nullptr);
 
-        fprintf(stderr, "SPEC-DBG-STDERR fused graph nodes=%d n_inj=%lld n_dec=%lld\n",
-                ggml_graph_n_nodes(gf), (long long) n_inj, (long long) n_dec);
+        {
+            std::map<int, int> ops;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ops[ggml_graph_node(gf, i)->op]++;
+            }
+            std::string hist;
+            for (auto & [op, n] : ops) {
+                hist += " " + std::to_string(op) + ":" + std::to_string(n);
+            }
+            fprintf(stderr, "SPEC-DBG-STDERR fused graph nodes=%d n_inj=%lld n_dec=%lld ops=%s\n",
+                    ggml_graph_n_nodes(gf), (long long) n_inj, (long long) n_dec, hist.c_str());
+        }
         // the unmasked nextn extraction reads one row per ubatch row, so pad the lattice
         // (the inject rows' slots stay unused)
         if (res->t_h_nextn && n_dec < (int64_t) ubatch.n_tokens) {
