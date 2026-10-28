@@ -392,6 +392,18 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
                 dbg += " " + std::to_string(cells[i]) + (ubatch->type[i] ? "E" : "N");
             }
             LLAMA_LOG_WARN("%s\n", dbg.c_str());
+            std::string dbg2 = "SPEC-DBG toks:";
+            for (int64_t i = n_inj; i < (int64_t) ubatch->n_tokens; ++i) {
+                dbg2 += " " + std::to_string(ubatch->token[i]);
+            }
+            std::string dbg3 = "SPEC-DBG pos:";
+            for (int64_t s = 0; s < (int64_t) ubatch->n_pos; ++s) {
+                for (int64_t i = 0; i < (int64_t) ubatch->n_tokens; ++i) {
+                    dbg3 += " " + std::to_string(ubatch->pos[s*ubatch->n_tokens + i]);
+                }
+                dbg3 += " |";
+            }
+            LLAMA_LOG_WARN("%s\n%s\n", dbg2.c_str(), dbg3.c_str());
         }
 
         // debug bisect: hide the in-graph inject cells from the noise rows' attention, so
