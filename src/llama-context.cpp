@@ -1584,7 +1584,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     // set the input data for the input tensors
-    const int64_t t_si0 = getenv("LLAMA_SPEC_TIMING") ? ggml_time_us() : 0;
     {
         //const auto t_start_us = ggml_time_us();
 
@@ -1594,17 +1593,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const int64_t t_gc0 = getenv("LLAMA_SPEC_TIMING") ? ggml_time_us() : 0;
-    if (t_gc0 && getenv("LLAMA_SPEC_TIMING")) {
-        LLAMA_LOG_INFO("SPEC-TIMING decode: set_inputs=%.3f n_tokens=%d\n",
-                (t_gc0 - t_si0)/1000.0, (int) ubatch.n_tokens);
-    }
-
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    if (getenv("LLAMA_SPEC_TIMING")) {
-        LLAMA_LOG_INFO("SPEC-TIMING decode: graph_compute=%.3f n_tokens=%d\n",
-                (ggml_time_us() - t_gc0)/1000.0, (int) ubatch.n_tokens);
-    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
