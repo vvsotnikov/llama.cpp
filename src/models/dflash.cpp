@@ -1401,6 +1401,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     build_decoder(n_tokens, inp_tokens, inp_pos, inp_anchor);
+    fprintf(stderr, "SPEC-DBG-STDERR plain graph nodes=%d n_tokens=%d\n", ggml_graph_n_nodes(gf), (int) ubatch.n_tokens);
 }
 
 // DSV4 DSpark decoder, dual-mode by batch type (see the DFlash decoder above):
