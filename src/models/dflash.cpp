@@ -392,11 +392,14 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
                     (void *) kq_mask_base, kq_mask_base ? kq_mask_base->buffer != nullptr : -1,
                     (void *) feats, feats ? feats->buffer != nullptr : -1);
             std::string dbg = "SPEC-DBG cells:";
-            if (k_idxs_base && k_idxs_base->buffer) {
-                const int64_t * cells = (const int64_t *) k_idxs_base->data;
+            ggml_tensor * kx = (k_idxs_swa && k_idxs_swa->buffer) ? k_idxs_swa : k_idxs_base;
+            if (kx && kx->buffer) {
+                const int64_t * cells = (const int64_t *) kx->data;
                 for (int64_t i = 0; i < ubatch->n_tokens; ++i) {
                     dbg += " " + std::to_string(cells[i]) + (ubatch->type[i] ? "E" : "N");
                 }
+            } else {
+                dbg += " <no live k_idxs>";
             }
             std::string dbg2 = "SPEC-DBG toks:";
             for (int64_t i = n_inj; i < (int64_t) ubatch->n_tokens; ++i) {
