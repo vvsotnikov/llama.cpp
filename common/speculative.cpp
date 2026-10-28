@@ -1050,6 +1050,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<llama_pos> pos;   // [n_rows] ascending absolute positions
     };
     std::vector<inject_stash> stash;
+    std::vector<bool> fused_stash_held; // the draft batch holds non-owning views of the stash rows
     const bool fuse_inject;
 
     // dspark speculators
@@ -1144,6 +1145,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch_inject = common_batch(ctx_dft);
 
         stash.resize(n_seq);
+        fused_stash_held.assign(n_seq, false);
 
         // embd batches on an M-RoPE draft carry 4 position rows per token
         is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
@@ -1783,15 +1785,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             continue;
                         }
                     } else {
+                        fused_stash_held[seq_id] = true; // the batch borrows the feature rows
                         for (size_t i = 0; i < st.pos.size(); ++i) {
                             const llama_pos pos_arr[4] = { st.pos[i], st.pos[i], st.pos[i], 0 };
-                            if (getenv("LLAMA_SPEC_DEBUG_DRAFT") && seq_id == 0) {
-                                fprintf(stderr, "SPEC-DBG stashrow %zu pos=%d [%s]\n", i, (int) st.pos[i],
-                                        std::to_string(st.feats[i * (size_t) n_embd_enc]).c_str());
-                            }
                             batch.add_embd({ st.feats.data() + i * (size_t) n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                         }
-                        stash[seq_id] = inject_stash(); // consumed by this pass
+                        // note: the stash stays alive until the decode completes - the batch
+                        // carries non-owning views of its feature rows, rendered by get()
                     }
                 }
             }
@@ -1816,6 +1816,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (sp_timing) {
                 sp_decode_us += ggml_time_us() - td0;
             }
+            // the batch rendered its (non-owning) feature views during the decode, so the
+            // stash can only be released now
+            if (!fused_stash_held[seq_id]) {
+                stash[seq_id] = inject_stash(); // consumed by this pass
+            }
+            fused_stash_held[seq_id] = false;
             if (ret != 0) {
                 LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
                 continue;
