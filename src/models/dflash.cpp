@@ -391,7 +391,7 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
             for (int64_t i = 0; i < ubatch->n_tokens; ++i) {
                 dbg += " " + std::to_string(cells[i]) + (ubatch->type[i] ? "E" : "N");
             }
-            LLAMA_LOG_INFO("%s\n", dbg.c_str());
+            LLAMA_LOG_WARN("%s\n", dbg.c_str());
         }
 
         // debug bisect: hide the in-graph inject cells from the noise rows' attention, so
@@ -897,7 +897,7 @@ static void build_lilicorr_scores(llm_graph_context & g, const llama_model & mod
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
 template <>
 llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
-    LLAMA_LOG_INFO("SPEC-DBG dflash decode graph built (gtype=%d)\n", (int) params.gtype);
+    LLAMA_LOG_WARN("SPEC-DBG dflash decode graph built (gtype=%d)\n", (int) params.gtype);
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
@@ -948,7 +948,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // the injection rows are always a leading prefix of the ubatch: the draft context
     // splits per sequence (embd_all), and the speculative side emits the inject rows first
     if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
-        LLAMA_LOG_INFO("SPEC-DBG dflash ubatch n_tokens=%d token=%d embd=%d mixed=%d n_seqs_unq=%d\n",
+        LLAMA_LOG_WARN("SPEC-DBG dflash ubatch n_tokens=%d token=%d embd=%d mixed=%d n_seqs_unq=%d\n",
                 (int) ubatch.n_tokens, ubatch.token != nullptr, ubatch.embd != nullptr,
                 ubatch.is_mixed(), (int) ubatch.n_seqs_unq);
     }
@@ -1299,7 +1299,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // fused draft pass: inject rows take the K/V-only encoder path, noise rows the decoder
     if (mixed) {
-        LLAMA_LOG_INFO("SPEC-DBG fused graph n_inj=%lld n_dec=%lld n_tokens=%d\n",
+        LLAMA_LOG_WARN("SPEC-DBG fused graph n_inj=%lld n_dec=%lld n_tokens=%d\n",
                 (long long) n_inj, (long long) n_dec, (int) ubatch.n_tokens);
         auto inp = std::make_unique<llm_graph_input_dflash_fused>(n_embd_inp);
 
