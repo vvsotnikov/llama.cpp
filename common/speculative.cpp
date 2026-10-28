@@ -1234,18 +1234,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return true;
         }
 
-        // stash positions are ascending, so the rolled-back tail drops off the back
-        size_t n_keep = st.pos.size();
-        while (n_keep > 0 && st.pos[n_keep - 1] > pos_max) {
-            --n_keep;
-        }
         // the stash must exactly continue the committed prefix; anything else is a stale
-        // leftover of an earlier request or an abandoned round - drop it whole
-        if (n_keep == 0 || st.pos[n_keep - 1] != pos_max ||
-                st.pos[0] != pos_max - (llama_pos) n_keep + 1) {
+        // leftover of an earlier request or an abandoned round - drop it whole (the
+        // injected reject rows, if any, are rewritten by the next fused pass)
+        if (st.pos.front() != pos_max + 1) {
             st = inject_stash();
             return true;
         }
+        const size_t n_keep = st.pos.size();
 
         batch_inject.clear();
         for (size_t i = 0; i < n_keep; ++i) {
@@ -1716,11 +1712,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     st.pos.pop_back();
                     st.feats.resize(st.pos.size() * (size_t) n_embd_enc);
                 }
-                // the trimmed stash must exactly continue the committed prefix (the cache
-                // ends at pos0-1 after the caller's rollback); anything else is stale
+                // the trimmed stash must exactly continue the committed prefix: its first
+                // position is one past the cache's max position (the rows are not in the
+                // cache yet - they are what this pass injects); anything else is stale
                 if (!st.pos.empty()) {
                     const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
-                    if (st.pos.back() != pos_max || st.pos.front() != pos_max - (llama_pos) st.pos.size() + 1) {
+                    if (st.pos.front() != pos_max + 1) {
                         st = inject_stash();
                     }
                 }
