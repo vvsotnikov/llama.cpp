@@ -1379,6 +1379,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (!st.pos.empty() && st.pos.back() + 1 != first_pos) {
                         st = inject_stash(); // rows of another request or a gap: start over
                     }
+                    if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
+                        std::string fd = "SPEC-DBG gather:";
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            fd += " ["; for (int c = 0; c < 3; ++c) fd += " " + std::to_string(features_buf[(size_t) i*n_embd_enc + c]);
+                            fd += "]";
+                        }
+                        fprintf(stderr, "%s\n", fd.c_str());
+                    }
                     st.feats.insert(st.feats.end(), features_buf.begin(), features_buf.end());
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         st.pos.push_back(batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0]);
