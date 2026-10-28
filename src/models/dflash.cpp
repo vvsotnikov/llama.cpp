@@ -383,67 +383,7 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
         ggml_backend_tensor_set(feats, ubatch->embd, 0, n_inj*n_embd_inp_enc*ggml_element_size(feats));
         ggml_backend_tensor_set(toks,  ubatch->token + n_inj, 0, (ubatch->n_tokens - n_inj)*ggml_element_size(toks));
 
-        // debug: dump the cache cell ids assigned to the ubatch rows (after the attn
-        // input's set_input has filled them), the noise token ids and the positions
-        if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
-            fprintf(stderr, "SPEC-DBG ptrs: n_tokens=%d k_idxs=%p buf=%d mask=%p buf=%d feats=%p buf=%d\n",
-                    (int) ubatch->n_tokens,
-                    (void *) k_idxs_base, k_idxs_base ? k_idxs_base->buffer != nullptr : -1,
-                    (void *) kq_mask_base, kq_mask_base ? kq_mask_base->buffer != nullptr : -1,
-                    (void *) feats, feats ? feats->buffer != nullptr : -1);
-            std::string dbg = "SPEC-DBG cells:";
-            ggml_tensor * kx = (k_idxs_swa && k_idxs_swa->buffer) ? k_idxs_swa : k_idxs_base;
-            if (kx && kx->buffer) {
-                const int64_t * cells = (const int64_t *) kx->data;
-                for (int64_t i = 0; i < ubatch->n_tokens; ++i) {
-                    dbg += " " + std::to_string(cells[i]) + (ubatch->type[i] ? "E" : "N");
-                }
-            } else {
-                dbg += " <no live k_idxs>";
-            }
-            std::string dbg2 = "SPEC-DBG toks:";
-            for (int64_t i = n_inj; i < (int64_t) ubatch->n_tokens; ++i) {
-                dbg2 += " " + std::to_string(ubatch->token[i]);
-            }
-            std::string dbg3 = "SPEC-DBG pos:";
-            for (int64_t s = 0; s < (int64_t) ubatch->n_pos; ++s) {
-                for (int64_t i = 0; i < (int64_t) ubatch->n_tokens; ++i) {
-                    dbg3 += " " + std::to_string(ubatch->pos[s*ubatch->n_tokens + i]);
-                }
-                dbg3 += " |";
-            }
-            fprintf(stderr, "%s\n%s\n%s\n", dbg.c_str(), dbg2.c_str(), dbg3.c_str());
-        }
 
-        // debug bisect: hide the in-graph inject cells from the noise rows' attention, so
-        // the noise block sees exactly the standalone-pass visibility (history only)
-        if (mask_hide) {
-            auto hide = [&](ggml_tensor * k_idxs, ggml_tensor * mask) {
-                if (!k_idxs || !mask || !mask->buffer || !k_idxs->buffer) {
-                    return;
-                }
-                const int64_t n_kv = mask->ne[0];
-                const int64_t * cells = (const int64_t *) k_idxs->data;
-                if (mask->type == GGML_TYPE_F16) {
-                    ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
-                    for (int64_t r = 0; r < toks->ne[0]; ++r) {
-                        ggml_fp16_t * row = (ggml_fp16_t *) mask->data + (n_inj_rows + r)*n_kv;
-                        for (int64_t j = 0; j < n_inj_rows; ++j) {
-                            row[cells[j]] = drop;
-                        }
-                    }
-                } else {
-                    for (int64_t r = 0; r < toks->ne[0]; ++r) {
-                        float * row = (float *) mask->data + (n_inj_rows + r)*n_kv;
-                        for (int64_t j = 0; j < n_inj_rows; ++j) {
-                            row[cells[j]] = -INFINITY;
-                        }
-                    }
-                }
-            };
-            hide(k_idxs_base, kq_mask_base);
-            hide(k_idxs_swa, kq_mask_swa);
-        }
         if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
             std::string fd = "SPEC-DBG feats0:";
             for (int c = 0; c < 6; ++c) fd += " " + std::to_string(ubatch->embd[c]);
@@ -487,12 +427,7 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
     ggml_tensor * toks  = nullptr; // I32 [n_dec]
 
     // debug bisect hooks (filled by the graph build)
-    ggml_tensor * k_idxs_base = nullptr; // I64 [n_tokens], filled before this input
-    ggml_tensor * kq_mask_base = nullptr;
-    ggml_tensor * k_idxs_swa  = nullptr;
-    ggml_tensor * kq_mask_swa = nullptr;
-    int64_t  n_inj_rows = 0;
-    bool     mask_hide  = false;
+
 
     const int64_t n_embd_inp_enc;
 };
@@ -952,7 +887,6 @@ static void build_lilicorr_scores(llm_graph_context & g, const llama_model & mod
 //   * token batch -> noise-block diffusion: attend over [committed, MASK...] to generate draft tokens
 template <>
 llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
-    LLAMA_LOG_WARN("SPEC-DBG dflash decode graph built (gtype=%d)\n", (int) params.gtype);
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
@@ -1002,11 +936,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     // KV-injection decode and the noise decode run in one graph (see speculative.cpp).
     // the injection rows are always a leading prefix of the ubatch: the draft context
     // splits per sequence (embd_all), and the speculative side emits the inject rows first
-    if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
-        LLAMA_LOG_WARN("SPEC-DBG dflash ubatch n_tokens=%d token=%d embd=%d mixed=%d n_seqs_unq=%d\n",
-                (int) ubatch.n_tokens, ubatch.token != nullptr, ubatch.embd != nullptr,
-                ubatch.is_mixed(), (int) ubatch.n_seqs_unq);
-    }
     const bool mixed = ubatch.embd && ubatch.token != nullptr;
     int64_t n_inj = 0;
     if (mixed) {
@@ -1353,9 +1282,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
     }
 
     // fused draft pass: inject rows take the K/V-only encoder path, noise rows the decoder
-    fprintf(stderr, "SPEC-DBG-STDERR ctor mixed=%d embd=%d token=%d\n", (int) mixed, ubatch.embd != nullptr, ubatch.token != nullptr);
     if (mixed) {
-        fprintf(stderr, "SPEC-DBG-STDERR fused branch n_inj=%lld n_dec=%lld\n", (long long) n_inj, (long long) n_dec);
         LLAMA_LOG_WARN("SPEC-DBG fused graph n_inj=%lld n_dec=%lld n_tokens=%d\n",
                 (long long) n_inj, (long long) n_dec, (int) ubatch.n_tokens);
         auto inp = std::make_unique<llm_graph_input_dflash_fused>(n_embd_inp);
@@ -1364,12 +1291,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_set_input(inp->feats);
         inp->toks = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_dec);
         ggml_set_input(inp->toks);
-        inp->k_idxs_base = use_iswa ? inp_attn_iswa->get_k_idxs() : inp_attn->get_k_idxs();
-        inp->kq_mask_base = use_iswa ? inp_attn_iswa->get_kq_mask() : inp_attn->get_kq_mask();
-        inp->k_idxs_swa  = use_iswa ? inp_attn_iswa->get_k_idxs_swa() : nullptr;
-        inp->kq_mask_swa = use_iswa ? inp_attn_iswa->get_kq_mask_swa() : nullptr;
-        inp->n_inj_rows = n_inj;
-        inp->mask_hide = getenv("LLAMA_SPEC_DEBUG_MASKHIDE") != nullptr;
 
         ggml_tensor * feats_inj = inp->feats;
         cb(feats_inj, "inp_target_features", -1);
@@ -1389,11 +1310,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
         // the encoder chain writes every layer's inject K/V before the decoder starts,
         // so the noise rows' attention reads the fresh cells in-graph
-        if (!getenv("LLAMA_SPEC_DEBUG_NOENCODER")) {
-            build_kv_inject(n_inj, feats_inj, pos_rows(inp_pos, 0, n_inj), k_idxs_of, v_idxs_of);
-        } else {
-            fprintf(stderr, "SPEC-DBG-STDERR encoder skipped\n");
-        }
+        build_kv_inject(n_inj, feats_inj, pos_rows(inp_pos, 0, n_inj), k_idxs_of, v_idxs_of);
 
         res->t_inp_tokens = dec_tokens;
         build_decoder(n_dec, dec_tokens, pos_rows(inp_pos, n_inj, n_dec), nullptr);
@@ -1409,15 +1326,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             }
             fprintf(stderr, "SPEC-DBG-STDERR fused graph nodes=%d n_inj=%lld n_dec=%lld ops=%s\n",
                     ggml_graph_n_nodes(gf), (long long) n_inj, (long long) n_dec, hist.c_str());
-        }
-        if (getenv("LLAMA_SPEC_DEBUG_DUMP") && getenv("LLAMA_SPEC_DEBUG_COMPARE")) {
-            FILE * f = fopen("/root/devspark/m3/fused_graph.txt", "w");
-            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                ggml_tensor * nd = ggml_graph_node(gf, i);
-                fprintf(f, "%4d %-14s %-32s [%lld,%lld,%lld,%lld]\n", i, ggml_op_desc(nd), nd->name,
-                        (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2], (long long) nd->ne[3]);
-            }
-            fclose(f);
         }
         // the unmasked nextn extraction reads one row per ubatch row, so pad the lattice
         // (the inject rows' slots stay unused)
@@ -1451,15 +1359,6 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     build_decoder(n_tokens, inp_tokens, inp_pos, inp_anchor);
     fprintf(stderr, "SPEC-DBG-STDERR plain graph nodes=%d n_tokens=%d\n", ggml_graph_n_nodes(gf), (int) ubatch.n_tokens);
-    if (getenv("LLAMA_SPEC_DEBUG_DUMP") && ubatch.n_tokens > 2 && ubatch.n_tokens < 64) {
-        FILE * f = fopen("/root/devspark/m3/plain_graph.txt", "w");
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            ggml_tensor * nd = ggml_graph_node(gf, i);
-            fprintf(f, "%4d %-14s %-32s [%lld,%lld,%lld,%lld]\n", i, ggml_op_desc(nd), nd->name,
-                    (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2], (long long) nd->ne[3]);
-        }
-        fclose(f);
-    }
 }
 
 // DSV4 DSpark decoder, dual-mode by batch type (see the DFlash decoder above):
