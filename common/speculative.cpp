@@ -1736,6 +1736,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 sp_build_us += ggml_time_us() - tb0;
             }
 
+            if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
+                std::string kinds;
+                for (int32_t i = 0; i < batch.size(); ++i) {
+                    kinds += batch.tokens[i].embd.data ? "E" : "T";
+                }
+                LOG_INF("SPEC-DBG batch n=%d kinds=%s has_tok=%d has_embd=%d\n",
+                        batch.size(), kinds.c_str(), batch.has_token(), batch.has_embd());
+            }
             const int64_t td0 = sp_timing ? ggml_time_us() : 0;
             const int32_t ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (sp_timing) {
