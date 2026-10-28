@@ -171,6 +171,10 @@ static gguf_context_ptr make_dflash_gguf() {
             static_assert(!sizeof(T), "unsupported kv type");
         }
     };
+    auto set_kv_u32 = [&](enum llm_kv key, uint32_t value) {
+        const std::string name = kv_name(key);
+        gguf_set_val_u32(gguf.get(), name.c_str(), value);
+    };
     auto set_kv_arr_u32 = [&](enum llm_kv key, const std::vector<uint32_t> & v) {
         const std::string name = kv_name(key);
         gguf_set_arr_data(gguf.get(), name.c_str(), GGUF_TYPE_UINT32, v.data(), v.size());
@@ -196,6 +200,10 @@ static gguf_context_ptr make_dflash_gguf() {
     set_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1.0e-5f);
     set_kv(LLM_KV_ROPE_DIMENSION_COUNT,   n_embd_head);
     set_kv(LLM_KV_ROPE_FREQ_BASE,         10000.0f);
+
+    // exercise the iSWA draft cache (base + sliding sub-cache) like the production drafter
+    set_kv_u32(LLM_KV_ATTENTION_SLIDING_WINDOW,         32u);
+    set_kv_arr_u32(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, { 0, 1 });
 
     set_kv(LLM_KV_DFLASH_BLOCK_SIZE,       k_block_size);
     set_kv(LLM_KV_DFLASH_CONV_KERNEL_SIZE, k_kernel);
