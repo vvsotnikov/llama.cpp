@@ -1536,6 +1536,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     sp_walk_us += ggml_time_us() - tw0;
                 }
                 if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
+                    if (seq_id == 0) {
+                        std::string lat;
+                        for (int32_t r = 0; r < 3 && r < n_block_tokens; ++r) {
+                            lat += " |";
+                            for (int32_t c = 0; c < 6; ++c) {
+                                lat += " " + std::to_string(lattice[(size_t)(beg + r) * n_embd_dec + c]);
+                            }
+                        }
+                        LOG_INF("SPEC-DBG lat%s\n", lat.c_str());
+                    }
                     LOG_INF("SPEC-DBG seq=%d pos0=%d n_block=%d draft0=%d draft1=%d n_result=%zu\n",
                             (int) seq_id, (int) dp.pos0, (int) n_block_tokens,
                             result.empty() ? -1 : (int) result[0],
