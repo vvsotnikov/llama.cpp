@@ -445,12 +445,10 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
             hide(k_idxs_swa, kq_mask_swa);
         }
         if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
-            std::string fd = "SPEC-DBG feats:";
-            for (int64_t i = 0; i < n_inj; ++i) {
-                const float * frow = ubatch->embd + i*feats->ne[0];
-                fd += " ["; for (int c = 0; c < 3; ++c) fd += " " + std::to_string(frow[c]);
-                fd += "]";
-            }
+            std::string fd = "SPEC-DBG feats0:";
+            for (int c = 0; c < 6; ++c) fd += " " + std::to_string(ubatch->embd[c]);
+            fd += "  | row1@25600:";
+            for (int c = 0; c < 3; ++c) fd += " " + std::to_string(ubatch->embd[25600 + c]);
             fprintf(stderr, "%s\n", fd.c_str());
         }
         fprintf(stderr, "SPEC-DBG-STDERR maskhide base(buf=%d swa_buf=%d kidx_swa_buf=%d)\n",
