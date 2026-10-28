@@ -383,6 +383,17 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
         ggml_backend_tensor_set(feats, ubatch->embd, 0, n_inj*n_embd_inp_enc*ggml_element_size(feats));
         ggml_backend_tensor_set(toks,  ubatch->token + n_inj, 0, (ubatch->n_tokens - n_inj)*ggml_element_size(toks));
 
+        // debug: dump the cache cell ids assigned to the ubatch rows (after the attn
+        // input's set_input has filled them)
+        if (k_idxs_base && k_idxs_base->buffer) {
+            const int64_t * cells = (const int64_t *) k_idxs_base->data;
+            std::string dbg = "SPEC-DBG cells:";
+            for (int64_t i = 0; i < ubatch->n_tokens; ++i) {
+                dbg += " " + std::to_string(cells[i]) + (ubatch->type[i] ? "E" : "N");
+            }
+            LLAMA_LOG_INFO("%s\n", dbg.c_str());
+        }
+
         // debug bisect: hide the in-graph inject cells from the noise rows' attention, so
         // the noise block sees exactly the standalone-pass visibility (history only)
         if (mask_hide && k_idxs_base && kq_mask_base && kq_mask_base->buffer) {
