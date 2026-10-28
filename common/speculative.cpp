@@ -1728,6 +1728,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (!st.pos.empty()) {
                     const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
                     if (st.pos.front() != pos_max + 1) {
+                        fprintf(stderr, "SPEC-DBG-STDERR stash drop seq=%d front=%d back=%d n=%zu cache_pos_max=%d pos0=%d\n",
+                                (int) seq_id, (int) st.pos.front(), (int) st.pos.back(), st.pos.size(),
+                                (int) pos_max, (int) dp.pos0);
                         st = inject_stash();
                     }
                 }
