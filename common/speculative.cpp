@@ -1774,6 +1774,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             finish_seq(seq_id, 0, n_block_tokens);
+
+            // debug: compare the fused pass against the reference two-pass flow on the
+            // same cache state (the plain noise decode re-reads the same cells)
+            if (getenv("LLAMA_SPEC_DEBUG_COMPARE")) {
+                llama_tokens fused_result = *dp.result;
+                dp.result->clear();
+                batch.clear();
+                for (int32_t i = 0; i < n_block_tokens; ++i) {
+                    batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, false);
+                }
+                if (llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0) {
+                    finish_seq(seq_id, 0, n_block_tokens);
+                    const llama_tokens & ref = *dp.result;
+                    bool eq = fused_result == ref;
+                    fprintf(stderr, "SPEC-DBG-CMP pos0=%d fused=%zu ref=%zu %s\n",
+                            (int) dp.pos0, fused_result.size(), ref.size(), eq ? "MATCH" : "MISMATCH");
+                    if (!eq) {
+                        for (size_t k = 0; k < std::min(fused_result.size(), ref.size()); ++k) {
+                            if (fused_result[k] != ref[k]) {
+                                fprintf(stderr, "SPEC-DBG-CMP first diff at %zu: fused=%d ref=%d\n",
+                                        k, (int) fused_result[k], (int) ref[k]);
+                                break;
+                            }
+                        }
+                    }
+                }
+                *dp.result = std::move(fused_result);
+            }
         }
 
         if (sp_timing) {
