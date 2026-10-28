@@ -1389,6 +1389,15 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             fprintf(stderr, "SPEC-DBG-STDERR fused graph nodes=%d n_inj=%lld n_dec=%lld ops=%s\n",
                     ggml_graph_n_nodes(gf), (long long) n_inj, (long long) n_dec, hist.c_str());
         }
+        if (getenv("LLAMA_SPEC_DEBUG_DUMP") && getenv("LLAMA_SPEC_DEBUG_COMPARE")) {
+            FILE * f = fopen("/root/devspark/m3/fused_graph.txt", "w");
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * nd = ggml_graph_node(gf, i);
+                fprintf(f, "%4d %-14s %-32s [%lld,%lld,%lld,%lld]\n", i, ggml_op_desc(nd), nd->name,
+                        (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2], (long long) nd->ne[3]);
+            }
+            fclose(f);
+        }
         // the unmasked nextn extraction reads one row per ubatch row, so pad the lattice
         // (the inject rows' slots stay unused)
         if (res->t_h_nextn && n_dec < (int64_t) ubatch.n_tokens) {
@@ -1421,6 +1430,15 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     build_decoder(n_tokens, inp_tokens, inp_pos, inp_anchor);
     fprintf(stderr, "SPEC-DBG-STDERR plain graph nodes=%d n_tokens=%d\n", ggml_graph_n_nodes(gf), (int) ubatch.n_tokens);
+    if (getenv("LLAMA_SPEC_DEBUG_DUMP") && ubatch.n_tokens > 2 && ubatch.n_tokens < 64) {
+        FILE * f = fopen("/root/devspark/m3/plain_graph.txt", "w");
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * nd = ggml_graph_node(gf, i);
+            fprintf(f, "%4d %-14s %-32s [%lld,%lld,%lld,%lld]\n", i, ggml_op_desc(nd), nd->name,
+                    (long long) nd->ne[0], (long long) nd->ne[1], (long long) nd->ne[2], (long long) nd->ne[3]);
+        }
+        fclose(f);
+    }
 }
 
 // DSV4 DSpark decoder, dual-mode by batch type (see the DFlash decoder above):
