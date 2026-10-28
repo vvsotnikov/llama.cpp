@@ -384,14 +384,15 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
         ggml_backend_tensor_set(toks,  ubatch->token + n_inj, 0, (ubatch->n_tokens - n_inj)*ggml_element_size(toks));
 
         // debug: dump the cache cell ids assigned to the ubatch rows (after the attn
-        // input's set_input has filled them)
-        if (k_idxs_base && k_idxs_base->buffer) {
-            const int64_t * cells = (const int64_t *) k_idxs_base->data;
+        // input's set_input has filled them), the noise token ids and the positions
+        if (getenv("LLAMA_SPEC_DEBUG_DRAFT")) {
             std::string dbg = "SPEC-DBG cells:";
-            for (int64_t i = 0; i < ubatch->n_tokens; ++i) {
-                dbg += " " + std::to_string(cells[i]) + (ubatch->type[i] ? "E" : "N");
+            if (k_idxs_base && k_idxs_base->buffer) {
+                const int64_t * cells = (const int64_t *) k_idxs_base->data;
+                for (int64_t i = 0; i < ubatch->n_tokens; ++i) {
+                    dbg += " " + std::to_string(cells[i]) + (ubatch->type[i] ? "E" : "N");
+                }
             }
-            LLAMA_LOG_WARN("%s\n", dbg.c_str());
             std::string dbg2 = "SPEC-DBG toks:";
             for (int64_t i = n_inj; i < (int64_t) ubatch->n_tokens; ++i) {
                 dbg2 += " " + std::to_string(ubatch->token[i]);
@@ -403,7 +404,7 @@ struct llm_graph_input_dflash_fused : llm_graph_input_i {
                 }
                 dbg3 += " |";
             }
-            LLAMA_LOG_WARN("%s\n%s\n", dbg2.c_str(), dbg3.c_str());
+            fprintf(stderr, "%s\n%s\n%s\n", dbg.c_str(), dbg2.c_str(), dbg3.c_str());
         }
 
         // debug bisect: hide the in-graph inject cells from the noise rows' attention, so
