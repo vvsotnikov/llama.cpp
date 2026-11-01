@@ -410,6 +410,117 @@ struct case_rollback_bound : ctx_test {
     }
 };
 
+// Later prompt ubatches can move a verified sequence before its rollback is consumed.
+struct case_mixed_rollback : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+
+    const char * name() const override { return "mixed_rollback"; }
+
+    const char * description() const override {
+        return "mixed prompt and verification ubatches preserve rollback bounds and snapshot contents";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        constexpr llama_pos n_prefix = 16;
+        constexpr uint32_t n_verify = 8;
+        constexpr uint32_t n_rollback = n_verify - 1;
+        constexpr llama_pos p0 = n_prefix + 1;
+
+        const auto make_ctx = [&](uint32_t n_seq = 4) {
+            ctx_opts opts;
+            opts.n_ctx      = 512;
+            opts.n_batch    = 128;
+            opts.n_ubatch   = 32;
+            opts.n_seq_max  = n_seq;
+            opts.n_rs_seq   = n_rollback;
+            opts.kv_unified = 1;
+            return mr.ctx(opts);
+        };
+
+        for (uint32_t reverse = 0; reverse < 2; ++reverse) {
+            auto seq = [&](llama_seq_id s) { return reverse ? 3 - s : s; };
+            llama_context_ptr ctx_roll = make_ctx();
+            llama_context_ptr ctx_ref  = make_ctx();
+            CTX_REQUIRE(ctx_roll && ctx_ref, "the mixed rollback contexts failed to initialize");
+            if (llama_n_rs_seq(ctx_roll.get()) == 0) {
+                return case_result::skip("n_rs_seq is disabled");
+            }
+
+            // Allocate the verified sequence between the two prompt sequences.
+            for (llama_seq_id s = 0; s < 4; ++s) {
+                CTX_REQUIRE(decode_gen(ctx_roll.get(), n_vocab, seq(s), 0, n_prefix) &&
+                            decode_gen(ctx_ref.get(),  n_vocab, seq(s), 0, n_prefix),
+                        "the mixed rollback prefixes failed");
+            }
+            const llama_seq_id verified = seq(1);
+            // Identical verification shapes isolate state movement from batch-shape rounding.
+            CTX_REQUIRE(decode_gen(ctx_roll.get(), n_vocab, verified, n_prefix, n_prefix + n_verify) &&
+                        decode_gen(ctx_ref.get(),  n_vocab, verified, n_prefix, n_prefix + n_verify),
+                    "the mixed verification decode failed");
+            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_ref.get()), verified, p0, -1),
+                    "the isolated verification reference rollback failed");
+            std::vector<uint8_t> state_ref, state_roll;
+            CTX_REQUIRE(get_seq_state(ctx_ref.get(), verified, 0, state_ref),
+                    "the reference accepted state could not be saved");
+
+            // Before acceptance is handled, prompt work compacts the inactive verified cell.
+            common_batch prompt(ctx_roll.get());
+            for (llama_seq_id s : { seq(0), seq(2) }) {
+                for (llama_pos p = n_prefix; p < n_prefix + (llama_pos) n_verify; ++p) {
+                    prompt.add(gen_token(n_vocab, s, p), p, s, true);
+                }
+            }
+            CTX_REQUIRE(llama_process(ctx_roll.get(), LLAMA_PROCESS_TYPE_DECODE, prompt.get()) == 0,
+                    "the interfering prompt decode failed");
+            CTX_REQUIRE(!llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), verified, n_prefix, -1),
+                    "rollback past the verification snapshots was accepted");
+            CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), verified, p0, -1),
+                    "mixed verification rollback was refused");
+
+            if (reverse) {
+                // A second move must not consume the idle sequence's pending rollback.
+                common_batch probe(ctx_roll.get());
+                probe.add(gen_token(n_vocab, seq(2), 24), 24, seq(2), true);
+                probe.add(gen_token(n_vocab, seq(3), 16), 16, seq(3), true);
+                CTX_REQUIRE(llama_process(ctx_roll.get(), LLAMA_PROCESS_TYPE_DECODE, probe.get()) == 0,
+                        "the pending rollback relocation probe failed");
+                CTX_REQUIRE(!llama_memory_seq_rm(llama_get_memory(ctx_roll.get()), verified, n_prefix, -1),
+                        "moving an idle sequence consumed its pending rollback");
+            }
+            CTX_REQUIRE(get_seq_state(ctx_roll.get(), verified, 0, state_roll),
+                    "the relocated accepted state could not be saved");
+            ctx_roll.reset();
+            ctx_ref.reset();
+
+            // Restore both accepted states into identical layouts before comparing continuation.
+            ctx_roll = make_ctx(1);
+            ctx_ref  = make_ctx(1);
+            CTX_REQUIRE(ctx_roll && ctx_ref &&
+                        set_seq_state(ctx_roll.get(), 0, 0, state_roll) &&
+                        set_seq_state(ctx_ref.get(),  0, 0, state_ref),
+                    "the accepted states could not be restored");
+            logits_diff diff;
+            for (llama_pos p = p0; p < p0 + 4; ++p) {
+                const llama_token tok = gen_token(n_vocab, verified, p + 31);
+                CTX_REQUIRE(decode_one(ctx_roll.get(), tok, p, 0) && decode_one(ctx_ref.get(), tok, p, 0),
+                        "the mixed rollback continuation failed");
+                const float * roll = llama_get_logits_ith(ctx_roll.get(), 0);
+                const float * ref  = llama_get_logits_ith(ctx_ref.get(),  0);
+                CTX_REQUIRE(roll && ref, "the mixed rollback logits are missing");
+                diff.add(roll, ref, n_vocab);
+            }
+            CTX_REQUIRE(diff.nmse() <= 1e-4,
+                    "mixed rollback logits mismatch (max diff " + std::to_string(diff.diff_max) +
+                    ", nmse " + std::to_string(diff.nmse()) + ", order " + std::to_string(reverse) + ")");
+            TLOG_INF("%s: mixed rollback order %u matched (max diff %g, nmse %g)\n",
+                    __func__, reverse, (double) diff.diff_max, diff.nmse());
+        }
+
+        return case_result::pass();
+    }
+};
+
 // decode a prompt into seq 0, share its cells with a second sequence, then keep decoding both
 struct case_shared_seq_reserve : ctx_test {
     test_group group() const override { return TEST_GROUP_RS; }
@@ -493,6 +604,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
+    cases.push_back(std::make_unique<case_mixed_rollback>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 
     return cases;
