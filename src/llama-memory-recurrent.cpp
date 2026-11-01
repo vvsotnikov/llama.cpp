@@ -219,6 +219,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
                 tail_id = -1;
+                set_rs_idx(seq_id, 0);
             }
         }
     } else {
@@ -274,6 +275,7 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
     }
 
     if ((uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size) {
+        set_rs_idx(seq_id_dst, 0);
         auto & tail_src = cells[seq_id_src];
         auto & tail_dst = cells[seq_id_dst];
         if (tail_dst.tail >= 0) {
@@ -293,12 +295,19 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
+            set_rs_idx(seq_id_dst, rs_idx[seq_id_src]);
         }
     }
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
+
+    for (uint32_t i = 0; i < n_seq_max; ++i) {
+        if ((llama_seq_id) i != seq_id) {
+            rs_idx[i] = 0;
+        }
+    }
 
     for (uint32_t i = 0; i < size; ++i) {
         if ((llama_seq_id) i != seq_id) {
@@ -494,6 +503,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     auto org_cells = cells;
     auto org_used = used;
     auto org_head = head;
+    auto org_rs_idx = rs_idx;
 
     bool success = true;
 
@@ -508,6 +518,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+    rs_idx = std::move(org_rs_idx);
 
     return success;
 }
@@ -680,6 +691,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
             cell.seq_id.insert(seq_id);
             cells[seq_id].tail = cell_id;
+            if (j > 0) {
+                rs_idx[seq_id] = rs_idx[ubatch.seq_id[i][0]];
+            }
         }
     }
 
@@ -1378,13 +1392,18 @@ int32_t llama_memory_recurrent_context::s_copy(int i, bool active) const {
     }
 
     uint32_t idx = 0;
-    if (!mem->cells[cell_idx].seq_id.empty()) {
-        const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
-        if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
-            idx = mem->rs_idx[seq];
-            // reset rollback idx
-            mem->rs_idx[seq] = 0;
-        }
+    const auto & owners = mem->cells[cell_idx].seq_id;
+    if (!owners.empty()) {
+        const llama_seq_id seq = *owners.begin();
+        GGML_ASSERT(seq >= 0 && (size_t) seq < mem->rs_idx.size());
+        idx = mem->rs_idx[seq];
+    }
+    for (const llama_seq_id seq : owners) {
+        GGML_ASSERT(seq >= 0 && (size_t) seq < mem->rs_idx.size());
+        GGML_ASSERT(mem->rs_idx[seq] == idx);
+    }
+    for (const llama_seq_id seq : owners) {
+        mem->rs_idx[seq] = 0;
     }
     return (int32_t)(idx * mem->size) + src0;
 }
