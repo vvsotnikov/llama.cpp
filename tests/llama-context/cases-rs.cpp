@@ -521,6 +521,122 @@ struct case_mixed_rollback : ctx_test {
     }
 };
 
+struct case_copy_rollback : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "copy_rollback"; }
+
+    const char * description() const override {
+        return "pending rollback follows copied owners and is cleared when owners advance or disappear";
+    }
+
+    case_result run(model_run & mr) const override {
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        constexpr llama_pos p0 = 5;
+        constexpr uint32_t flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        ctx_opts opts;
+        opts.n_ctx = 256;
+        opts.n_batch = 16;
+        opts.n_ubatch = 16;
+        opts.n_seq_max = 2;
+        opts.n_rs_seq = 7;
+        opts.kv_unified = 1;
+        char ple_ngram[32];
+        const bool has_ple = llama_model_meta_val_str(mr.model, "qwen4exp.ple.ngram_size", ple_ngram, sizeof(ple_ngram)) >= 0;
+        for (uint32_t mode : { 0u, 1u, 2u }) {
+            const bool shared = mode != 0;
+            const bool materialize = mode == 2;
+            if (shared && has_ple) {
+                TLOG_INF("%s: joint token omitted because PLE does not support multiple sequence owners\n", __func__);
+                continue;
+            }
+            if (materialize && llama_model_n_swa(mr.model) > 0) {
+                TLOG_INF("%s: materialized owner omitted because partial state includes SWA KV\n", __func__);
+                continue;
+            }
+            auto ctx = mr.ctx(opts);
+            auto ref = mr.ctx(opts);
+            CTX_REQUIRE(ctx && ref, "the copy contexts failed to initialize");
+            if (llama_n_rs_seq(ctx.get()) == 0) {
+                return case_result::skip("n_rs_seq is disabled");
+            }
+            CTX_REQUIRE(decode_gen(ctx.get(), n_vocab, 0, 0, 8) &&
+                        llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, p0, -1),
+                    "the source rollback failed");
+            std::vector<uint8_t> source, copied;
+            CTX_REQUIRE(get_seq_state(ctx.get(), 0, flags, source), "the source state could not be saved");
+            // Save/load normalizes the sequence id without evaluating either sequence.
+            const auto copy_matches = [&]() {
+                return get_seq_state(ctx.get(), 1, flags, copied) &&
+                       set_seq_state(ref.get(), 0, flags, copied) &&
+                       get_seq_state(ref.get(), 0, flags, copied) && copied == source;
+            };
+            llama_memory_seq_cp(llama_get_memory(ctx.get()), 0, 1, -1, -1);
+            CTX_REQUIRE(copy_matches(), "copying a pending rollback changed its logical state");
+            if (materialize) {
+                // Keep the shared attention KV prefix while materializing only the child's recurrent state.
+                CTX_REQUIRE(set_seq_state(ctx.get(), 1, flags, source) && copy_matches(),
+                        "the child's materialized rollback changed its logical state");
+            }
+            llama_pos pos = p0;
+            if (shared) {
+                common_batch joint(ctx.get());
+                joint.add(gen_token(n_vocab, 0, pos + 21), pos, std::vector<llama_seq_id>{ 0, 1 }, true);
+                CTX_REQUIRE(llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, joint.get()) == 0 &&
+                            get_seq_state(ctx.get(), 0, flags, source) && copy_matches(),
+                        "the shared continuation left a pending rollback on one owner");
+                ++pos;
+            }
+            const llama_token token = gen_token(n_vocab, 0, pos + 31);
+            std::vector<float> fork_logits;
+            CTX_REQUIRE(decode_one(ctx.get(), token, pos, 1) && get_current_logits(ctx.get(), fork_logits),
+                    "the fork continuation failed");
+            CTX_REQUIRE(get_seq_state(ctx.get(), 0, flags, copied) && copied == source,
+                    "evaluating the fork changed its source");
+            CTX_REQUIRE(decode_one(ctx.get(), token, pos, 0), "the source continuation failed");
+            const float * logits = llama_get_logits_ith(ctx.get(), 0);
+            CTX_REQUIRE(logits && compare_logits(logits, fork_logits.data(), n_vocab).nmse() <= 1e-4,
+                    "the source and fork continuations differ");
+        }
+
+        for (bool keep : { false, true }) {
+            auto ctx = mr.ctx(opts);
+            auto ref = mr.ctx(opts);
+            CTX_REQUIRE(ctx && ref, "the reuse contexts failed to initialize");
+            for (llama_context * target : { ctx.get(), ref.get() }) {
+                CTX_REQUIRE(decode_gen(target, n_vocab, 0, 0, 8) &&
+                            llama_memory_seq_rm(llama_get_memory(target), 0, p0, -1), "the reuse source prefixes failed");
+            }
+            std::vector<uint8_t> prefix;
+            CTX_REQUIRE(get_seq_state(ref.get(), 0, flags, prefix) && set_seq_state(ref.get(), 0, flags, prefix),
+                    "the reuse reference could not materialize its rollback");
+            // Keep the same KV allocation while comparing a pending selector against a materialized state.
+            for (llama_context * target : { ctx.get(), ref.get() }) {
+                CTX_REQUIRE(decode_gen(target, n_vocab, 1, 0, 3), "the kept prefix failed");
+                if (keep) {
+                    llama_memory_seq_keep(llama_get_memory(target), 1);
+                } else {
+                    CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(target), 0, 0, p0),
+                            "the bounded source removal failed");
+                }
+                common_batch batch(target);
+                for (llama_pos pos = 0; pos < 3; ++pos) {
+                    batch.add(gen_token(n_vocab, 0, pos + 101), pos, 0, false);
+                }
+                CTX_REQUIRE(llama_process(target, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0 &&
+                            decode_one(target, gen_token(n_vocab, 0, 104), 3, 0), "the reused sequence failed");
+            }
+            const float * actual = llama_get_logits_ith(ctx.get(), 0);
+            const float * expected = llama_get_logits_ith(ref.get(), 0);
+            CTX_REQUIRE(actual && expected, "the reused sequence logits are missing");
+            const auto diff = compare_logits(actual, expected, n_vocab);
+            TLOG_INF("%s: reuse keep=%d nmse %g\n", __func__, keep, diff.nmse());
+            CTX_REQUIRE(diff.nmse() == 0.0,
+                    "a dropped pending rollback changed the reused sequence logits");
+        }
+        return case_result::pass();
+    }
+};
+
 // decode a prompt into seq 0, share its cells with a second sequence, then keep decoding both
 struct case_shared_seq_reserve : ctx_test {
     test_group group() const override { return TEST_GROUP_RS; }
@@ -605,6 +721,7 @@ std::vector<ctx_test_ptr> make_rs_cases() {
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
     cases.push_back(std::make_unique<case_mixed_rollback>());
+    cases.push_back(std::make_unique<case_copy_rollback>());
     cases.push_back(std::make_unique<case_shared_seq_reserve>());
 
     return cases;
