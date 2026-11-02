@@ -7429,6 +7429,39 @@ struct test_top_k_inf : public test_top_k {
     }
 };
 
+struct test_top_k_prefix : public test_top_k {
+    const int pattern;
+
+    test_top_k_prefix(int pattern)
+        : test_top_k(GGML_TYPE_F32, {8193, 6, 1, 1}, 10, pattern == 1), pattern(pattern) {}
+
+    std::string vars() override {
+        return test_top_k::vars() + ",prefix=" + std::to_string(pattern);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    void initialize_tensors(ggml_context *) override {
+        std::mt19937 rng(1234);
+        for (int64_t r = 0; r < ggml_nrows(input); ++r) {
+            std::vector<float> data(ne[0]);
+            for (int64_t i = 0; i < ne[0]; ++i) {
+                if (pattern == 0) {
+                    // The first radix bucket contains exactly k values.
+                    data[i] = i < k ? 8.0f + i / 1024.0f : -1.0f - i;
+                } else if (pattern == 1) {
+                    // Only part of the boundary tie belongs to top-k.
+                    data[i] = i < k / 2 ? 16.0f + i : i < 2 * k ? 8.0f : -1.0f - i;
+                } else {
+                    data[i] = i < k / 2 ? INFINITY : i < 2 * k ? -1.0f - i : -INFINITY;
+                }
+            }
+            std::shuffle(data.begin(), data.end(), rng);
+            ggml_backend_tensor_set(input, data.data(), r * input->nb[1], data.size() * sizeof(float));
+        }
+    }
+};
+
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
@@ -11943,6 +11976,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k_inf({4096, 2, 1, 1}, k));
         test_cases.emplace_back(new test_top_k_inf({248320, 1, 1, 1}, k));
     }
+    for (int pattern : {0, 1, 2}) {
+        test_cases.emplace_back(new test_top_k_prefix(pattern));
+    }
 
     for (int i = 0; i < 20; ++i) {
         for (int k : {1, 2, 3, 7, 15, 100, 500, 1023, 9999}) {
@@ -13046,6 +13082,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 16, 1, 1}));
 
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2, 1, 1, 1}, 1));
+    for (int nrows : {8, 32}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, nrows, 1, 1}, 16));
+    }
     // widths around the tiling threshold
     for (auto cols : {4096, 8192, 12288, 16384, 24576, 32768, 65536, 131072}) {
         for (auto nrows : {1, 16}) {
