@@ -311,9 +311,13 @@ kernel void kernel_top_k_f32_i32(
 
         prefix  |= *sh_bucket << uint(shift);
         desired -= *sh_above;
+        const bool done = atomic_load_explicit(&histo[*sh_bucket], memory_order_relaxed) == desired;
 
-        // ensure every thread has consumed sh_bucket/sh_above before the next pass
+        // ensure every thread has consumed the shared data before the next pass
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (done) {
+            break; // the entire bucket belongs to top-k
+        }
     }
 
     if (tid == 0) {
