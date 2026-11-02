@@ -645,6 +645,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
+            std::swap(dst_cell.rs_max, src_cell.rs_max);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
             // swap tails
@@ -1348,6 +1349,10 @@ uint32_t llama_memory_recurrent_context::get_size() const {
     return mem->size;
 }
 
+uint32_t llama_memory_recurrent_context::get_n_rs_seq() const {
+    return mem->n_rs_seq;
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
     return mem->r_l[il];
 }
@@ -1360,11 +1365,15 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
 
-int32_t llama_memory_recurrent_context::s_copy(int i) const {
-    const uint32_t cell_idx = i + mem->head;
-    const int32_t  src0     = mem->cells[cell_idx].src0;
+int32_t llama_memory_recurrent_context::s_copy_src(int i) const {
+    return mem->cells[i + mem->head].src0;
+}
 
-    if (mem->n_rs_seq == 0) {
+int32_t llama_memory_recurrent_context::s_copy(int i, bool active) const {
+    const uint32_t cell_idx = i + mem->head;
+    const int32_t  src0     = s_copy_src(i);
+
+    if (mem->n_rs_seq == 0 || !active) {
         return src0;
     }
 

@@ -180,12 +180,14 @@ public:
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
+    uint32_t get_n_rs_seq() const;
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
 
-    int32_t s_copy(int i) const;
+    int32_t s_copy_src(int i) const;
+    int32_t s_copy(int i, bool active) const;
 
 private:
     const llama_memory_status status;
