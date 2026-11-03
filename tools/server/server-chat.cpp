@@ -43,6 +43,15 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         for (json item : input_value) {
             bool merge_prev = !chatcmpl_messages.empty() && chatcmpl_messages.back().value("role", "") == "assistant";
 
+            // EasyInputMessage items (the Responses API's untyped message form) carry only
+            // {role, content} with no "type" discriminator; normalize them to "message" so the
+            // branches below recognize messages produced by this server itself and by clients
+            // that omit the optional type field.
+            if (!item.contains("type") && exists_and_is_string(item, "role") &&
+                (item.contains("content"))) {
+                item["type"] = "message";
+            }
+
             if (exists_and_is_string(item, "content")) {
                 // #responses_create-input-input_item_list-input_message-content-text_input
                 // Only "Input message" contains item["content"]::string
@@ -228,33 +237,34 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         {"tool_call_id", item.at("call_id")},
                     });
                 }
-            } else if (exists_and_is_array(item, "summary") &&
-                exists_and_is_string(item, "type") &&
+            } else if (exists_and_is_string(item, "type") &&
                 item.at("type") == "reasoning") {
                 // #responses_create-input-input_item_list-item-reasoning
-
-                if (!exists_and_is_array(item, "content")) {
-                    throw std::invalid_argument("item['content'] is not an array");
-                }
-                if (item.at("content").empty()) {
-                    throw std::invalid_argument("item['content'] is empty");
-                }
-                if (!exists_and_is_string(item.at("content")[0], "text")) {
-                    throw std::invalid_argument("item['content']['text'] is not a string");
+                // Accept the shapes this server (and OpenAI) emit: `summary` may be absent or
+                // empty, and `content` may be absent or empty (e.g. encrypted-only reasoning).
+                std::string reasoning_text;
+                if (exists_and_is_array(item, "content")) {
+                    for (const auto & part : item.at("content")) {
+                        if (exists_and_is_string(part, "text")) {
+                            reasoning_text += json_value(part, "text", std::string());
+                        }
+                    }
                 }
 
                 if (merge_prev) {
                     auto & prev_msg = chatcmpl_messages.back();
-                    prev_msg["reasoning_content"] = item.at("content")[0].at("text");
+                    prev_msg["reasoning_content"] = reasoning_text;
                 } else {
                     chatcmpl_messages.push_back(json {
                         {"role", "assistant"},
                         {"content", json::array()},
-                        {"reasoning_content", item.at("content")[0].at("text")},
+                        {"reasoning_content", reasoning_text},
                     });
                 }
             } else {
-                throw std::invalid_argument("Cannot determine type of 'item'");
+                std::string ks;
+                for (auto it = item.begin(); it != item.end(); ++it) { ks += it.key(); ks += ","; }
+                throw std::invalid_argument("Cannot determine type of 'item' (type=" + json_value(item, "type", std::string("<missing>")) + ", keys=" + ks + ")");
             }
         }
     } else {
