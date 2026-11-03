@@ -342,9 +342,14 @@ struct server_slot {
 
     // Reuse two retired checkpoints without sharing storage with the live prompt/cache.
     std::vector<common_prompt_checkpoint> checkpoint_buffers;
+    // Valid only until the next target decode or replacement of the owning prompt.
+    const common_prompt_checkpoint * checkpoint_restored = nullptr;
 
     void recycle_checkpoint(common_prompt_checkpoint & checkpoint) {
-        if (checkpoint_buffers.size() < 2) {
+        if (checkpoint_restored == &checkpoint) {
+            checkpoint_restored = nullptr;
+        }
+        if (!checkpoint.data_tgt.empty() && checkpoint_buffers.size() < 2) {
             checkpoint_buffers.push_back(std::move(checkpoint));
         }
     }
@@ -359,6 +364,7 @@ struct server_slot {
     }
 
     void prompt_reset() {
+        checkpoint_restored = nullptr;
         for (auto & checkpoint : prompt.checkpoints) {
             recycle_checkpoint(checkpoint);
         }
@@ -392,6 +398,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        checkpoint_restored = nullptr;
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
@@ -445,6 +452,7 @@ struct server_slot {
     int32_t n_gen_last = 0;
 
     void reset() {
+        checkpoint_restored = nullptr;
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
@@ -871,6 +879,7 @@ struct server_slot {
         mem.seq_rm(other.id,     -1, -1);
         mem.seq_cp(id, other.id, -1, -1);
 
+        other.checkpoint_restored = nullptr;
         other.prompt = prompt.clone();
     }
 
@@ -884,6 +893,7 @@ struct server_slot {
 
         other.stats = stats;
 
+        other.checkpoint_restored = nullptr;
         other.prompt = prompt.clone();
         other.init_sampler();
     }
@@ -1974,6 +1984,7 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.checkpoint_restored = nullptr;
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2748,6 +2759,19 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+        const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+        common_prompt_checkpoint restored = {};
+        bool reuse = false;
+        for (auto & checkpoint : slot.prompt.checkpoints) {
+            if (&checkpoint == slot.checkpoint_restored && checkpoint.n_tokens == n_tokens_new &&
+                checkpoint.pos_min == pos_min && checkpoint.pos_max == pos_max) {
+                // Keep the payload while applying the normal pruning and replacement policy below.
+                restored = std::move(checkpoint);
+                reuse = true;
+                break;
+            }
+        }
+        slot.checkpoint_restored = nullptr;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2782,7 +2806,6 @@ private:
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
@@ -2794,7 +2817,8 @@ private:
             }
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back(slot.take_checkpoint_buffer());
+        auto & cur = reuse ? slot.prompt.checkpoints.emplace_back(std::move(restored)) :
+                            slot.prompt.checkpoints.emplace_back(slot.take_checkpoint_buffer());
 
         cur.id_task = id_task;
 
@@ -2803,18 +2827,19 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        if (ctx_dft == nullptr) {
-            cur.data_dft.clear();
+        if (!reuse) {
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (ctx_dft == nullptr) {
+                cur.data_dft.clear();
+            }
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.data_spec.clear();
+            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
         }
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        // stash the draft's speculative state with the checkpoint
-        cur.data_spec.clear();
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                "%s context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                reuse ? "reused" : "created", (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
@@ -2943,6 +2968,7 @@ private:
                 }
             }
         }
+        slot.checkpoint_restored = nullptr;
         slot.prompt.checkpoints = std::move(checkpoints);
         SLT_INF(slot, "restored %zu context checkpoint(s) from '%s'\n", slot.prompt.checkpoints.size(), filepath.c_str());
         return n_read;
@@ -4318,6 +4344,10 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        if (slots.size() == 1 && it->id_task >= 0 && n_past == it->n_tokens &&
+                                            (ctx_dft == nullptr || !it->data_dft.empty())) {
+                                            slot.checkpoint_restored = &*it;
+                                        }
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
@@ -4722,6 +4752,9 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        if (slots.size() == 1) {
+            slots.front().checkpoint_restored = nullptr;
+        }
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {

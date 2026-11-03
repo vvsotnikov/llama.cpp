@@ -2,6 +2,25 @@
 
 ## Current cache-enabled profile
 
+The server now retains a checkpoint that it has just restored when the next capture requests the same state. It previously serialized that state back to the CPU before running another target decode. A byte-comparison diagnostic confirms identical target, draft and speculative payloads for all five repeated captures in the short-prompt probe. Each avoided target export is 156894368 bytes; the mean prompt-time reduction in the clean comparison is 17.28 ms for HumanEval and 18.67 ms for GSM8K.
+
+Direct reference: previous published fork `793051d4881b994cf426b82484c4c94d4cfe3c10`. Both builds preserve prompt caching, the exact target and original Inco drafter, F16 KV, C1, model-card sampling, thinking low, GPU target sampling and seven probabilistic proposals.
+
+| Dataset | Reference prefill tok/s | Current prefill tok/s | Reference decode tok/s | Current decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| HumanEval | 1227.37 | 1383.11 | 215.37 | 214.56 |
+| GSM8K | 644.71 | 761.15 | 217.58 | 216.25 |
+
+Prefill improves 12.69%/18.06%. Decode changes -0.37%/-0.61%, with opposite directions at the two seeds; this change establishes no decode benefit. These rates include server checkpoint work and are not bulk matrix-computation throughput.
+
+The unchanged `dflash==0.1.0` OpenAI client runs 16 HumanEval and 16 GSM8K prompts, a 256-token output cap, and seeds 42/43. Reference/current run in that order at seed 42 and reversed order at seed 43. All 128 scored requests complete in 188.46 seconds (3m08s), including startup and excluded client warmups. Every one of 64 paired requests has identical processed-prompt, generated, accepted and drafted counts. Prefill pools newly processed tokens over prompt time; cached tokens are not credited. Decode pools generated tokens minus the first over generation time, including drafting and verification.
+
+Reuse requires a successful in-memory restoration in a single-slot server, matching token count and position bounds, and no intervening target decode or owning-prompt replacement. Loaded slot-file checkpoints retain the capture fallback. Pruning, checkpoint limits, ordering and saved-state format stay unchanged. This removes a redundant transfer while preserving the prior checkpoint policy.
+
+API validation covers 8K cached continuation, edited tails, CPU/GPU sampling changes, probability fallback, streaming cancellation recovery, a 4096 MiB host prompt cache and saved-slot replacement/restore. Reference/current saved-slot files are byte-identical. The same lifecycle checks also pass with checkpoint limits of one and 32; edited tails correctly reprocess when the one-checkpoint history cannot serve them. This is a quick screen on independent questions with shared prefixes, not a full coding-trajectory, long-context or accuracy evaluation. The numerical recurrent replay qualification below remains applicable; this update changes server checkpoint ownership only.
+
+## Previous cache-enabled profile
+
 The fork now combines deferred recurrent-state commit with reuse of retired prompt-checkpoint storage. Both preserve prompt caching. The target, original Inco drafter, F16 KV, model-card sampling, thinking low, C1 and seven probabilistic proposals remain fixed as described below.
 
 A direct three-way comparison uses previous published fork `82269c67feeee674ca4ff6e20497de5c483756c9`, recurrent replay `31308a853598aca0a582a62c52d38e7b0bfb3a17`, and replay plus two recycled checkpoint buffers:
