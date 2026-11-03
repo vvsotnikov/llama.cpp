@@ -2153,6 +2153,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (cc == GGML_CUDA_CC_ADA_LOVELACE && src0->type == GGML_TYPE_Q8_0 && ne00 >= 2048 && ne01 <= 64 &&
+            ne11 > 1 && ne11 <= MMVQ_MAX_BATCH_SIZE && ggml_is_matrix(src0) && ggml_is_matrix(src1) &&
+            ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        // Use token columns as broadcast batches to fill more blocks for small projections.
+        ggml_tensor src1_batched = *src1;
+        ggml_tensor dst_batched  = *dst;
+        src1_batched.ne[1] = 1;
+        src1_batched.ne[2] = ne11;
+        src1_batched.nb[2] = src1->nb[1];
+        dst_batched.ne[1] = 1;
+        dst_batched.ne[2] = ne11;
+        dst_batched.nb[2] = dst->nb[1];
+        ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_batched, nullptr, &dst_batched);
+        return;
+    }
+
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
