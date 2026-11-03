@@ -396,7 +396,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    ggml_tensor * state = inp->gdn_ctl ?
+        build_rs(ssm_states_all, inp->s_copy_s, inp->s_copy_s_main, hparams.n_embd_s(), n_seqs,
+                 inp->mctx->get_n_rs(), inp->mctx->get_head(), inp->mctx->get_size(), inp->mctx->get_rs_z()) :
+        build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 

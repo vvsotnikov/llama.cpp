@@ -487,9 +487,63 @@ struct case_shared_seq_reserve : ctx_test {
     }
 };
 
+// Compare every accepted verification prefix against native recurrent snapshots with the same batch shape.
+struct case_verify_prefix : ctx_test {
+    test_group group() const override { return TEST_GROUP_RS; }
+    const char * name() const override { return "verify_prefix"; }
+    const char * description() const override {
+        return "partial speculative acceptance matches native recurrent snapshots";
+    }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx = 512;
+        opts.n_batch = 128;
+        opts.n_ubatch = 128;
+        opts.n_seq_max = 1;
+        opts.n_rs_seq = 7;
+        auto tested = mr.ctx(opts);
+        CTX_REQUIRE(tested, "failed to create verification context");
+        if (llama_n_rs_seq(tested.get()) == 0) {
+            return case_result::skip("recurrent rollback is disabled");
+        }
+
+        // Deferred commit supports one sequence only; reserving two retains the snapshot reference.
+        // Both contexts process seq 0 with the same token batches.
+        opts.n_seq_max = 2;
+        auto reference = mr.ctx(opts);
+        CTX_REQUIRE(reference, "failed to create snapshot reference");
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(mr.model));
+        logits_diff total;
+        llama_pos pos = 64;
+        CTX_REQUIRE(decode_gen(tested.get(), n_vocab, 0, 0, pos) &&
+                    decode_gen(reference.get(), n_vocab, 0, 0, pos), "initial prefill failed");
+
+        for (llama_pos kept = 1; kept <= 8; ++kept) {
+            CTX_REQUIRE(decode_gen(tested.get(), n_vocab, 0, pos, pos + 8) &&
+                        decode_gen(reference.get(), n_vocab, 0, pos, pos + 8), "verification failed");
+            if (kept < 8) {
+                CTX_REQUIRE(llama_memory_seq_rm(llama_get_memory(tested.get()), 0, pos + kept, -1) &&
+                            llama_memory_seq_rm(llama_get_memory(reference.get()), 0, pos + kept, -1),
+                            "partial acceptance rollback failed");
+            }
+            pos += kept;
+            const auto token = gen_token(n_vocab, 0, pos);
+            CTX_REQUIRE(decode_one(tested.get(), token, pos) && decode_one(reference.get(), token, pos),
+                        "continuation failed");
+            total.add(llama_get_logits_ith(reference.get(), -1), llama_get_logits_ith(tested.get(), -1), n_vocab);
+            CTX_REQUIRE(total.nmse() <= NMSE_THRESHOLD, "accepted prefix logits differ, nmse " + std::to_string(total.nmse()));
+            ++pos;
+        }
+        TLOG_INF("%s: all accepted prefixes match, nmse %.9g, max diff %.9g\n", __func__, total.nmse(), total.diff_max);
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_rs_cases() {
     std::vector<ctx_test_ptr> cases;
 
+    cases.push_back(std::make_unique<case_verify_prefix>());
     cases.push_back(std::make_unique<case_rollback>());
     cases.push_back(std::make_unique<case_rollback_bound>());
     cases.push_back(std::make_unique<case_multi_seq_split_replay>());
