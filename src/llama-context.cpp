@@ -1530,6 +1530,14 @@ void llama_context::set_warmup(bool value) {
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+    const auto invalidate_sampler_graph = [&]() {
+        gf_res_prev_active = nullptr;
+        if (!sched_need_reserve &&
+                (!gf_res_reserve || graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch)) > gf_res_reserve->get_max_nodes())) {
+            sched_need_reserve = true;
+        }
+    };
+
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
     }
@@ -1542,10 +1550,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
             warned = true;
         }
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+        if (sampling.samplers.erase(seq_id) > 0) {
+            invalidate_sampler_graph();
         }
-        sampling.samplers.erase(seq_id);
         return false;
     }
 
@@ -1562,7 +1569,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        invalidate_sampler_graph();
 
         return true;
     }
@@ -1570,18 +1577,16 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && !can_offload) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+        if (sampling.samplers.erase(seq_id) > 0) {
+            invalidate_sampler_graph();
         }
-
-        sampling.samplers.erase(seq_id);
 
         return false;
     }
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    invalidate_sampler_graph();
 
     return true;
 }
