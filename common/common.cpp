@@ -15,6 +15,7 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -2413,6 +2414,118 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+static std::atomic<size_t> checkpoint_pinned_bytes{0};
+static constexpr size_t checkpoint_pinned_limit = 512 * 1024 * 1024;
+
+struct common_checkpoint_storage {
+    ggml_backend_buffer_ptr buffer;
+    size_t capacity = 0;
+    size_t size = 0;
+
+    ~common_checkpoint_storage() {
+        buffer.reset();
+        checkpoint_pinned_bytes.fetch_sub(capacity);
+    }
+};
+
+static std::unique_ptr<common_checkpoint_storage> common_allocate_checkpoint(size_t size) {
+    if (size == 0 || size > checkpoint_pinned_limit) {
+        return nullptr;
+    }
+    auto reg = ggml_backend_reg_by_name("CUDA");
+    if (!reg || ggml_backend_reg_dev_count(reg) == 0) {
+        return nullptr;
+    }
+    auto buft = ggml_backend_dev_host_buffer_type(ggml_backend_reg_dev_get(reg, 0));
+    if (!buft) {
+        return nullptr;
+    }
+    auto result = std::make_unique<common_checkpoint_storage>();
+    size_t used = checkpoint_pinned_bytes.load();
+    do {
+        if (used > checkpoint_pinned_limit - size) {
+            return nullptr;
+        }
+    } while (!checkpoint_pinned_bytes.compare_exchange_weak(used, used + size));
+    result->capacity = size;
+    result->buffer.reset(ggml_backend_buft_alloc_buffer(buft, size));
+    // A backend may fall back to ordinary host memory when pinned allocation fails.
+    if (!result->buffer || ggml_backend_buffer_get_type(result->buffer.get()) != buft) {
+        return nullptr;
+    }
+    return result;
+}
+
+common_checkpoint_buffer::common_checkpoint_buffer() = default;
+common_checkpoint_buffer::~common_checkpoint_buffer() = default;
+common_checkpoint_buffer::common_checkpoint_buffer(common_checkpoint_buffer && other) noexcept = default;
+common_checkpoint_buffer & common_checkpoint_buffer::operator=(common_checkpoint_buffer && other) noexcept = default;
+
+common_checkpoint_buffer::common_checkpoint_buffer(const common_checkpoint_buffer & other) : bytes(other.bytes) {
+    if (other.pinned && other.size() > 0) {
+        bytes.assign(other.data(), other.data() + other.size());
+    }
+}
+
+common_checkpoint_buffer & common_checkpoint_buffer::operator=(const common_checkpoint_buffer & other) {
+    if (this != &other) {
+        *this = common_checkpoint_buffer(other);
+    }
+    return *this;
+}
+
+size_t common_checkpoint_buffer::size() const {
+    return pinned ? pinned->size : bytes.size();
+}
+
+uint8_t * common_checkpoint_buffer::data() {
+    return pinned ? (uint8_t *) ggml_backend_buffer_get_base(pinned->buffer.get()) : bytes.data();
+}
+
+const uint8_t * common_checkpoint_buffer::data() const {
+    return pinned ? (const uint8_t *) ggml_backend_buffer_get_base(pinned->buffer.get()) : bytes.data();
+}
+
+void common_checkpoint_buffer::clear() {
+    bytes.clear();
+    if (pinned) {
+        pinned->size = 0;
+    }
+}
+
+void common_checkpoint_buffer::resize(size_t size) {
+    if (pinned) {
+        if (size <= pinned->capacity) {
+            if (size > pinned->size) {
+                memset(data() + pinned->size, 0, size - pinned->size);
+            }
+            pinned->size = size;
+            return;
+        }
+        bytes.assign(data(), data() + pinned->size);
+        bytes.resize(size);
+        pinned.reset();
+    } else {
+        bytes.resize(size);
+    }
+}
+
+void common_checkpoint_buffer::reset(size_t size, bool pin_host) {
+    if (pin_host) {
+        if (!pinned || size > pinned->capacity) {
+            pinned.reset();
+            pinned = common_allocate_checkpoint(size);
+        }
+        if (pinned) {
+            pinned->size = size;
+            std::vector<uint8_t>().swap(bytes);
+            return;
+        }
+    }
+    pinned.reset();
+    bytes.resize(size);
+}
+
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
@@ -2444,14 +2557,15 @@ void common_prompt_checkpoint::update_pos(
 void common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
-        llama_state_seq_flags flags) {
+        llama_state_seq_flags flags,
+        bool pin_host) {
     if (ctx == nullptr) {
         return;
     }
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
+    data_tgt.reset(ckpt_size, pin_host);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {

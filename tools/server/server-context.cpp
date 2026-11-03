@@ -2828,7 +2828,10 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         if (!reuse) {
-            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            auto dev = params_base.devices.empty() ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : params_base.devices.front();
+            const bool pin_host = slots.size() == 1 && params_base.n_gpu_layers != 0 && dev &&
+                strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0;
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, pin_host);
             if (ctx_dft == nullptr) {
                 cur.data_dft.clear();
             }
@@ -2856,7 +2859,8 @@ private:
         return true;
     }
 
-    static bool ckpt_read_buf(std::ifstream & ifs, std::vector<uint8_t> & buf, size_t n_avail, size_t & n_read) {
+    template<typename Buffer>
+    static bool ckpt_read_buf(std::ifstream & ifs, Buffer & buf, size_t n_avail, size_t & n_read) {
         uint64_t n = 0;
         // check the size against the bytes left in the file before allocating, the size field may be corrupted
         if (!ckpt_read(ifs, &n, sizeof(n), n_read) || n > n_avail - n_read) {
@@ -2871,7 +2875,8 @@ private:
         n_written += size;
     }
 
-    static void ckpt_write_buf(std::ofstream & ofs, const std::vector<uint8_t> & buf, size_t & n_written) {
+    template<typename Buffer>
+    static void ckpt_write_buf(std::ofstream & ofs, const Buffer & buf, size_t & n_written) {
         const uint64_t n = buf.size();
         ckpt_write(ofs, &n, sizeof(n), n_written);
         if (n > 0) {

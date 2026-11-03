@@ -10,6 +10,7 @@
 
 #include <array>
 #include <list>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1293,6 +1294,31 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+struct common_checkpoint_storage;
+
+class common_checkpoint_buffer {
+public:
+    common_checkpoint_buffer();
+    ~common_checkpoint_buffer();
+    common_checkpoint_buffer(const common_checkpoint_buffer & other);
+    common_checkpoint_buffer(common_checkpoint_buffer && other) noexcept;
+    common_checkpoint_buffer & operator=(const common_checkpoint_buffer & other);
+    common_checkpoint_buffer & operator=(common_checkpoint_buffer && other) noexcept;
+
+    size_t size() const;
+    bool empty() const { return size() == 0; }
+    uint8_t * data();
+    const uint8_t * data() const;
+    void clear();
+    void resize(size_t size);
+    // Discard the previous payload; the caller overwrites every byte.
+    void reset(size_t size, bool pin_host);
+
+private:
+    std::vector<uint8_t> bytes;
+    std::unique_ptr<common_checkpoint_storage> pinned;
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1302,7 +1328,7 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
+    common_checkpoint_buffer data_tgt;
     std::vector<uint8_t> data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
@@ -1322,7 +1348,8 @@ struct common_prompt_checkpoint {
     void update_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            bool pin_host = false);
 
     void update_dft(
             llama_context * ctx,

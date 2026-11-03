@@ -2,6 +2,27 @@
 
 ## Current cache-enabled profile
 
+Target prompt checkpoints now use reusable CUDA pinned host buffers, so state export and restoration transfer directly between the GPU and the checkpoint's storage. This removes the extra driver staging needed for pageable storage. The model computation, checkpoint selection and prompt-cache policy are unchanged. This is a new server/storage change on top of published fork `499eace08964c2ca5698f53fe512b8a1252d8b69`.
+
+| Dataset | Reference prefill tok/s | Current prefill tok/s | Reference decode tok/s | Current decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| HumanEval | 1387.17 | 1659.20 | 216.76 | 215.60 |
+| GSM8K | 767.50 | 980.53 | 219.24 | 218.35 |
+
+Prefill improves 19.61%/27.76%. Pooled decode changes -0.53%/-0.41%; this change establishes no decode benefit. In the first round decode changes -1.12%/-0.99%; in the reverse-order repeat it changes +0.06%/+0.18%. The GPU computation libraries are byte-identical between the two builds. These observations do not establish a particular cause for the timing variation.
+
+The unchanged `dflash==0.1.0` OpenAI client runs 16 HumanEval and 16 GSM8K prompts, a 256-token output cap, and seeds 42/43, twice. Both builds use the exact target and original Inco drafter, F16 KV, model-card sampling, thinking low, GPU target sampling, C1 and seven probabilistic proposals specified below. Prompt caching stays enabled. Round one runs reference/current at seed 42 and current/reference at seed 43; round two reverses both orders. The two rounds take 185.58 and 184.91 seconds, 370.49 seconds combined (6m10s), including startup and excluded client warmups. All 256 scored requests complete; every one of 128 paired requests has identical processed-prompt, generated, accepted and drafted counts. This is two seeds repeated twice, not four independent seeds.
+
+Prefill pools newly processed tokens over server prompt time, including checkpoint work. Reused tokens are not counted as newly processed tokens. Decode pools generated tokens minus the first over server generation time, including drafting and verification. These short questions share prefixes; this is not a long coding-session, long-context or accuracy evaluation. The short-prompt prefill improvement must not be generalized to bulk matrix throughput.
+
+Pinned storage is enabled automatically for target checkpoints in a single-slot CUDA server with GPU layers. It uses the existing backend host allocator, with a process-wide 512 MiB budget for requested pinned payload capacity. A failed allocation, an exhausted budget or another backend uses ordinary CPU storage. Retired buffers retain capacity for reuse; cached checkpoint copies own independent ordinary CPU buffers. The checkpoint positions, history limits and saved-state format remain unchanged. This adds no staging memcpy and no GPU-only checkpoint format.
+
+Validation covers an 8K cached continuation and tail edit, CPU/GPU sampler changes, candidate-width changes, probability fallback, streaming cancellation recovery, a 4096 MiB host prompt cache, and saved-slot replacement/restore. Reference/current saved-slot files are byte-identical (1137485316 bytes). Lifecycle checks also pass at checkpoint limits one and 32 and with `GGML_CUDA_NO_PINNED=1`, which exercises ordinary-memory fallback. The checkpoint-buffer component test checks independent copy ownership, reuse, move and resize behavior. The earlier recurrent numerical qualification below remains applicable; this update changes host checkpoint storage only.
+
+To repeat a quick comparison, use the existing commands below with `--num-prompts 16` and prompt caching enabled for both revisions. One two-seed A/B round takes about three minutes on the measured machine; the second round above checks the opposite build order.
+
+## Earlier restored-checkpoint retention profile
+
 The server now retains a checkpoint that it has just restored when the next capture requests the same state. It previously serialized that state back to the CPU before running another target decode. A byte-comparison diagnostic confirms identical target, draft and speculative payloads for all five repeated captures in the short-prompt probe. Each avoided target export is 156894368 bytes; the mean prompt-time reduction in the clean comparison is 17.28 ms for HumanEval and 18.67 ms for GSM8K.
 
 Direct reference: previous published fork `793051d4881b994cf426b82484c4c94d4cfe3c10`. Both builds preserve prompt caching, the exact target and original Inco drafter, F16 KV, C1, model-card sampling, thinking low, GPU target sampling and seven probabilistic proposals.
