@@ -1,6 +1,32 @@
 # RTX 4090 DFlash2 performance
 
-## Prompt-cache-enabled recurrent state replay
+## Current cache-enabled profile
+
+The fork now combines deferred recurrent-state commit with reuse of retired prompt-checkpoint storage. Both preserve prompt caching. The target, original Inco drafter, F16 KV, model-card sampling, thinking low, C1 and seven probabilistic proposals remain fixed as described below.
+
+A direct three-way comparison uses previous published fork `82269c67feeee674ca4ff6e20497de5c483756c9`, recurrent replay `31308a853598aca0a582a62c52d38e7b0bfb3a17`, and replay plus two recycled checkpoint buffers:
+
+| Dataset | Build | Prefill tok/s | Decode tok/s |
+| --- | --- | ---: | ---: |
+| HumanEval | Previous fork 82269 | 995.38 | 210.67 |
+| HumanEval | Recurrent replay 31308 | 1001.90 | 216.43 |
+| HumanEval | Replay + checkpoint reuse | 1220.85 | 215.75 |
+| GSM8K | Previous fork 82269 | 499.17 | 212.32 |
+| GSM8K | Recurrent replay 31308 | 507.23 | 217.84 |
+| GSM8K | Replay + checkpoint reuse | 654.57 | 218.90 |
+
+Relative to 82269, the combined profile improves prefill 22.65%/31.13% and decode 2.41%/3.10% on HumanEval/GSM8K. Checkpoint reuse alone improves prefill 21.85%/29.05%; its decode changes -0.32%/+0.48% do not establish a separate decode benefit. Recurrent allocation remains 213.28 MiB instead of 1197.00 MiB, as measured for the replay change.
+
+This uses the unchanged `dflash==0.1.0` OpenAI benchmark: 16 prompts per dataset, 256-token output cap, seeds 42/43, and GPU target sampling. Builds run previous/replay/reuse at seed 42 and in reverse order at seed 43. All 192 scored requests complete in 289.86 seconds (4m50s), including server startup and excluded client warmups. All 64 three-way request groups have identical processed-prompt, generated, accepted and drafted token counts. Prefill pools processed tokens over prompt time; cached tokens are not credited as fresh prefill. Decode pools generated tokens minus the first over generation time, including drafting and verification. Two seeds are an engineering screen, not a confidence interval or an accuracy evaluation.
+
+A diagnostic separates checkpoint sizing, vector resize and state export. Before recycling, each 156894368-byte target checkpoint spends 16.6-41.6 ms allocating and zero-initializing its byte vector, before roughly 17 ms exporting the state. The capture overwrites the serialized payload. Each short request creates two checkpoints. The server now retains at most two already-retired checkpoint allocations per slot and moves them into subsequent captures, avoiding repeated allocation/initialization when their sizes fit. It never recycles a live checkpoint or shares its writable storage with the prompt cache. Checkpoint positions, history limits, serialization and selection stay the same.
+
+This can retain roughly 300 MiB of target checkpoint storage per idle slot for this model, plus draft state. First captures, newly retained history and growth beyond a recycled capacity still allocate. The measured prefill gain applies to these short independent questions with caching enabled, where checkpoints retire between questions; it is not a measured claim for every growing coding trajectory or long-context prefill.
+
+API validation uses two live checkpoints and a 4096 MiB host prompt cache to exercise eviction and ownership. Cached append, tail edits, CPU/GPU sampling switches, probability fallback, streaming cancellation recovery and saved-slot replacement/restore match the reference output. The earlier replay validation below also covers the numerical recurrence and rollback bounds. No accuracy score or CUDA result beyond RTX 4090 is claimed.
+
+
+## Earlier cache-enabled recurrent replay screen
 
 The current fork adapts the deferred gated-delta-net commit from [Avalon commit 657b456a](https://github.com/freriadoc/Avalon/commit/657b456a7648cf9152616eafa629b5c7cd0f9e17) to dense Qwen35 on CUDA. Instead of keeping a full recurrent matrix for each speculative token, it retains one committed matrix and two compact input windows. The next pass replays the accepted prefix before processing its new window. Convolution history retains its native snapshots. Prompt caching and checkpoint restoration remain enabled.
 
@@ -21,7 +47,7 @@ Validation includes all 84 CPU-versus-CUDA gated-delta-net cases (41 exercise re
 
 Replay is enabled automatically only for all-CUDA dense Qwen35 contexts with one sequence and F32 recurrent state. Other backends and multi-sequence contexts retain snapshots. `LLAMA_GDN_REPLAY=0` selects the snapshot path for diagnostics. Replay checkpoints carry a distinct layout tag; snapshot-only contexts reject that format. CUDA qualification here is RTX 4090; other CUDA hardware and longer contexts remain unmeasured.
 
-To reproduce the screen, build the reference and fork as below and start each with GPU target sampling and `--cache-prompt` in place of `--no-cache-prompt`. Use the same DFlash commands below with `--num-prompts 16`, then restart at seed 43 in reversed build order. Keep the prefix checkpoints enabled. The cache-disabled multiplier in the historical section below does not describe this configuration.
+To reproduce the screen, build the reference and fork as below and start each with GPU target sampling and prompt caching enabled. Use the same DFlash commands below with `--num-prompts 16`, then restart at seed 43 in reversed build order. Keep the prefix checkpoints enabled. The cache-disabled multiplier in the historical section below does not describe this configuration.
 
 Run the numerical regressions against the real target:
 
@@ -77,7 +103,9 @@ This is one prompt at two seeds, not a context-length sweep. The short-prompt mu
 
 Four existing CUDA backend-sampler tests pass: sampler replacement, multi-output RNG transactions, sampling chains, and CPU suffix fallback. API checks cover changing candidate width, CPU/GPU switching, pre-sampling probabilities, streaming cancellation and restoring settings. Cache-policy checks verify zero cached tokens and no reuse checkpoints for cache-disabled requests, successful prompt reuse for cache-enabled requests, and response parity with the reference configured with `--ctx-checkpoints 0`. A test-only zero-snapshot context also completes checkpoint-based speculative rollback; that override is absent from measured builds.
 
-### Reproduce
+## Reproduce
+
+The command below enables prompt caching for the current profile. Historical cache-disabled measurements use `--no-cache-prompt` instead.
 
 Build the desired revision:
 
@@ -103,7 +131,7 @@ build/bin/llama-server -m "$TARGET_MODEL" -md "$DRAFT_MODEL" \
   --temp 1 --top-p .95 --top-k 20 --min-p 0 \
   --presence-penalty 0 --repeat-penalty 1 \
   --reasoning on --reasoning-effort low --seed 42 \
-  --no-cache-prompt --cache-ram 0 --no-cache-idle-slots \
+  --cache-prompt --cache-ram 0 --no-cache-idle-slots \
   --metrics --log-timestamps
 ```
 
@@ -145,7 +173,7 @@ for test in test_set_sampler test_multi_output_dist_transaction test_multi_outpu
 done
 ```
 
-### Earlier CUDA changes
+## Earlier CUDA changes
 
 The reference fork `f8f699b5c` already includes Ada small-matrix tuning (`feaf1d143`), recapture of warmed CUDA graphs (`ea258a72c`), and two-tap DFlash2 convolution fusion (`f8f699b5c`). Weight quantization and sampling policy are unchanged; FP32 reduction order can change. The original composed convolution remains the CPU reference and fallback, with 20 CUDA arithmetic cases:
 

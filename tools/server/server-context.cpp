@@ -340,6 +340,31 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // Reuse two retired checkpoints without sharing storage with the live prompt/cache.
+    std::vector<common_prompt_checkpoint> checkpoint_buffers;
+
+    void recycle_checkpoint(common_prompt_checkpoint & checkpoint) {
+        if (checkpoint_buffers.size() < 2) {
+            checkpoint_buffers.push_back(std::move(checkpoint));
+        }
+    }
+
+    common_prompt_checkpoint take_checkpoint_buffer() {
+        if (checkpoint_buffers.empty()) {
+            return {};
+        }
+        auto result = std::move(checkpoint_buffers.back());
+        checkpoint_buffers.pop_back();
+        return result;
+    }
+
+    void prompt_reset() {
+        for (auto & checkpoint : prompt.checkpoints) {
+            recycle_checkpoint(checkpoint);
+        }
+        prompt.clear();
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -380,7 +405,7 @@ struct server_slot {
 
         mem.seq_rm(id, -1, -1);
 
-        prompt.clear();
+        prompt_reset();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -1956,7 +1981,7 @@ private:
                 // if lora has changed, check to see if the cache should be cleared
                 if (lora_should_clear_cache(slot.lora, task_loras)) {
                     SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
-                    slot.prompt.clear();
+                    slot.prompt_reset();
                 } else {
                     SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
                 }
@@ -2735,6 +2760,7 @@ private:
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
 
+                slot.recycle_checkpoint(*it);
                 it = slot.prompt.checkpoints.erase(it);
                 continue;
             }
@@ -2750,6 +2776,7 @@ private:
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
+            slot.recycle_checkpoint(slot.prompt.checkpoints.front());
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -2759,6 +2786,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if (it->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                    slot.recycle_checkpoint(*it);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2766,7 +2794,7 @@ private:
             }
         }
 
-        auto & cur = slot.prompt.checkpoints.emplace_back();
+        auto & cur = slot.prompt.checkpoints.emplace_back(slot.take_checkpoint_buffer());
 
         cur.id_task = id_task;
 
@@ -2776,8 +2804,12 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (ctx_dft == nullptr) {
+            cur.data_dft.clear();
+        }
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
+        cur.data_spec.clear();
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
@@ -3317,7 +3349,7 @@ private:
                             throw std::runtime_error("Invalid tokens in slot save file");
                         }
 
-                        slot->prompt.clear();
+                        slot->prompt_reset();
                         slot->prompt.tokens = std::move(restored);
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
@@ -3819,7 +3851,7 @@ private:
 
                     new_tokens.resize(slot.prompt.tokens.size() - n_discard);
 
-                    slot.prompt.clear();
+                    slot.prompt_reset();
                     slot.prompt.tokens.insert(new_tokens);
                 }
 
@@ -4304,6 +4336,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        slot.recycle_checkpoint(*it);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
