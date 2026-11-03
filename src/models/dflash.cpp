@@ -621,6 +621,8 @@ static ggml_tensor * build_dflash2_conv(
     if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
         dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
     }
+    // Keep the hidden-state producer outside the dynamic-convolution fusion.
+    ggml_build_forward_expand(g.gf, hidden);
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,

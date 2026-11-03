@@ -1,6 +1,6 @@
 # RTX 4090 DFlash2 performance
 
-This fork tunes the small CUDA matrix operations used during DFlash2 verification on Ada. It uses one warp for IQ3_S/IQ4_XS operations with five to eight token columns, and runs small Q8_0 projections as broadcast single-column batches. The latter changes tensor metadata for the kernel launch without copying data. Weight quantization and sampling policy are unchanged. FP32 reduction order can change.
+This fork tunes the small CUDA matrix operations used during DFlash2 verification on Ada. It uses one warp for IQ3_S/IQ4_XS operations with five to eight token columns, and runs small Q8_0 projections as broadcast single-column batches. The latter changes tensor metadata for the kernel launch without copying data. It also recaptures warmed CUDA graphs after property changes and fuses the drafter's two-tap grouped dynamic convolutions. Weight quantization and sampling policy are unchanged. FP32 reduction order can change in the matrix kernels.
 
 ## Measured comparison
 
@@ -8,16 +8,16 @@ Baseline: unmodified upstream `259d91709d60945911bedb9bcfb2957c6e153ea7`. Hardwa
 
 | Dataset | Baseline client tok/s | Fork client tok/s | Change | Baseline native decode tok/s | Fork native decode tok/s | Change |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| HumanEval | 154.80 | 161.54 | +4.35% | 180.13 | 189.04 | +4.94% |
-| GSM8K | 162.30 | 168.24 | +3.66% | 188.58 | 196.31 | +4.10% |
+| HumanEval | 155.22 | 169.24 | +9.04% | 180.68 | 197.82 | +9.49% |
+| GSM8K | 162.65 | 176.77 | +8.68% | 188.79 | 205.65 | +8.93% |
 
 The client is unmodified `dflash benchmark openai` from `dflash==0.1.0`. Each dataset used 48 prompts in the client's fixed shuffled order, a 256-token output cap, C1, and seeds 42 and 43. These counts are a bounded subset, not the complete datasets or an accuracy evaluation. One client warmup per dataset is excluded from scoring. Prompt caching was disabled.
 
 Client throughput is output tokens divided by the client's measured batch elapsed time, including prompt processing, generation and HTTP. The table averages the two client scores. Native decode is the sum of `(output_tokens - 1)` divided by the sum of the server's generation-phase time. It includes drafting and verification but excludes prompt processing. The first token belongs to prompt processing in this server's timing convention.
 
-The combined change improved both metrics for both datasets at both seeds. Client scores at seeds 42/43 were 153.64/155.96 versus 160.32/162.75 for HumanEval, and 160.30/164.30 versus 166.27/170.20 for GSM8K. Two seeds do not establish a confidence interval or performance on all workloads. Sampling trajectories differ slightly between builds.
+The six-arm comparison ran upstream, the matrix-tuned recapture build, and that build plus dynamic-convolution fusion at seed 42, then reversed build order at seed 43. All 576 scored requests completed in 885.69 seconds (14 minutes 46 seconds). Convolution fusion preserved accepted and drafted token counts in every seed/dataset pair compared with the recapture build; the matrix changes can alter sampling trajectories. Two seeds do not establish a confidence interval or performance on all workloads.
 
-The six-arm comparison also measured the one-warp change alone, ordered baseline/one-warp/combined at seed 42 and combined/one-warp/baseline at seed 43. All 576 scored requests completed. Total wall time was 911.88 seconds. The incremental request-level gain from the Q8_0 change alone was not consistent across both seeds; its isolated eight-column K5120/M48 operation improved from 5.95 to 4.22 microseconds.
+The matrix tuning alone previously measured +4.94% and +4.10% native decode over upstream. The recapture and convolution sections below give their incremental comparisons. The Q8_0 small projection improved from 5.95 to 4.22 microseconds in isolation; its incremental request-level gain was inconsistent across seeds.
 
 ## Reproduce
 
@@ -90,3 +90,22 @@ A separate comparison against `feaf1d143`, using the same client, 48 prompts per
 | GSM8K | 167.17 | 173.81 | 194.91 | 201.56 |
 
 Accepted and drafted token counts matched in every seed/dataset pair. The native decode gains were +2.99% and +3.41% over `feaf1d143`. Short-prompt native prefill improved +5.19% and +7.43%. A separate 32K prompt check completed at both seeds with unchanged draft counters; no long-prefill gain was established.
+
+## Fuse two-tap grouped dynamic convolution
+
+The drafter's convolution was composed from broadcasts, contiguous copies, padding, multiplies and an add. CUDA now recognizes the closed two-tap graph and calculates its output in one kernel without materializing broadcast weights. The primitive graph remains the CPU reference and fallback. The matcher rejects externally consumed intermediate tensors and producers inside the fusion span. If output storage overlaps an input, the kernel writes to temporary storage before copying the result back. Separate FP32 add/multiply rounding is retained.
+
+Compared with the matrix-tuned recapture build in the six-arm comparison above:
+
+| Dataset | Recapture native decode tok/s | With convolution fusion tok/s | Change |
+| --- | ---: | ---: | ---: |
+| HumanEval | 194.25 | 197.82 | +1.84% |
+| GSM8K | 201.71 | 205.65 | +1.95% |
+
+Twenty composed-graph arithmetic cases pass against the CPU reference. They cover both convolution sides, one/two/eight-token blocks, multiple sequences, odd channel counts, the actual 5120-channel shape, a live intermediate that must prevent fusion, and a computed input producer that must not be skipped:
+
+```sh
+build/bin/test-backend-ops test -b CUDA0 -o DYNAMIC_CONV_1D
+```
+
+The test utility's whole-graph performance mode now repeats all producers on every iteration. Prior timings that repeated only a final fusion-test operation must not be interpreted as whole-graph latency.

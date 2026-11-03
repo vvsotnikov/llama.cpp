@@ -1687,6 +1687,9 @@ struct test_case {
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
         }
 
+        // Fusion tests need all producers on every timed iteration.
+        if (run_whole_graph()) n_runs = 1;
+
         // duplicate the op
         for (int i = 1; i < n_runs; i++) {
             ggml_graph_add_node(gf, out);
@@ -2892,6 +2895,50 @@ struct test_rope_set_rows : public test_case {
                 }
             }
         }
+    }
+};
+
+// Original composed dynamic convolution, used as the CPU reference for CUDA fusion.
+struct test_dynamic_conv_1d : public test_case {
+    int channels, group_size, block_size, blocks, side;
+    bool exposed, produced;
+    ggml_tensor * weights_out = nullptr;
+    ggml_tensor * result_out = nullptr;
+    test_dynamic_conv_1d(int c, int g, int b, int n, int s, bool e = false, bool p = false)
+        : channels(c), group_size(g), block_size(b), blocks(n), side(s), exposed(e), produced(p) {}
+    std::string op_desc(ggml_tensor *) override { return "DYNAMIC_CONV_1D"; }
+    std::string vars() override { return VARS_TO_STR7(channels, group_size, block_size, blocks, side, exposed, produced); }
+    bool run_whole_graph() override { return true; }
+    uint64_t op_flops(ggml_tensor * t) override { return 5 * ggml_nelements(t); }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return exposed ? std::vector<ggml_tensor *>{result_out, weights_out} : std::vector<ggml_tensor *>{result_out};
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t h = channels, ng = channels / group_size, nt = block_size * blocks;
+        ggml_tensor * hidden = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, h, nt);
+        if (produced) hidden = ggml_scale(ctx, hidden, 0.5f);
+        ggml_tensor * dynamic = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ng * 4, nt);
+        ggml_tensor * base = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, h, 2, 2);
+        ggml_tensor * x = ggml_reshape_3d(ctx, hidden, h, block_size, blocks);
+        ggml_tensor * coeff = ggml_reshape_4d(ctx, dynamic, ng, 2, 2, nt);
+        coeff = ggml_view_3d(ctx, coeff, ng, 2, nt, coeff->nb[1], coeff->nb[3], side * coeff->nb[2]);
+        coeff = ggml_reshape_4d(ctx, ggml_cont(ctx, coeff), 1, ng, 2, nt);
+        coeff = ggml_repeat_4d(ctx, coeff, group_size, ng, 2, nt);
+        ggml_tensor * b = ggml_reshape_4d(ctx, ggml_view_1d(ctx, base, h * 2, side * base->nb[2]), group_size, ng, 2, 1);
+        weights_out = ggml_add(ctx, coeff, b);
+        if (exposed) ggml_set_output(weights_out);
+        ggml_tensor * result = nullptr;
+        for (int tap = 0; tap < std::min(2, block_size); ++tap) {
+            ggml_tensor * v = x;
+            if (tap) v = ggml_pad_ext(ctx, ggml_view_3d(ctx, x, h, block_size - tap, blocks, x->nb[1], x->nb[2], 0), 0, 0, tap, 0, 0, 0, 0, 0);
+            v = ggml_reshape_2d(ctx, v, h, nt);
+            ggml_tensor * w = ggml_reshape_2d(ctx, ggml_cont(ctx,
+                ggml_view_4d(ctx, weights_out, group_size, ng, 1, nt, weights_out->nb[1], weights_out->nb[2], weights_out->nb[3], tap * weights_out->nb[2])), h, nt);
+            ggml_tensor * term = ggml_mul(ctx, w, v);
+            result = result ? ggml_add(ctx, result, term) : term;
+        }
+        result_out = result;
+        return result;
     }
 };
 
@@ -11539,6 +11586,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int side : {0, 1}) {
+        for (int block : {1, 2, 8}) {
+            test_cases.emplace_back(new test_dynamic_conv_1d(48, 16, block, 1, side));
+            test_cases.emplace_back(new test_dynamic_conv_1d(48, 16, block, 3, side));
+        }
+        test_cases.emplace_back(new test_dynamic_conv_1d(35, 5, 8, 2, side));
+        test_cases.emplace_back(new test_dynamic_conv_1d(5120, 16, 8, 1, side));
+        test_cases.emplace_back(new test_dynamic_conv_1d(48, 16, 8, 2, side, true));
+        test_cases.emplace_back(new test_dynamic_conv_1d(48, 16, 8, 2, side, false, true));
+    }
+
     // Test IQP panel path for all grid IQ types
     for (ggml_type type_a : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS,
                              GGML_TYPE_IQ3_S, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS}) {
@@ -13027,6 +13085,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 17408, n, 5120, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 17408, {1, 1}, {1, 1}));
         }
+    }
+
+    for (int side : {0, 1}) {
+        test_cases.emplace_back(new test_dynamic_conv_1d(5120, 16, 8, 1, side));
     }
 
     // qwen3-30b-a3b

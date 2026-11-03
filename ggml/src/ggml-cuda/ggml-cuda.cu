@@ -3955,6 +3955,134 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Fuse the two-tap grouped dynamic convolution without materializing its broadcasts.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __global__ void dynamic_conv_two_tap_f32(
+        const float * hidden, const float * dynamic, const float * base, float * out,
+        int channels, int groups, int group_size, int tokens, int block_size, int side) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= int64_t(channels) * tokens) return;
+    const int h = i % channels, t = i / channels, g = h / group_size;
+    const int64_t coeff = int64_t(t) * groups * 4 + side * groups * 2 + g;
+    const int64_t b = int64_t(side) * channels * 2 + h;
+    float y = __fmul_rn(__fadd_rn(base[b], dynamic[coeff]), hidden[i]);
+    if (t % block_size != 0) {
+        const float w = __fadd_rn(base[b + channels], dynamic[coeff + groups]);
+        y = __fadd_rn(y, __fmul_rn(w, hidden[i - channels]));
+    } else {
+        // Match the composed graph's addition of the zero-padded tap, including signed zero.
+        y = __fadd_rn(y, __fmul_rn(__fadd_rn(base[b + channels], dynamic[coeff + groups]), 0.0f));
+    }
+    out[i] = y;
+}
+
+static int ggml_cuda_try_dynamic_conv(ggml_backend_cuda_context * ctx, const ggml_cgraph * graph, int start) {
+    if (ggml_cuda_info().devices[ctx->device].cc != GGML_CUDA_CC_ADA_LOVELACE || !ctx->stream_context().concurrent_events.empty()) return 0;
+    const ggml_tensor * first = graph->nodes[start];
+    if (first->op != GGML_OP_CONT || first->type != GGML_TYPE_F32 || !first->src[0]) return 0;
+    const ggml_tensor * coeff_view = first->src[0];
+    const ggml_tensor * dynamic = coeff_view->view_src;
+    if (coeff_view->op != GGML_OP_VIEW || !dynamic || dynamic->type != GGML_TYPE_F32 ||
+            !ggml_is_matrix(dynamic) || !ggml_is_contiguous(dynamic) || coeff_view->ne[1] != 2 || coeff_view->ne[3] != 1) return 0;
+    const int64_t ng = coeff_view->ne[0], nt = coeff_view->ne[2];
+    if (ng <= 0 || nt <= 1 || ng > INT_MAX / 4 || nt > INT_MAX || dynamic->ne[0] != ng * 4 || dynamic->ne[1] != nt ||
+            coeff_view->nb[0] != sizeof(float) || coeff_view->nb[1] != ng * sizeof(float) || coeff_view->nb[2] != dynamic->nb[1]) return 0;
+    const size_t side_bytes = ng * 2 * sizeof(float);
+    if (coeff_view->view_offs % side_bytes != 0 || coeff_view->view_offs / side_bytes >= 2) return 0;
+    const int side = coeff_view->view_offs / side_bytes;
+
+    for (int end = start + 1; end < graph->n_nodes && end - start < 31; ++end) {
+        ggml_tensor * dst = graph->nodes[end];
+        if (dst->op != GGML_OP_ADD || !dst->src[0] || !dst->src[1] || dst->src[0]->op != GGML_OP_MUL || dst->src[1]->op != GGML_OP_MUL) continue;
+        const ggml_tensor * term[2] = { dst->src[0], dst->src[1] };
+        const ggml_tensor * weights = nullptr;
+        bool match = true;
+        for (int tap = 0; tap < 2 && match; ++tap) {
+            const ggml_tensor * w = term[tap]->src[0];
+            if (!w || w->op != GGML_OP_RESHAPE || !w->src[0] || w->src[0]->op != GGML_OP_CONT || !w->src[0]->src[0]) { match = false; break; }
+            const ggml_tensor * view = w->src[0]->src[0];
+            if (view->op != GGML_OP_VIEW || !view->view_src) { match = false; break; }
+            if (tap == 0) weights = view->view_src;
+            if (view->view_src != weights || view->view_offs != tap * weights->nb[2] ||
+                    view->ne[0] != weights->ne[0] || view->ne[1] != ng || view->ne[2] != 1 || view->ne[3] != nt ||
+                    view->nb[0] != weights->nb[0] || view->nb[1] != weights->nb[1] || view->nb[2] != weights->nb[2] || view->nb[3] != weights->nb[3]) match = false;
+        }
+        if (!match || !weights || weights->op != GGML_OP_ADD || weights->type != GGML_TYPE_F32 || !ggml_is_contiguous(weights) ||
+                weights->ne[0] <= 0 || weights->ne[1] != ng || weights->ne[2] != 2 || weights->ne[3] != nt) continue;
+        const ggml_tensor * repeat = weights->src[0];
+        const ggml_tensor * base_view = weights->src[1];
+        if (!repeat || repeat->op != GGML_OP_REPEAT || !repeat->src[0] || repeat->src[0]->op != GGML_OP_RESHAPE ||
+                repeat->src[0]->src[0] != first || repeat->src[0]->ne[0] != 1 || repeat->src[0]->ne[1] != ng || repeat->src[0]->ne[2] != 2 || repeat->src[0]->ne[3] != nt || repeat->type != GGML_TYPE_F32 || !ggml_are_same_shape(repeat, weights) ||
+                !base_view || base_view->op != GGML_OP_RESHAPE || !base_view->view_src || base_view->type != GGML_TYPE_F32) continue;
+        const ggml_tensor * base = base_view->view_src;
+        const int64_t gs = weights->ne[0];
+        if (gs > INT_MAX / ng) continue;
+        const int64_t h = gs * ng;
+        if (h > INT_MAX / nt || base->type != GGML_TYPE_F32 || !ggml_is_contiguous(base) ||
+                base->ne[0] != h || base->ne[1] != 2 || base->ne[2] != 2 || base->ne[3] != 1 ||
+                base_view->view_offs != side * base->nb[2] || base_view->ne[0] != gs || base_view->ne[1] != ng || base_view->ne[2] != 2 || base_view->ne[3] != 1 || !ggml_is_contiguous(base_view)) continue;
+        const ggml_tensor * values0 = term[0]->src[1];
+        const ggml_tensor * values1 = term[1]->src[1];
+        if (!values0 || !values1 || values0->op != GGML_OP_RESHAPE || values1->op != GGML_OP_RESHAPE ||
+                !values0->src[0] || !values1->src[0]) continue;
+        const ggml_tensor * blocks = values0->src[0];
+        const ggml_tensor * hidden = blocks->src[0];
+        const ggml_tensor * pad = values1->src[0];
+        if (blocks->op != GGML_OP_RESHAPE || !hidden || hidden->type != GGML_TYPE_F32 || !ggml_is_matrix(hidden) || !ggml_is_contiguous(hidden) ||
+                hidden->ne[0] != h || hidden->ne[1] != nt || blocks->ne[0] != h || blocks->ne[1] <= 1 || blocks->ne[1] > INT_MAX ||
+                blocks->ne[3] != 1 || nt % blocks->ne[1] != 0 || blocks->ne[2] != nt / blocks->ne[1] || pad->op != GGML_OP_PAD || !pad->src[0]) continue;
+        const ggml_tensor * previous = pad->src[0];
+        if (previous->op != GGML_OP_VIEW || previous->view_src != blocks->view_src || previous->view_offs != blocks->view_offs ||
+                previous->ne[0] != h || previous->ne[1] != blocks->ne[1] - 1 || previous->ne[2] != blocks->ne[2] || previous->ne[3] != 1 ||
+                previous->nb[0] != sizeof(float) || previous->nb[1] != blocks->nb[1] || previous->nb[2] != blocks->nb[2]) continue;
+        for (int k = 0; k < 9; ++k) if (ggml_get_op_params_i32(pad,k) != (k == 2 ? 1 : 0)) match = false;
+        if (!match || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->ne[0] != h || dst->ne[1] != nt || !ggml_is_matrix(dst)) continue;
+        for (const ggml_tensor * input : {hidden, dynamic, base}) {
+            const ggml_tensor * root = input->view_src ? input->view_src : input;
+            for (int j = start; j <= end; ++j) if (graph->nodes[j] == root) match = false;
+        }
+        if (!match) continue;
+        static constexpr ggml_op expected[] = {
+            GGML_OP_CONT, GGML_OP_REPEAT, GGML_OP_ADD, GGML_OP_CONT, GGML_OP_MUL,
+            GGML_OP_CONT, GGML_OP_PAD, GGML_OP_MUL, GGML_OP_ADD,
+        };
+        int real_ops = 0;
+        for (int j = start; j <= end; ++j) {
+            const auto op = graph->nodes[j]->op;
+            if (op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE) continue;
+            if (real_ops >= 9 || op != expected[real_ops++]) match = false;
+        }
+        if (!match || real_ops != 9) continue;
+        const int count = end - start + 1;
+        ggml_op ops[32];
+        int indices[32], eliminated = 0;
+        for (int k = start; k <= end; ++k) {
+            const auto * v = graph->nodes[k];
+            bool external_view = (v->op == GGML_OP_VIEW || v->op == GGML_OP_RESHAPE || v->op == GGML_OP_PERMUTE || v->op == GGML_OP_TRANSPOSE) && v->view_src;
+            for (int j = start; j <= end && external_view; ++j) {
+                if (v->view_src == graph->nodes[j]) external_view = false;
+            }
+            // Input views need no GPU work and are not eliminated by this fusion.
+            if (external_view) continue;
+            indices[eliminated] = k;
+            ops[eliminated++] = v->op;
+        }
+        if (!ggml_can_fuse_subgraph_ext(graph,indices,eliminated,ops,&end,1)) continue;
+        ggml_cuda_pool_alloc<float> scratch(ctx->pool());
+        float * output = (float *) dst->data;
+        const bool overlap = !ggml_cuda_check_fusion_memory_ranges(graph,start,count,&end,1);
+        if (overlap) output = scratch.alloc(h*nt);
+        dynamic_conv_two_tap_f32<<<(h*nt+255)/256,256,0,ctx->stream()>>>(
+                (const float *)hidden->data,(const float *)dynamic->data,(const float *)base->data,output,
+                h,ng,gs,nt,blocks->ne[1],side);
+        CUDA_CHECK(cudaGetLastError());
+        if (overlap) CUDA_CHECK(cudaMemcpyAsync(dst->data,output,ggml_nbytes(dst),cudaMemcpyDeviceToDevice,ctx->stream()));
+        return end-start;
+    }
+    return 0;
+}
+#endif
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3963,6 +4091,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (node->op == GGML_OP_CONT) {
+        const int skipped = ggml_cuda_try_dynamic_conv(cuda_ctx,cgraph,i);
+        if (skipped) return skipped;
+    }
+#endif
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
