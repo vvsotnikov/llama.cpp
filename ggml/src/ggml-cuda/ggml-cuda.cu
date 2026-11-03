@@ -5046,11 +5046,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
-                    graph->warmup_complete = false;
-                    if (ggml_cuda_graph_debug_enabled()) {
-                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
-                    }
+                    // The graph has already warmed up; recapture its changed properties directly.
+                    use_cuda_graph = true;
+                    cuda_graph_update_required = true;
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instances.empty();

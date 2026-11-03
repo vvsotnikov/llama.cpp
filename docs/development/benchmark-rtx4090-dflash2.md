@@ -77,3 +77,16 @@ The following 32 CUDA arithmetic cases passed against the CPU reference, includi
 build/bin/test-backend-ops test -b CUDA0 -o MUL_MAT \
   -p 'type_a=(iq3_s|iq4_xs),type_b=f32,m=33,|type_a=q8_0,type_b=f32,m=(47|48|64|65),n=(1|2|4|8|9),k=5120,'
 ```
+
+## Recapture warmed CUDA graphs
+
+After initial CUDA-graph warmup, a change of tensor properties now triggers capture directly. Previously it reset warmup and launched operations eagerly until the graph was stable again. Initial warmup is retained.
+
+A separate comparison against `feaf1d143`, using the same client, 48 prompts per dataset, 256-token cap and seeds 42/43, completed in 590.96 seconds:
+
+| Dataset | Base client tok/s | Recapture client tok/s | Base native decode tok/s | Recapture native decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| HumanEval | 160.72 | 166.04 | 188.30 | 193.94 |
+| GSM8K | 167.17 | 173.81 | 194.91 | 201.56 |
+
+Accepted and drafted token counts matched in every seed/dataset pair. The native decode gains were +2.99% and +3.41% over `feaf1d143`. Short-prompt native prefill improved +5.19% and +7.43%. A separate 32K prompt check completed at both seeds with unchanged draft counters; no long-prefill gain was established.
