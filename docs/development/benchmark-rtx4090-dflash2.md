@@ -1,23 +1,47 @@
 # RTX 4090 DFlash2 performance
 
-This fork tunes the small CUDA matrix operations used during DFlash2 verification on Ada. It uses one warp for IQ3_S/IQ4_XS operations with five to eight token columns, and runs small Q8_0 projections as broadcast single-column batches. The latter changes tensor metadata for the kernel launch without copying data. It also recaptures warmed CUDA graphs after property changes and fuses the drafter's two-tap grouped dynamic convolutions. Weight quantization and sampling policy are unchanged. FP32 reduction order can change in the matrix kernels.
+This fork avoids prompt-reuse checkpoint work for requests that disable prompt caching, retains the execution arena across backend-sampler changes when it fits, and avoids sampler backups when native speculative rollback makes them unnecessary. These are server/context changes; this round adds no CUDA kernels.
 
 ## Measured comparison
 
-Baseline: unmodified upstream `259d91709d60945911bedb9bcfb2957c6e153ea7`. Hardware: RTX 4090, 24 GB, 450 W limit, driver 610.88, WSL Ubuntu. Both builds used CUDA 12.6.85, Release, SM89.
+Reference: published fork `f8f699b5cdd7837e878a10a5b3a028604584733e`. Hardware: RTX 4090, 24 GB, 450 W limit, driver 610.88, WSL Ubuntu. Both builds use CUDA 12.6.85, Release, SM89. Target and original Inco drafter, model-card sampling, thinking low, C1 and seven probabilistic proposals are fixed below.
 
-| Dataset | Baseline client tok/s | Fork client tok/s | Change | Baseline native decode tok/s | Fork native decode tok/s | Change |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| HumanEval | 155.22 | 169.24 | +9.04% | 180.68 | 197.82 | +9.49% |
-| GSM8K | 162.65 | 176.77 | +8.68% | 188.79 | 205.65 | +8.93% |
+| Dataset | Build / target sampling | Server prefill tok/s | Native decode tok/s | Client output tok/s |
+| --- | --- | ---: | ---: | ---: |
+| HumanEval | Reference / CPU | 1019.93 | 201.13 | 172.11 |
+| HumanEval | Fork / CPU | 2692.34 | 202.45 | 190.39 |
+| HumanEval | Fork / GPU | 2698.66 | 204.31 | 192.05 |
+| GSM8K | Reference / CPU | 628.26 | 209.52 | 179.99 |
+| GSM8K | Fork / CPU | 2162.60 | 211.86 | 202.44 |
+| GSM8K | Fork / GPU | 2164.35 | 213.61 | 204.02 |
 
-The client is unmodified `dflash benchmark openai` from `dflash==0.1.0`. Each dataset used 48 prompts in the client's fixed shuffled order, a 256-token output cap, C1, and seeds 42 and 43. These counts are a bounded subset, not the complete datasets or an accuracy evaluation. One client warmup per dataset is excluded from scoring. Prompt caching was disabled.
+The GPU variant improves server prefill 2.65x/3.45x, native decode 1.58%/1.95%, and client throughput 11.59%/13.35% for HumanEval/GSM8K. The prefill gain comes from avoiding state serialization and prompt-tail passes scheduled solely to create reuse checkpoints. Cache-enabled requests retain checkpoint creation.
 
-Client throughput is output tokens divided by the client's measured batch elapsed time, including prompt processing, generation and HTTP. The table averages the two client scores. Native decode is the sum of `(output_tokens - 1)` divided by the sum of the server's generation-phase time. It includes drafting and verification but excludes prompt processing. The first token belongs to prompt processing in this server's timing convention.
+The client is unmodified `dflash benchmark openai` from `dflash==0.1.0`. Each dataset uses 48 prompts in the client's fixed shuffled order, a 256-token output cap, and seeds 42/43. Three variants run in order at seed 42 and reversed order at seed 43. All 576 scored requests completed in 798.58 seconds (13 minutes 19 seconds), including server startup and excluded client warmups. These are bounded dataset subsets, not an accuracy evaluation.
 
-The six-arm comparison ran upstream, the matrix-tuned recapture build, and that build plus dynamic-convolution fusion at seed 42, then reversed build order at seed 43. All 576 scored requests completed in 885.69 seconds (14 minutes 46 seconds). Convolution fusion preserved accepted and drafted token counts in every seed/dataset pair compared with the recapture build; the matrix changes can alter sampling trajectories. Two seeds do not establish a confidence interval or performance on all workloads.
+Client output throughput divides generated tokens by the client's batch elapsed time, including prefill, generation and HTTP. The table averages the two client scores. Native decode pools `(output_tokens - 1)` over server generation time, including drafting and verification. Server prefill pools processed prompt tokens over server prompt time, including checkpoint work; the first token belongs to prompt time. Prompt caching is disabled throughout this comparison.
 
-The matrix tuning alone previously measured +4.94% and +4.10% native decode over upstream. The recapture and convolution sections below give their incremental comparisons. The Q8_0 small projection improved from 5.95 to 4.22 microseconds in isolation; its incremental request-level gain was inconsistent across seeds.
+CPU/GPU variants have matching generated, accepted and drafted counts for every one of 192 paired scored requests. Removing checkpoint-only prompt splits changes prefill chunk boundaries, so generated text and acceptance can differ from the reference. Two seeds do not establish a confidence interval.
+
+## Longer prompt check
+
+A supplementary recorded 32,612-token prompt, 256-token output cap and two seeds gives:
+
+| Build / target sampling | Server prefill tok/s | Native decode tok/s |
+| --- | ---: | ---: |
+| Reference / CPU | 2905.35 | 140.24 |
+| Fork / CPU | 2952.80 | 146.76 |
+| Fork / GPU | 2940.86 | 146.45 |
+
+This is one prompt at two seeds, not a context-length sweep. The short-prompt multiplier must not be generalized to 32K or to bulk `llama-bench` throughput. This change removes request-processing work outside the main model computation.
+
+## Implementation and validation
+
+- Prompt-reuse checkpoints now require `cache_prompt=true`. Speculative correctness checkpoints use separate storage and retain their existing behavior. A cache-disabled diagnostic request under the previous policy serialized 159,970,116 bytes of state in 63.18 ms, in addition to the checkpoint-only prompt splits.
+- Sampler binding changes invalidate graph reuse. The existing arena is retained if its graph-node capacity fits; a larger requirement triggers full reservation. Retired sampler bindings are erased before inspecting the new capacity.
+- A sampler backup is made only when verification may restore a speculative checkpoint. The bounded recurrent-rollback path does not use that backup.
+
+Four existing CUDA backend-sampler tests pass: sampler replacement, multi-output RNG transactions, sampling chains, and CPU suffix fallback. API checks cover changing candidate width, CPU/GPU switching, pre-sampling probabilities, streaming cancellation and restoring settings. Cache-policy checks verify zero cached tokens and no reuse checkpoints for cache-disabled requests, successful prompt reuse for cache-enabled requests, and response parity with the reference configured with `--ctx-checkpoints 0`. A test-only zero-snapshot context also completes checkpoint-based speculative rollback; that override is absent from measured builds.
 
 ## Reproduce
 
@@ -25,7 +49,7 @@ Build the desired revision:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DLLAMA_BUILD_TESTS=ON
-cmake --build build --target llama-server llama-bench test-backend-ops -j4
+cmake --build build --target llama-server llama-bench test-backend-ops test-backend-sampler -j4
 ```
 
 Use these GGUFs, stored outside the checkout:
@@ -33,7 +57,7 @@ Use these GGUFs, stored outside the checkout:
 - Target: `unsloth/Qwen3.8-27B-GGUF@4ca720788d1e01f1bff70c033e0d0028fd02e502`, file `Qwen3.8-27B-UD-Q3_K_XL.gguf`, SHA256 `8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e`.
 - Drafter: original `incoai/Qwen3.8-27B-DFlash2@015e795645c74b1a0eeef3b570031fb62e769bc5`, converted to Q4_K_M GGUF, SHA256 `8cb82324c55b62c8a522e483204fa7521ec6d4a4b72a5e0441efadef4583edaa`.
 
-Set `TARGET_MODEL` and `DRAFT_MODEL` to their cache paths, then start the server:
+Set `TARGET_MODEL` and `DRAFT_MODEL` to their cache paths. The following command is the CPU target-sampling variant. Add `--backend-sampling` for the GPU variant above; sampling parameters and rejection policy stay the same. This flag controls target sampling, separately from the existing draft flag. Then start the server:
 
 ```sh
 build/bin/llama-server -m "$TARGET_MODEL" -md "$DRAFT_MODEL" \
@@ -60,7 +84,7 @@ for dataset in humaneval gsm8k; do
 done
 ```
 
-Restart with `--seed 43` for the second seed. Keep separate binaries and logs for the baseline and fork; run only one GPU job at a time. For a quick screen, use `--num-prompts 16` instead of 48. On the measured machine this took about 70 seconds including server startup.
+Restart with `--seed 43` for the second seed. Keep separate binaries and logs for the baseline and fork; run only one GPU job at a time. For a quick screen, use `--num-prompts 16` instead of 48. On the measured machine this takes about a minute per variant including server startup.
 
 For a separate target-only prefill component measurement, use unmodified `llama-bench`. This uses synthetic token IDs and does not load the DFlash2 drafter or measure its feature-capture overhead:
 
@@ -69,7 +93,7 @@ build/bin/llama-bench -m "$TARGET_MODEL" -p 512,8192,32768 -n 0 \
   -r 2 -b 2048 -ub 512 -ctk f16 -ctv f16 -fa on -ngl 99 -o json
 ```
 
-The CUDA changes above target small-token verification. No prefill speedup is claimed from the short request benchmark.
+The request-level prefill gain above is separate from this target-only component measurement.
 
 The following 32 CUDA arithmetic cases passed against the CPU reference, including dispatch boundaries and odd output-row counts:
 
@@ -78,34 +102,21 @@ build/bin/test-backend-ops test -b CUDA0 -o MUL_MAT \
   -p 'type_a=(iq3_s|iq4_xs),type_b=f32,m=33,|type_a=q8_0,type_b=f32,m=(47|48|64|65),n=(1|2|4|8|9),k=5120,'
 ```
 
-## Recapture warmed CUDA graphs
 
-After initial CUDA-graph warmup, a change of tensor properties now triggers capture directly. Previously it reset warmup and launched operations eagerly until the graph was stable again. Initial warmup is retained.
+For the context/sampler changes:
 
-A separate comparison against `feaf1d143`, using the same client, 48 prompts per dataset, 256-token cap and seeds 42/43, completed in 590.96 seconds:
+```sh
+for test in test_set_sampler test_multi_output_dist_transaction test_multi_output_sampling_chain test_multi_output_cpu_suffix; do
+  build/bin/test-backend-sampler --model "$TARGET_MODEL" --device gpu --test "$test"
+done
+```
 
-| Dataset | Base client tok/s | Recapture client tok/s | Base native decode tok/s | Recapture native decode tok/s |
-| --- | ---: | ---: | ---: | ---: |
-| HumanEval | 160.72 | 166.04 | 188.30 | 193.94 |
-| GSM8K | 167.17 | 173.81 | 194.91 | 201.56 |
+## Earlier CUDA changes
 
-Accepted and drafted token counts matched in every seed/dataset pair. The native decode gains were +2.99% and +3.41% over `feaf1d143`. Short-prompt native prefill improved +5.19% and +7.43%. A separate 32K prompt check completed at both seeds with unchanged draft counters; no long-prefill gain was established.
-
-## Fuse two-tap grouped dynamic convolution
-
-The drafter's convolution was composed from broadcasts, contiguous copies, padding, multiplies and an add. CUDA now recognizes the closed two-tap graph and calculates its output in one kernel without materializing broadcast weights. The primitive graph remains the CPU reference and fallback. The matcher rejects externally consumed intermediate tensors and producers inside the fusion span. If output storage overlaps an input, the kernel writes to temporary storage before copying the result back. Separate FP32 add/multiply rounding is retained.
-
-Compared with the matrix-tuned recapture build in the six-arm comparison above:
-
-| Dataset | Recapture native decode tok/s | With convolution fusion tok/s | Change |
-| --- | ---: | ---: | ---: |
-| HumanEval | 194.25 | 197.82 | +1.84% |
-| GSM8K | 201.71 | 205.65 | +1.95% |
-
-Twenty composed-graph arithmetic cases pass against the CPU reference. They cover both convolution sides, one/two/eight-token blocks, multiple sequences, odd channel counts, the actual 5120-channel shape, a live intermediate that must prevent fusion, and a computed input producer that must not be skipped:
+The reference fork `f8f699b5c` already includes Ada small-matrix tuning (`feaf1d143`), recapture of warmed CUDA graphs (`ea258a72c`), and two-tap DFlash2 convolution fusion (`f8f699b5c`). Weight quantization and sampling policy are unchanged; FP32 reduction order can change. The original composed convolution remains the CPU reference and fallback, with 20 CUDA arithmetic cases:
 
 ```sh
 build/bin/test-backend-ops test -b CUDA0 -o DYNAMIC_CONV_1D
 ```
 
-The test utility's whole-graph performance mode now repeats all producers on every iteration. Prior timings that repeated only a final fusion-test operation must not be interpreted as whole-graph latency.
+An earlier separate comparison of that reference against unmodified upstream `259d91709d60945911bedb9bcfb2957c6e153ea7` measured native decode 180.68->197.82 tok/s on HumanEval and 188.79->205.65 on GSM8K. Those rates belong to that earlier run; the architecture comparison above directly remeasures `f8f699b5c` as its baseline.
