@@ -2174,7 +2174,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
-    // from a per-type number of src1 columns up to 24, few-row MMQ is faster than MMVQ and MMQ
+    // Use few-row MMQ for eligible quantized projections.
     if (ggml_cuda_should_use_mmq_few(src0, src1, cc)) {
         ggml_cuda_mul_mat_q_few(ctx, src0, src1, dst);
         return;

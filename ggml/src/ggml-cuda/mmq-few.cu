@@ -845,6 +845,10 @@ void ggml_cuda_mul_mat_q_few(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
 // Min. number of src1 columns for the few-row MMQ, 0 if it is not used for this type, GPU and row length.
 static int ggml_cuda_mmq_few_min_ncols(const ggml_type type, const int cc, const int64_t ne00) {
+    if (cc != GGML_CUDA_CC_ADA_LOVELACE || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ4_NL) {
+        return 0;
+    }
+
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return 0;
 #endif // GGML_CUDA_FORCE_CUBLAS
