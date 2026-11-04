@@ -204,6 +204,11 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    llama_state_seq_snapshot_ptr state_seq_snapshot_save(
+            llama_seq_id seq_id, llama_state_seq_flags flags, llama_state_seq_snapshot_ptr reusable);
+    bool state_seq_snapshot_restore(
+            const llama_state_seq_snapshot_ptr & snapshot, llama_seq_id seq_id, llama_state_seq_flags flags);
+
     //
     // training
     //
@@ -447,6 +452,7 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+    std::shared_ptr<const uint8_t> state_snapshot_owner = std::make_shared<const uint8_t>(0);
 
     bool has_evaluated_once = false;
 

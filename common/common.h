@@ -1319,6 +1319,8 @@ private:
     std::unique_ptr<common_checkpoint_storage> pinned;
 };
 
+struct llama_state_seq_snapshot;
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1328,8 +1330,10 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    common_checkpoint_buffer data_tgt;
-    std::vector<uint8_t> data_dft;
+    mutable common_checkpoint_buffer data_tgt;
+    std::shared_ptr<llama_state_seq_snapshot> device_tgt;
+    mutable std::vector<uint8_t> data_dft;
+    std::shared_ptr<llama_state_seq_snapshot> device_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
@@ -1339,6 +1343,9 @@ struct common_prompt_checkpoint {
 
     bool empty() const;
     void clear();
+    const common_checkpoint_buffer & target_data() const;
+    const std::vector<uint8_t> & draft_data() const;
+    bool has_draft_state() const;
 
     void update_pos(
             int64_t n_tokens,
@@ -1349,12 +1356,13 @@ struct common_prompt_checkpoint {
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags,
-            bool pin_host = false);
+            bool device_storage = false);
 
     void update_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
-            llama_state_seq_flags flags);
+            llama_state_seq_flags flags,
+            bool device_storage = false);
 
     // return false if the state could not be restored
     bool load_tgt(

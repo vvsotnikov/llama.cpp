@@ -349,7 +349,7 @@ struct server_slot {
         if (checkpoint_restored == &checkpoint) {
             checkpoint_restored = nullptr;
         }
-        if (!checkpoint.data_tgt.empty() && checkpoint_buffers.size() < 2) {
+        if (!checkpoint.empty() && checkpoint_buffers.size() < 2) {
             checkpoint_buffers.push_back(std::move(checkpoint));
         }
     }
@@ -2829,13 +2829,13 @@ private:
 
         if (!reuse) {
             auto dev = params_base.devices.empty() ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : params_base.devices.front();
-            const bool pin_host = slots.size() == 1 && params_base.n_gpu_layers != 0 && dev &&
+            const bool device_storage = slots.size() == 1 && params_base.n_gpu_layers != 0 && dev &&
                 strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0;
-            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, pin_host);
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, device_storage);
             if (ctx_dft == nullptr) {
-                cur.data_dft.clear();
+                cur.clear_dft();
             }
-            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, device_storage);
             cur.data_spec.clear();
             common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
         }
@@ -2905,8 +2905,8 @@ private:
             ckpt_write(ofs, &cur.n_tokens, sizeof(cur.n_tokens), n_written);
             ckpt_write(ofs, &cur.pos_min,  sizeof(cur.pos_min),  n_written);
             ckpt_write(ofs, &cur.pos_max,  sizeof(cur.pos_max),  n_written);
-            ckpt_write_buf(ofs, cur.data_tgt,  n_written);
-            ckpt_write_buf(ofs, cur.data_dft,  n_written);
+            ckpt_write_buf(ofs, cur.target_data(), n_written);
+            ckpt_write_buf(ofs, cur.draft_data(), n_written);
             ckpt_write_buf(ofs, cur.data_spec, n_written);
         }
         ofs.flush();
@@ -4350,7 +4350,7 @@ private:
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         if (slots.size() == 1 && it->id_task >= 0 && n_past == it->n_tokens &&
-                                            (ctx_dft == nullptr || !it->data_dft.empty())) {
+                                            (ctx_dft == nullptr || it->has_draft_state())) {
                                             slot.checkpoint_restored = &*it;
                                         }
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
