@@ -2,6 +2,29 @@
 
 ## Current cache-enabled profile
 
+Eligible target recurrent-state checkpoints and draft sliding-window-cache checkpoints now stay in independently owned CUDA buffers. This removes their routine GPU-to-host export and host-to-GPU restoration. Cached copies share immutable snapshots; a later capture reuses a buffer only when it owns it exclusively. Checkpoint positions, pruning, model computation and sampling are unchanged. The existing slot-file format is produced on demand from the captured state.
+
+Direct reference: published fork `dd21f0e3b999fc77e057d3f801a2d9d63c9e082a`. Measured code: `8c2836ad72678a172eec251efed49a80824710c3`. Hardware and configuration remain the RTX 4090/WSL setup below, with prompt caching enabled.
+
+| Dataset | Reference prefill tok/s | Current prefill tok/s | Reference decode tok/s | Current decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| HumanEval | 1678.56 | 1833.29 | 216.05 | 216.55 |
+| GSM8K | 990.35 | 1132.81 | 218.30 | 218.91 |
+
+Prefill improves 9.22%/14.39%. Pooled decode changes +0.23%/+0.28%; the reverse-order repeat changes -0.14%/-0.14%. No consistent decode improvement is established.
+
+The unchanged `dflash==0.1.0` OpenAI client runs 16 HumanEval and 16 GSM8K prompts, capped at 256 output tokens, with seeds 42/43. Each comparison runs reference/current at seed 42 and current/reference at seed 43; the second comparison reverses those orders. The two comparisons take 367.86 seconds combined (6m08s), including server startup and excluded client warmups. All 256 scored requests complete; all 128 paired requests have identical processed-prompt, generated, accepted and drafted counts. This is two seeds repeated twice, not four independent seeds.
+
+Prefill pools newly processed tokens over server prompt time, including checkpoint work; reused tokens are excluded. Decode pools generated tokens minus the first over generation time, including drafting and verification. These are short questions with shared prefixes. The prefill gain comes from checkpoint storage and does not establish faster bulk prefill or long-context performance.
+
+Device snapshots have a process-wide 1 GiB budget for requested storage. New allocations require 1 GiB of free VRAM beyond their tensor payload. Unavailable capacity, non-CUDA storage, small payloads and block-quantized partial states use the existing host path. The server selects this automatically for C1 CUDA checkpoint capture; no additional launch flag is required. The quantization and capacity of the model's KV cache are unchanged.
+
+Component tests and all four selected real-target state tests pass: `verify_prefix`, `rollback`, `rollback_bound` and `owned_checkpoint`. The ownership regression checks host-format byte equality, pending rollback, immutable shared copies, exclusive reuse, independence from legacy device snapshots, budget exhaustion/release, context isolation and export after context destruction.
+
+HTTP checks cover 8K cached append/edit, sampling and candidate-width changes, probability fallback, streaming cancellation recovery, a 4096 MiB host prompt cache, and saved-slot replacement/restoration. They pass with checkpoint limits 1, 2 and 32, and with quantized drafter KV using host fallback. Saved-slot files are byte-identical between builds in each comparison. With two checkpoints, observed resident GPU memory after these API requests increases from 17,305 to 17,691 MiB; these observations are not peak-memory measurements.
+
+## Previous cache-enabled profile: pinned host checkpoints
+
 Target prompt checkpoints now use reusable CUDA pinned host buffers, so state export and restoration transfer directly between the GPU and the checkpoint's storage. This removes the extra driver staging needed for pageable storage. The model computation, checkpoint selection and prompt-cache policy are unchanged. This is a new server/storage change on top of published fork `499eace08964c2ca5698f53fe512b8a1252d8b69`.
 
 | Dataset | Reference prefill tok/s | Current prefill tok/s | Reference decode tok/s | Current decode tok/s |
