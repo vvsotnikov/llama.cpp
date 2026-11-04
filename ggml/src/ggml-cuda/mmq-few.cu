@@ -8,6 +8,42 @@
 
 using namespace ggml_cuda_mma;
 
+static __device__ __forceinline__ void ggml_cuda_prefetch_l2(const void * p) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(p));
+#else
+    GGML_UNUSED(p);
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+// Commits the copies issued since the last commit as one group.
+static __device__ __forceinline__ void cp_async_commit_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.commit_group;");
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+// Makes each thread wait until at most n of its copy groups are pending.
+// Like cp_async_wait_all, this does NOT provide any additional synchronization.
+template <int n>
+static __device__ __forceinline__ void cp_async_wait_group() {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.wait_group %0;" : : "n"(n));
+#else
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
+// The 6-bit scales 4*ksc .. 4*ksc + 3 of a q3_K block, minus 32, as int8.
+static __device__ __forceinline__ int unpack_scales_q3_K(const uint8_t * scales, const int ksc) {
+    const int sc_low  = (get_int_b2(scales, ksc % 2) >> (4 * (ksc / 2))) & 0x0F0F0F0F;
+    const int sc_high = ((get_int_b2(scales, 2) >> (2 * ksc)) << 4) & 0x30303030;
+    return __vsub4(sc_low | sc_high, 0x20202020);
+}
+
+
 // Few-row MMQ: int8 MMA mat-mul for 2-24 src1 columns. A CUDA block has 16 src0 rows (32 for 2 column groups on large matrices).
 // Its warps split K in units of 256 values and copy raw src0 rows into their own cp.async ring, src1 is quantized to the MMA fragment layout.
 
