@@ -1,6 +1,29 @@
 # RTX 4090 DFlash2 performance
 
-## Current cache-enabled profile
+## Current cache-enabled profile: few-row CUDA projections
+
+This integrates Anuj Jalota's [few-row MMQ kernel, upstream PR #31533](https://github.com/ggml-org/llama.cpp/pull/31533), from commits `e8ba4fce41e9d8edefb5f438a70d7e2093969b1d` and `86db2f308364c900cfe196e5ed038262a1b0b5af`. It uses int8 tensor-core MMA for small token batches, with activation fragments prepared in their consumer layout and per-warp asynchronous weight staging. This fork enables it for Q3_K, Q4_K, Q5_K, Q6_K and Q8_0 on Ada. IQ formats retain the previous kernels, and the earlier small Q8_0 projection optimization remains ahead of the new dispatch. No additional launch flag is required.
+
+Measured engine: `a0f51104f7afb7a95964b690808b8ed58c4d9ff7`. Direct reference, remeasured alongside it: published engine `8c2836ad72678a172eec251efed49a80824710c3`. Both use the exact target and original Inco drafter, F16 KV, C1, model-card sampling, thinking low, seven probabilistic proposals, GPU target sampling and prompt caching specified below.
+
+| Dataset | Reference prefill tok/s | Current prefill tok/s | Reference decode tok/s | Current decode tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| HumanEval | 1828.41 | 1828.35 | 215.12 | 219.89 |
+| GSM8K | 1118.10 | 1118.48 | 217.69 | 223.36 |
+
+Decode improves 2.22%/2.60%; prefill changes -0.003%/+0.034%. An earlier policy-equivalent prototype measured +1.11%/+1.93% decode across another two rounds. These results support a modest gain on this short suite, approximately 1-3%, and establish no prefill gain.
+
+The unchanged `dflash==0.1.0 benchmark openai` client runs 16 HumanEval and 16 GSM8K prompts, capped at 256 output tokens, with seeds 42/43. Each comparison runs reference/current at seed 42 and current/reference at seed 43; the second comparison reverses those orders. The two clean-build comparisons take 364.43 seconds combined (6m04s), including startup and excluded warmups. All 256 scored requests complete. This is two seeds repeated twice, not four independent seeds.
+
+Prefill pools newly processed tokens over native server prompt time; reused tokens are excluded. Decode pools generated tokens minus the first over generation time, including drafting and verification. Arithmetic changes affect proposals, acceptance and generated sequences: 114 of 128 paired request counter groups differ. The decode result therefore includes those effects and does not isolate kernel execution time. These short shared-prefix questions do not qualify long-context throughput or coding-task accuracy.
+
+Numerical validation uses the same quantized target's saved micro-batch-512 logits as its reference, not BF16. On the first 20 WikiText-2 test chunks of 512 tokens, evaluating 5,120 positions with micro-batch 8, mean KL divergence changes from 0.001988 to 0.000988 and same-top-token agreement from 98.196% to 98.686%. This is a numerical regression screen, not evidence of improved task accuracy.
+
+Cache diagnostics compare fixed-prefix target logits separately from stochastic text. In the checked 8K cold/cached requests, fingerprints over all 248,320 target logits match through the first differing sampled token (three shared-prefix positions), while the drafter's conditional probabilities differ. Rejection sampling can therefore produce different seeded text despite identical target logits. Exact seeded-text equality is retained for storage-only changes; it is not the numerical correctness criterion for this arithmetic change.
+
+All 59 selected CUDA operator comparisons against the CPU reference, the gate/up fusion regression, 50 component tests (199 assertions), and the four selected real-target state cases pass. The state cases cover `verify_prefix`, `rollback`, `rollback_bound` and `owned_checkpoint`. API lifecycle qualification covers cached 8K append/edit, deep-edit fallback after checkpoint eviction, sampler and candidate-width changes, probability fallback, streaming cancellation/recovery, and saved-slot replacement/restoration: 14 reference checks and 16 candidate checks. Valid end-of-generation responses may contain no text. The existing checkpoint ownership, capacity policy and saved-state format are unchanged.
+
+## Previous cache-enabled profile: owned device checkpoints
 
 Eligible target recurrent-state checkpoints and draft sliding-window-cache checkpoints now stay in independently owned CUDA buffers. This removes their routine GPU-to-host export and host-to-GPU restoration. Cached copies share immutable snapshots; a later capture reuses a buffer only when it owns it exclusively. Checkpoint positions, pruning, model computation and sampling are unchanged. The existing slot-file format is produced on demand from the captured state.
 
