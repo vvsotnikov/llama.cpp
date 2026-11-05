@@ -5748,6 +5748,27 @@ static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
 }
 
 // GGML_OP_MUL_MAT
+// Keep immutable IQ3 weights in a weight buffer so prepared execution paths are exercised.
+struct test_mul_mat_iq3_verify : public test_case {
+    const int64_t m, n, k;
+    const bool view;
+
+    test_mul_mat_iq3_verify(int64_t m, int64_t n, int64_t k, bool view = false) : m(m), n(n), k(k), view(view) {}
+    std::string vars() override { return VARS_TO_STR4(m, n, k, view); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_IQ3_VERIFY"; }
+    bool use_weight_context() override { return true; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * weights) override {
+        ggml_tensor * a = ggml_new_tensor_2d(weights, GGML_TYPE_IQ3_S, k, m + (view ? 16 : 0));
+        ggml_set_name(a, "weight");
+        if (view) a = ggml_view_2d(ctx, a, k, m, a->nb[1], 16*a->nb[1]);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        return ggml_mul_mat(ctx, a, b);
+    }
+};
+
 struct test_mul_mat : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -11650,6 +11671,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 16, 8, 300, 2, false, /*K=*/1, /*weak_decay=*/true)); // d_state=96 SSD multi-chunk (partial 2nd chunk, 2 seqs)
+    for (int64_t n : {7, 8, 9}) {
+        test_cases.emplace_back(new test_mul_mat_iq3_verify(5120, n, 2048));
+    }
+    test_cases.emplace_back(new test_mul_mat_iq3_verify(5136, 8, 2304));
+    test_cases.emplace_back(new test_mul_mat_iq3_verify(5120, 8, 2048, true));
+
     test_cases.emplace_back(new test_ssm_scan_rollback(GGML_TYPE_F32, 96, 64, 16, 8, 8, 2, /*K=*/3)); // d_state=96 rollback snapshots match prefix states
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 32, 4)); // Mamba-2
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 256, 64,  8, 2, 32, 4)); // Falcon-H1
