@@ -745,6 +745,18 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+void ggml_cuda_graph_capture_begin() {
+    std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+    ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ggml_cuda_graph_capture_end() {
+    std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+    if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+        ggml_cuda_lock_cv.notify_all();
+    }
+}
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -2944,6 +2956,7 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_mmq_few_free(*cuda_ctx);
     delete cuda_ctx;
     delete backend;
 }
@@ -5409,10 +5422,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             graph->instances.resize(n_chunks);
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
-            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
-            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
-                ggml_cuda_lock_cv.notify_all();
-            }
+            ggml_cuda_graph_capture_end();
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
         }
@@ -5453,6 +5463,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
 
     ggml_cuda_prepare_iq3_fragments(*cuda_ctx,cgraph);
+    bool graph_mode = false;
+#ifdef USE_CUDA_GRAPH
+    static const bool graphs_disabled = getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
+    const bool graph_compatible = !graphs_disabled && ggml_cuda_graph_check_compability(cgraph);
+    graph_mode = graph_compatible;
+#endif
+    ggml_cuda_mmq_few_scope mmq_few_scope(*cuda_ctx, cgraph, graph_mode);
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5465,7 +5482,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
@@ -5497,10 +5513,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
-        {
-            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
-            ggml_cuda_lock_counter.fetch_add(1, std::memory_order_relaxed);
-        }
+        ggml_cuda_graph_capture_begin();
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }

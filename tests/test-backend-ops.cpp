@@ -11898,6 +11898,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 21, k, {1, 1}, {1, 1}));
         }
     }
+    // Constant IQ4 weights also exercise calibration before graph capture.
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
+        for (int64_t m : {1000, 6170}) {
+            test_cases.emplace_back(new test_mul_mat_weights(type_a, GGML_TYPE_F32, m, 8, 4608));
+        }
+    }
     // permuted and broadcast src0/src1 for the 2 byte aligned types
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 64, 13, 2304, {2, 3}, {1, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K,  GGML_TYPE_F32, 63,  5, 2304, {3, 2}, {2, 2}));
