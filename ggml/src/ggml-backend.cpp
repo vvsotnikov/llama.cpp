@@ -2087,6 +2087,15 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+        // This extension owns a host copy before returning, so the user may reuse the input immediately.
+        using copy_input_async_t = bool (*)(ggml_backend_t, const ggml_tensor *, ggml_tensor *);
+        auto * dev = ggml_backend_get_device(split_backend);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto copy_input = reg ? reinterpret_cast<copy_input_async_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_input_async")) : nullptr;
+        if (copy_input && copy_input(split_backend, input, input_cpy)) {
+            return;
+        }
+
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);

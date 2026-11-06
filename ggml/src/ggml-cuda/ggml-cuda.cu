@@ -2,6 +2,8 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <array>
+
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -783,6 +785,16 @@ struct ggml_backend_cuda_buffer_context {
     std::mutex fragment_mutex;
     std::unordered_map<const void *, fragment_entry> iq3_fragments;
 
+    static constexpr size_t input_slot_bytes = 64*1024;
+    struct input_slot {
+        cudaEvent_t ready = nullptr;
+    };
+    std::mutex input_mutex;
+    std::array<input_slot, 64> input_slots;
+    char * input_staging = nullptr;
+    bool input_staging_failed = false;
+    size_t input_cursor = 0;
+
     void invalidate_fragments() {
         std::lock_guard<std::mutex> lock(fragment_mutex);
         for (auto & entry : iq3_fragments) entry.second.dirty = true;
@@ -795,6 +807,15 @@ struct ggml_backend_cuda_buffer_context {
 
     ~ggml_backend_cuda_buffer_context() {
         ggml_cuda_set_device(device);
+        for (auto & slot : input_slots) {
+            if (slot.ready) {
+                CUDA_CHECK(cudaEventSynchronize(slot.ready));
+                CUDA_CHECK(cudaEventDestroy(slot.ready));
+            }
+        }
+        if (input_staging) {
+            CUDA_CHECK(cudaFreeHost(input_staging));
+        }
         for (auto & entry : iq3_fragments) {
             CUDA_CHECK(cudaFree(entry.second.data));
             CUDA_CHECK(cudaEventDestroy(entry.second.ready));
@@ -2967,6 +2988,69 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+}
+
+static bool ggml_backend_cuda_copy_input_async(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_CUDA_ASYNC_INPUTS");
+        return value && strcmp(value, "1") == 0;
+    }();
+    if (!enabled || !ggml_backend_is_cuda(backend) || !(src->flags & GGML_TENSOR_FLAG_INPUT) ||
+            !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) || ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return false;
+    }
+    auto * src_buffer = src->view_src ? src->view_src->buffer : src->buffer;
+    auto * dst_buffer = dst->view_src ? dst->view_src->buffer : dst->buffer;
+    const size_t size = ggml_nbytes(src);
+    if (!src_buffer || !dst_buffer || !ggml_backend_buffer_is_host(src_buffer) ||
+            !ggml_backend_buffer_is_cuda(dst_buffer) || size > ggml_backend_cuda_buffer_context::input_slot_bytes) {
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    auto * buffer = static_cast<ggml_backend_cuda_buffer_context *>(dst_buffer->context);
+    if (buffer->device != cuda_ctx->device) {
+        return false;
+    }
+
+    ggml_cuda_set_device(buffer->device);
+    std::lock_guard<std::mutex> lock(buffer->input_mutex);
+    if (!buffer->input_staging && !buffer->input_staging_failed) {
+        buffer->input_staging = static_cast<char *>(ggml_cuda_host_malloc(buffer->input_slot_bytes*buffer->input_slots.size()));
+        buffer->input_staging_failed = !buffer->input_staging;
+    }
+    if (!buffer->input_staging) {
+        return false;
+    }
+    size_t index = buffer->input_cursor;
+    for (size_t i = 0; i < buffer->input_slots.size(); ++i) {
+        index = (buffer->input_cursor + i) % buffer->input_slots.size();
+        const auto event = buffer->input_slots[index].ready;
+        const auto status = event ? cudaEventQuery(event) : cudaSuccess;
+        if (status == cudaSuccess) {
+            break;
+        }
+        if (status != cudaErrorNotReady) {
+            CUDA_CHECK(status);
+        }
+        if (i + 1 == buffer->input_slots.size()) {
+            index = buffer->input_cursor;
+            CUDA_CHECK(cudaEventSynchronize(buffer->input_slots[index].ready));
+        }
+    }
+    auto & slot = buffer->input_slots[index];
+    if (!slot.ready) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&slot.ready, cudaEventDisableTiming));
+    }
+    char * staging = buffer->input_staging + index*buffer->input_slot_bytes;
+    memcpy(staging, src->data, size);
+    buffer->invalidate_fragments();
+    CUDA_CHECK(cudaMemcpyAsync(dst->data, staging, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    CUDA_CHECK(cudaEventRecord(slot.ready, cuda_ctx->stream()));
+    buffer->input_cursor = (index + 1) % buffer->input_slots.size();
+    return true;
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
@@ -6742,6 +6826,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_copy_input_async") == 0) {
+        return (void *)ggml_backend_cuda_copy_input_async;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }
