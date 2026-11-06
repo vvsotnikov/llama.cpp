@@ -4754,6 +4754,10 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // Prepare device feature consumption before waiting for the target when supported.
+        const bool process_spec_early = common_speculative_can_process_async(spec.get());
+        bool spec_ok = true;
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -4762,6 +4766,9 @@ private:
         }
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            if (ret == 0 && process_spec_early) {
+                spec_ok = common_speculative_process(spec.get(), batch.view);
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -4824,10 +4831,12 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch.view);
-            });
+            bool ok = spec_ok;
+            if (!process_spec_early) {
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process(spec.get(), batch.view);
+                });
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");

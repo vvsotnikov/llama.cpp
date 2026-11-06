@@ -208,6 +208,8 @@ struct common_speculative_impl {
 
     virtual bool process(const common_batch & batch) = 0;
 
+    virtual bool can_process_async() const { return false; }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -1029,6 +1031,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // inject target features from the target's device buffer instead of host copies (env LLAMA_DFLASH_DEV=0 disables)
     bool use_dev_features = false;
+
+    bool can_process_async() const override {
+        return is_dflash2 && use_dev_features && llama_supports_async_embd_row(params.ctx_dft);
+    }
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -2995,6 +3001,12 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
     }
+}
+
+bool common_speculative_can_process_async(const common_speculative * spec) {
+    return spec && !spec->impls.empty() && std::all_of(spec->impls.begin(), spec->impls.end(), [](const auto & impl) {
+        return impl->can_process_async();
+    });
 }
 
 bool common_speculative_process(common_speculative * spec, const common_batch & batch) {

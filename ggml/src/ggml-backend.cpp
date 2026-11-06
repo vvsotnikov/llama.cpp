@@ -1229,6 +1229,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
+    ggml_backend_sched_compute_callback callback_compute;
+    void * callback_compute_user_data;
+
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
@@ -2165,6 +2168,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sched->callback_compute) {
+            sched->callback_compute(split_backend, sched->callback_compute_user_data);
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2422,6 +2429,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_compute_callback(ggml_backend_sched_t sched, ggml_backend_sched_compute_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_compute = callback;
+    sched->callback_compute_user_data = user_data;
 }
 
 void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {

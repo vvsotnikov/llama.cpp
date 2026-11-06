@@ -187,6 +187,7 @@ LLAMA_API void llama_set_embeddings_layer_inp_dev(struct llama_context * ctx, bo
 // Whether decode accepts entries added with llama_batch_ext_add_embd_row()
 // (needs a DFlash/DSpark decoder context whose ctx_other has a layer input device buffer).
 LLAMA_API bool llama_supports_embd_row(const struct llama_context * ctx);
+LLAMA_API bool llama_supports_async_embd_row(const struct llama_context * ctx);
 
 // Add an entry whose embedding is row `row` of the layer input device buffer of ctx_other.
 // All entries of the batch must be of this kind. Positions are set with llama_batch_ext_set_pos(), n_pos_per_embd of them.

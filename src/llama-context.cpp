@@ -1441,6 +1441,26 @@ bool llama_context::supports_embd_row() const {
     return false;
 }
 
+bool llama_context::supports_async_embd_row() const {
+    const char * enabled = getenv("LLAMA_DFLASH_ASYNC_INJECT");
+    if (!enabled || atoi(enabled) == 0 || cparams.n_seq_max != 1 || !cparams.op_offload || !supports_embd_row()) {
+        return false;
+    }
+
+    const auto * source = cparams.ctx_other;
+    const auto dev = source->layer_inp_dev_dev;
+    if (!dev || !source->ev_layer_inp_written || !source->ev_layer_inp_read || !backend_from_dev(dev) ||
+            strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0 || model.dev_output() != dev) {
+        return false;
+    }
+    for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+        if (model.dev_layer(il) != dev) {
+            return false;
+        }
+    }
+    return true;
+}
+
 ggml_backend_t llama_context::backend_from_dev(ggml_backend_dev_t dev) const {
     for (const auto & backend : backends) {
         if (ggml_backend_get_device(backend.get()) == dev) {
@@ -1714,7 +1734,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const bool wait_for_features = ubatch.embd_row && supports_async_embd_row();
+    if (wait_for_features) {
+        auto * source = cparams.ctx_other;
+        auto * feature_backend = res->get_embd() ? ggml_backend_sched_get_tensor_backend(sched.get(), res->get_embd()) : nullptr;
+        if (ggml_backend_sched_get_n_splits(sched.get()) != 1 || !feature_backend ||
+                ggml_backend_get_device(feature_backend) != source->layer_inp_dev_dev) {
+            // A split may copy features to another backend before its compute callback.
+            ggml_backend_event_synchronize(source->ev_layer_inp_written.get());
+        } else {
+            // Input copies can synchronize the consumer stream, so wait only after they finish.
+            ggml_backend_sched_set_compute_callback(sched.get(), [](ggml_backend_t backend, void * data) {
+                auto * producer = static_cast<llama_context *>(data);
+                ggml_backend_event_wait(backend, producer->ev_layer_inp_written.get());
+            }, source);
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (wait_for_features) {
+        ggml_backend_sched_set_compute_callback(sched.get(), nullptr, nullptr);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2146,9 +2186,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (inject_src) {
         inject_backend = inject_src->ev_layer_inp_written ? backend_from_dev(inject_src->layer_inp_dev_dev) : nullptr;
         if (inject_backend) {
-            // wait on the host: a device-side wait would stall our queue for the whole target batch,
-            // which trips the Metal command buffer timeout on long prompts
-            ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get());
+            if (!supports_async_embd_row()) {
+                // Metal needs a host wait to avoid command buffer timeouts on long prompts.
+                ggml_backend_event_synchronize(inject_src->ev_layer_inp_written.get());
+            }
         } else {
             inject_src->synchronize();
         }
@@ -4700,6 +4741,10 @@ void llama_set_embeddings_layer_inp_dev(llama_context * ctx, bool value) {
 
 bool llama_supports_embd_row(const llama_context * ctx) {
     return ctx->supports_embd_row();
+}
+
+bool llama_supports_async_embd_row(const llama_context * ctx) {
+    return ctx->supports_async_embd_row();
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
