@@ -282,6 +282,9 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
+    void graph_workspace_select(bool tokens);
+    void graph_workspace_invalidate();
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -433,6 +436,16 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    struct graph_workspace {
+        ggml_backend_sched_ptr sched;
+        std::array<llm_graph_result_ptr, 2> results;
+        llm_graph_result * active = nullptr;
+    };
+
+    std::unique_ptr<graph_workspace> graph_workspace_alt;
+    bool graph_workspace_tokens = false;
+    bool graph_workspaces_enabled = false;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

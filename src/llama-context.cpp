@@ -405,6 +405,9 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+
+        const char * phase_graphs = getenv("LLAMA_DFLASH_PHASE_GRAPHS");
+        graph_workspaces_enabled = phase_graphs && atoi(phase_graphs) != 0;
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -611,6 +614,8 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    const auto sched_reserved = graph_workspace_tokens && graph_workspace_alt ? graph_workspace_alt->sched.get() : sched.get();
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -618,7 +623,7 @@ llama_context::~llama_context() {
             ggml_backend_buffer_type_t buft    = backend_buft[i];
 
             const size_t size_exp = backend_buf_exp_size[i];
-            const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            const size_t size_act = ggml_backend_sched_get_buffer_size(sched_reserved, backend);
             if (size_exp == size_act) {
                 LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
@@ -629,6 +634,7 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+    graph_workspace_alt.reset();
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -770,6 +776,9 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+
+    graph_workspace_alt.reset();
+    graph_workspace_tokens = false;
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -1027,6 +1036,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        graph_workspace_invalidate();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1553,6 +1563,7 @@ void llama_context::set_warmup(bool value) {
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     const auto invalidate_sampler_graph = [&]() {
         gf_res_prev_active = nullptr;
+        graph_workspace_invalidate();
         if (!sched_need_reserve &&
                 (!gf_res_reserve || graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch)) > gf_res_reserve->get_max_nodes())) {
             sched_need_reserve = true;
@@ -1672,6 +1683,11 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (graph_workspaces_enabled && !graph_reuse_disable && model.arch == LLM_ARCH_DFLASH && cparams.ctx_other &&
+            cparams.n_seq_max == 1 && !cparams.pipeline_parallel && !model.no_alloc() && !opt_ctx) {
+        graph_workspace_select(ubatch.token != nullptr);
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2799,6 +2815,33 @@ llm_graph_result * llama_context::get_gf_res_prev() {
     return res.get();
 }
 
+void llama_context::graph_workspace_select(bool tokens) {
+    if (graph_workspace_tokens == tokens) {
+        return;
+    }
+
+    if (!graph_workspace_alt) {
+        auto workspace = std::make_unique<graph_workspace>();
+        workspace->sched.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), gf_res_reserve->get_max_nodes(), false, cparams.op_offload));
+        ggml_backend_sched_set_copy_callback(workspace->sched.get(), sched_copy_experts, this);
+        ggml_backend_sched_set_realloc_callback(workspace->sched.get(), sched_graph_realloc, this);
+        graph_workspace_alt = std::move(workspace);
+    }
+
+    // Keep each phase's allocation addresses stable for backend graph replay.
+    std::swap(sched, graph_workspace_alt->sched);
+    std::swap(gf_res_prev, graph_workspace_alt->results);
+    std::swap(gf_res_prev_active, graph_workspace_alt->active);
+    graph_workspace_tokens = tokens;
+}
+
+void llama_context::graph_workspace_invalidate() {
+    if (graph_workspace_alt) {
+        graph_workspace_alt->active = nullptr;
+    }
+}
+
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
 static void ubatch_prepare_reserve(
               llama_ubatch                            & ubatch,
@@ -2875,6 +2918,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
     gf_res_prev_active = nullptr;
+    graph_workspace_invalidate();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -4201,6 +4245,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
             ggml_backend_t             backend = backend_ptr.get();
             ggml_backend_buffer_type_t buft    = ggml_backend_sched_get_buffer_type(sched.get(), backend);
             ret[buft].compute += ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            if (graph_workspace_alt) {
+                ret[buft].compute += ggml_backend_sched_get_buffer_size(graph_workspace_alt->sched.get(), backend);
+            }
         }
     }
     return ret;
