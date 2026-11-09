@@ -1102,6 +1102,39 @@ static void requires_non_null_content(json & messages) {
     }
 }
 
+// Models frequently emit raw control characters (LF, CR, TAB) inside JSON string
+// literals of tool-call arguments - e.g. multi-line code in a "new_string" value -
+// which is invalid JSON and made server.tool_call parsing fail hard. Escape any
+// unescaped control character found inside a JSON string; everything outside
+// strings is left untouched.
+static std::string escape_unescaped_control_chars(const std::string & s) {
+    std::string out;
+    out.reserve(s.size() + 16);
+    bool in_string = false;
+    bool escaped = false;
+    for (char ch : s) {
+        if (in_string) {
+            if (escaped) { escaped = false; out += ch; continue; }
+            if (ch == '\\') { escaped = true; out += ch; continue; }
+            if (ch == '"') { in_string = false; out += ch; continue; }
+            unsigned char c = static_cast<unsigned char>(ch);
+            if (c < 0x20) {
+                char buf[8];
+                snprintf(buf, sizeof(buf), "\\u%04X", c);
+                out += buf;
+                continue;
+            }
+            out += ch;
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+        }
+        out += ch;
+    }
+    return out;
+}
+
 static void func_args_not_string(json & messages) {
     GGML_ASSERT(messages.is_array());
     for (auto & message : messages) {
@@ -1111,7 +1144,7 @@ static void func_args_not_string(json & messages) {
                     auto & args = tool_call["function"]["arguments"];
                     if (args.is_string()) {
                         try {
-                            args = json::parse(args.get<std::string>());
+                            args = json::parse(escape_unescaped_control_chars(args.get<std::string>()));
                         } catch (const std::exception & e) {
                             throw std::runtime_error("Failed to parse tool call arguments as JSON: " + std::string(e.what()));
                         }
