@@ -6387,6 +6387,24 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // LiteLLM-style model discovery: clients such as LiteLLM and BYOK consumers
+    // list models on /v1/model/info rather than /v1/models.
+    this->get_models_litellm = [this](const server_http_req &) {
+        auto res = create_response(true);
+        json data = json::array({
+            {
+                {"model_name", meta->model_name},
+                {"litellm_params", {{"model", meta->model_name}}},
+                {"model_info", {
+                    {"litellm_provider", "openai"},
+                    {"supports_function_calling", true},
+                }},
+            },
+        });
+        res->ok(data);
+        return res;
+    };
+
     this->get_models = [this](const server_http_req &) {
         auto res = create_response(true);
         // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
