@@ -304,6 +304,7 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * s_copy;  // I32 [n_rs]
+    ggml_tensor * s_copy_snapshots = nullptr; // I32 [(n_rs - n_seqs)*n_rs_seq]
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
@@ -311,6 +312,8 @@ public:
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
     const llama_memory_recurrent_context * mctx;
+
+    bool can_reuse(const llama_memory_recurrent_context * mctx, const llama_ubatch & ubatch);
 
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
