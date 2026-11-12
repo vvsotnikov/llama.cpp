@@ -315,6 +315,9 @@ public:
     ggml_tensor * s_copy_s      = nullptr;
     ggml_tensor * s_copy_s_main = nullptr;
     ggml_tensor * gdn_ctl       = nullptr;
+    ggml_tensor * tree_parent   = nullptr;
+    ggml_tensor * tree_conv     = nullptr;
+    int32_t       tree_slots    = 0;
 
 
     const llama_memory_recurrent_context * mctx;

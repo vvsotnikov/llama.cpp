@@ -4,11 +4,13 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "llama.h"
+#include "llama-tree.h"
 #include "log.h"
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "speculative-tree.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
@@ -20,6 +22,7 @@
 #include <iomanip>
 #include <map>
 #include <random>
+#include <queue>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1012,6 +1015,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_dflash2     = false;
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
+    bool tree_enabled = false;
 
     // DFlash2 probabilistic drafting: one generator per sequence and the seed it was last seeded with (-1: reseed)
     std::vector<std::mt19937> dflash2_rng;
@@ -1074,6 +1078,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
         is_dflash2     = selector_top_k > 0;
+        const char * tree_env = getenv("LLAMA_DFLASH_TREE");
+        tree_enabled = is_dflash2 && tree_env && std::atoi(tree_env) != 0;
+        if (tree_enabled) {
+            if (n_seq != 1 || !llama_tree_supported(ctx_tgt) || this->params.n_max > 31 ||
+                    selector_top_k > 20 || n_embd_dec < 2 * selector_top_k * (selector_top_k + 1)) {
+                throw std::runtime_error("DFlash2 trees require a CUDA Qwen35 C1 replay context and at most 31 draft nodes");
+            }
+            block_size = std::max(block_size, this->params.n_max + 1);
+            LOG_INF("%s: DFlash2 trees enabled: budget=%d, block=%d\n", __func__, this->params.n_max, block_size);
+        }
         dflash2_rng.resize(n_seq);
         dflash2_seed.assign(n_seq, -1);
         char lilicorr_meta[32] = {};
@@ -1266,7 +1280,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         const int32_t   row        = i_batch_beg[seq_id] + offset + i;
                         const llama_pos p          = batch_in.tokens[row].pos[0];
                         const llama_pos pos_arr[4] = { p, p, p, 0 };
-                        batch_inject.add_embd_row(row, pos_arr, seq_id, false);
+                        const int32_t mapped = batch_in.tokens[row].embd_row;
+                        batch_inject.add_embd_row(mapped >= 0 ? mapped : row, pos_arr, seq_id, false);
                     }
 
                     const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
@@ -1288,7 +1303,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        const int32_t row = i_batch_beg[seq_id] + offset + i;
+                        const int32_t mapped = batch_in.tokens[row].embd_row;
+                        const float * src = layer + (size_t) (mapped >= 0 ? mapped : row) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
@@ -1392,6 +1409,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // Both DFlash and LiliCorr greedily walk the candidate lattice.
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+                if (tree_enabled && dp.result_parents) {
+                    const auto nodes = common_tree_grow(
+                            lattice + (size_t) beg * n_embd_dec, n_block_tokens, n_embd_dec,
+                            selector_top_k, params.n_max, dp.seed, dp.pos0, dp.temp);
+                    auto & parents = *dp.result_parents;
+                    parents.assign(1, -1);
+                    for (const auto & node : nodes) {
+                        result.push_back(node.token);
+                        parents.push_back(node.parent);
+                    }
+                    if (result.empty()) {
+                        parents.clear();
+                    }
+                    continue;
+                }
 
                 // DFlash2 can instead sample each step and hand q to the verifier for rejection sampling
                 const bool sample = is_dflash2 && params.probabilistic && dp.result_q;
@@ -3072,6 +3105,9 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
+                        if (dp.result_parents && !dp.result_parents->empty()) {
+                            dp.result_parents->resize(dp.n_max + 1);
+                        }
 
                         // trim the candidates only if the drafter produced them (n-gram drafters do not)
                         if (dp.result_q && !dp.result_q->empty()) {

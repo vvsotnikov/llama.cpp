@@ -13,6 +13,8 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
+#include "llama-tree.h"
+#include "llama-memory-hybrid.h"
 
 #include <atomic>
 #include <cinttypes>
@@ -1682,7 +1684,12 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch_in, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    llama_ubatch ubatch = ubatch_in;
+    if (!tree_parents.empty()) {
+        GGML_ASSERT(ubatch.n_tokens == tree_parents.size() && ubatch.n_seqs == 1);
+        ubatch.tree_parent = tree_parents.data();
+    }
     if (graph_workspaces_enabled && !graph_reuse_disable && model.arch == LLM_ARCH_DFLASH && cparams.ctx_other &&
             cparams.n_seq_max == 1 && !cparams.pipeline_parallel && !model.no_alloc() && !opt_ctx) {
         graph_workspace_select(ubatch.token != nullptr);
@@ -5253,4 +5260,68 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+bool llama_tree_supported(const llama_context * ctx) {
+    if (!ctx || ctx->n_seq_max() != 1 || ctx->get_model().arch != LLM_ARCH_QWEN35 || ctx->get_model().hparams.ssm_d_state != 128) {
+        return false;
+    }
+    const auto * mem = dynamic_cast<const llama_memory_hybrid *>(ctx->get_memory());
+    return mem && mem->get_mem_recr()->gdn_replay;
+}
+
+int llama_tree_decode(llama_context * ctx, llama_batch_ext * batch, const int32_t * parents, int32_t n) {
+    if (!llama_tree_supported(ctx) || !batch || !parents || n < 1 || n > 32 ||
+            (size_t) n != batch->tokens.size() || (uint32_t) n > ctx->n_ubatch() ||
+            !ctx->tree_parents.empty() || parents[0] != -1) {
+        return -1;
+    }
+    auto * mem = static_cast<llama_memory_hybrid *>(ctx->get_memory())->get_mem_recr();
+    if ((uint32_t) n > mem->gdn_w) {
+        return -1;
+    }
+    const llama_pos pos0 = batch->tokens[0].pos[0];
+    for (int32_t i = 0; i < n; ++i) {
+        const auto & token = batch->tokens[i];
+        if ((i && (parents[i] < 0 || parents[i] >= i)) || token.has_embd || !token.output ||
+                token.seq_ids.size() != 1 || !token.seq_ids.count(0) || token.pos[0] != pos0 + i) {
+            return -1;
+        }
+    }
+    ctx->tree_pos0 = pos0;
+    ctx->tree_parents.assign(parents, parents + n);
+    const int rc = ctx->decode(*batch);
+    if (rc != 0) {
+        ctx->tree_parents.clear();
+    }
+    return rc;
+}
+
+bool llama_tree_commit(llama_context * ctx, const int32_t * rows, int32_t n) {
+    if (!llama_tree_supported(ctx) || !rows || n < 1 || (size_t) n > ctx->tree_parents.size() || rows[0] != 0) {
+        return false;
+    }
+    for (int32_t i = 0; i < n; ++i) {
+        if (rows[i] < 0 || (size_t) rows[i] >= ctx->tree_parents.size() ||
+                (i && ctx->tree_parents[rows[i]] != rows[i - 1])) {
+            return false;
+        }
+    }
+    auto * mem = static_cast<llama_memory_hybrid *>(ctx->get_memory());
+    auto * rec = mem->get_mem_recr();
+    const int32_t tail = rec->cells[0].tail;
+    if (tail < 0 || rec->replay_n != ctx->tree_parents.size()) {
+        return false;
+    }
+    ctx->synchronize();
+    if (!mem->get_mem_attn()->tree_commit(0, ctx->tree_pos0, ctx->tree_parents, rows, n)) {
+        return false;
+    }
+    rec->set_rs_idx(0, ctx->tree_parents.size() - 1 - rows[n - 1]);
+    rec->cells[tail].pos = ctx->tree_pos0 + n - 1;
+    rec->cells[tail].rs_max = 0;
+    rec->replay_n = n;
+    rec->replay_rows.assign(rows, rows + n);
+    ctx->tree_parents.clear();
+    return true;
 }

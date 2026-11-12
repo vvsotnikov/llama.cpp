@@ -13,7 +13,238 @@ struct gdn_replay_args {
     int64_t     row;     // floats per token row: k [S_v*n_k_heads], v [S_v*H], g [H*(KDA ? S_v : 1)], beta [H]
     int64_t     w;       // token rows per half
     int64_t     n_k_heads;
+    bool        indexed;
 };
+
+template <int S_v, bool prefix_committed = false>
+__global__ void gated_delta_net_tree_cuda(
+        const float * q, const float * k, const float * v, const float * g, const float * beta,
+        const float * initial, float * dst, float * committed, const int32_t * parents,
+        int64_t H, int64_t sq1, int64_t sq2, int64_t sv1, int64_t sv2, int64_t sb1, int64_t sb2,
+        uint3 neqk1_magic, float scale, gdn_replay_args rp) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+    constexpr int lanes = warp_size / gdn_cols_per_warp;
+    constexpr int nr = S_v / lanes;
+    const int h = blockIdx.x;
+    const int node = blockIdx.y;
+    const int lane = threadIdx.x % lanes;
+    const int cg = threadIdx.x / lanes;
+    const int col = (blockIdx.z * blockDim.y + threadIdx.y) * gdn_cols_per_warp + cg;
+    const int kh = fastmodulo(h, neqk1_magic);
+    const int64_t off_v = S_v * rp.n_k_heads;
+    const int64_t off_g = off_v + S_v * H;
+    const int64_t off_b = off_g + H;
+    const int64_t state_off = (int64_t) h * S_v * S_v + col * S_v;
+    float s[nr];
+    __shared__ int path[32];
+    __shared__ int depth;
+    ggml_cuda_pdl_sync();
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        int n = 0;
+        for (int p = node; p >= 0; p = parents[p]) {
+            path[n++] = p;
+        }
+        depth = n;
+    }
+#pragma unroll
+    for (int r = 0; r < nr; ++r) {
+        s[r] = initial[state_off + r * lanes + lane];
+    }
+    const float * read = rp.stash + (int64_t) rp.ctl[1] * rp.w * rp.row;
+    float * write = rp.stash + (int64_t) (1 - rp.ctl[1]) * rp.w * rp.row;
+    for (int t = 0; !prefix_committed && t < rp.ctl[0]; ++t) {
+        const int row_idx = rp.indexed ? rp.ctl[3 + t] : t;
+        const float * row = read + row_idx * rp.row;
+        const float decay = expf(row[off_g + h]);
+        float kr[nr];
+        float dot = 0.0f;
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            kr[r] = row[kh * S_v + r * lanes + lane];
+            dot += s[r] * kr[r];
+        }
+        const float delta = (row[off_v + h * S_v + col] - decay * warp_reduce_sum<lanes>(dot)) * row[off_b + h];
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            s[r] = decay * s[r] + kr[r] * delta;
+        }
+    }
+    if (!prefix_committed && node == 0) {
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            committed[state_off + r * lanes + lane] = s[r];
+        }
+    }
+    __syncthreads();
+    for (int d = depth - 1; d >= 0; --d) {
+        const int t = path[d];
+        const float * kt = k + kh * sq1 + t * sq2;
+        const float * vt = v + h * sv1 + t * sv2;
+        const float decay_log = g[h * sb1 + t * sb2];
+        const float b = beta[h * sb1 + t * sb2];
+        const float decay = expf(decay_log);
+        float kr[nr];
+        float dot = 0.0f;
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            kr[r] = kt[r * lanes + lane];
+            dot += s[r] * kr[r];
+        }
+        const float delta = (vt[col] - decay * warp_reduce_sum<lanes>(dot)) * b;
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            s[r] = decay * s[r] + kr[r] * delta;
+        }
+        if (t == node) {
+            float * row = write + t * rp.row;
+            const bool first = blockIdx.z == 0 && threadIdx.y == 0 && cg == 0;
+            if (first && h < rp.n_k_heads) {
+#pragma unroll
+                for (int r = 0; r < nr; ++r) {
+                    row[h * S_v + r * lanes + lane] = k[h * sq1 + t * sq2 + r * lanes + lane];
+                }
+            }
+            if (lane == 0) {
+                row[off_v + h * S_v + col] = vt[col];
+            }
+            if (first && lane == 0) {
+                row[off_g + h] = decay_log;
+                row[off_b + h] = b;
+            }
+        }
+    }
+    const float * qt = q + kh * sq1 + node * sq2;
+    float out = 0.0f;
+#pragma unroll
+    for (int r = 0; r < nr; ++r) {
+        out += s[r] * qt[r * lanes + lane];
+    }
+    out = warp_reduce_sum<lanes>(out);
+    if (lane == 0) {
+        dst[((int64_t) node * H + h) * S_v + col] = out * scale;
+    }
+}
+
+template <int S_v, int SLOTS, int WARPS>
+__global__ void gated_delta_net_tree_slots_cuda(
+        const float * q, const float * k, const float * v, const float * g, const float * beta,
+        const float * initial, float * dst, float * committed, const int32_t * parents,
+        int64_t H, int32_t n_tokens, int64_t sq1, int64_t sq2, int64_t sv1, int64_t sv2, int64_t sb1, int64_t sb2,
+        uint3 neqk1_magic, float scale, gdn_replay_args rp) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+    constexpr int lanes = warp_size / gdn_cols_per_warp;
+    constexpr int nr = S_v / lanes;
+    const int h = blockIdx.x;
+    const int lane = threadIdx.x % lanes;
+    const int cg = threadIdx.x / lanes;
+    const int col = (blockIdx.z * blockDim.y + threadIdx.y) * gdn_cols_per_warp + cg;
+    const int kh = fastmodulo(h, neqk1_magic);
+    const int64_t off_v = S_v * rp.n_k_heads;
+    const int64_t off_g = off_v + S_v * H;
+    const int64_t off_b = off_g + H;
+    const int64_t state_off = (int64_t) h * S_v * S_v + col * S_v;
+    float root[nr], s[nr];
+    __shared__ float kept[SLOTS][WARPS][nr][warp_size];
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int r = 0; r < nr; ++r) {
+        s[r] = initial[state_off + r * lanes + lane];
+    }
+    const float * read = rp.stash + (int64_t) rp.ctl[1] * rp.w * rp.row;
+    float * write = rp.stash + (int64_t) (1 - rp.ctl[1]) * rp.w * rp.row;
+    for (int t = 0; t < rp.ctl[0]; ++t) {
+        const int row_idx = rp.indexed ? rp.ctl[3 + t] : t;
+        const float * row = read + row_idx * rp.row;
+        const float decay = expf(row[off_g + h]);
+        float kr[nr];
+        float dot = 0.0f;
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            kr[r] = row[kh * S_v + r * lanes + lane];
+            dot += s[r] * kr[r];
+        }
+        const float delta = (row[off_v + h * S_v + col] - decay * warp_reduce_sum<lanes>(dot)) * row[off_b + h];
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            s[r] = decay * s[r] + kr[r] * delta;
+        }
+    }
+    {
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            committed[state_off + r * lanes + lane] = s[r];
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < nr; ++r) {
+        root[r] = s[r];
+    }
+    const int32_t * steps = parents + n_tokens;
+    for (int item = 0; item < n_tokens; ++item) {
+        const int t = steps[3 * item];
+        const int read_slot = steps[3 * item + 1];
+        const int write_slot = steps[3 * item + 2];
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            if (read_slot == -1) {
+                s[r] = root[r];
+            } else if (read_slot >= 0) {
+                s[r] = kept[read_slot][threadIdx.y][r][threadIdx.x];
+            }
+        }
+        const float * kt = k + kh * sq1 + t * sq2;
+        const float * vt = v + h * sv1 + t * sv2;
+        const float decay_log = g[h * sb1 + t * sb2];
+        const float b = beta[h * sb1 + t * sb2];
+        const float decay = expf(decay_log);
+        float kr[nr];
+        float dot = 0.0f;
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            kr[r] = kt[r * lanes + lane];
+            dot += s[r] * kr[r];
+        }
+        const float delta = (vt[col] - decay * warp_reduce_sum<lanes>(dot)) * b;
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            s[r] = decay * s[r] + kr[r] * delta;
+        }
+        {
+            float * row = write + t * rp.row;
+            const bool first = blockIdx.z == 0 && threadIdx.y == 0 && cg == 0;
+            if (first && h < rp.n_k_heads) {
+#pragma unroll
+                for (int r = 0; r < nr; ++r) {
+                    row[h * S_v + r * lanes + lane] = k[h * sq1 + t * sq2 + r * lanes + lane];
+                }
+            }
+            if (lane == 0) {
+                row[off_v + h * S_v + col] = vt[col];
+            }
+            if (first && lane == 0) {
+                row[off_g + h] = decay_log;
+                row[off_b + h] = b;
+            }
+        }
+        if (write_slot >= 0) {
+#pragma unroll
+            for (int r = 0; r < nr; ++r) {
+                kept[write_slot][threadIdx.y][r][threadIdx.x] = s[r];
+            }
+        }
+        const float * qt = q + kh * sq1 + t * sq2;
+        float out = 0.0f;
+#pragma unroll
+        for (int r = 0; r < nr; ++r) {
+            out += s[r] * qt[r * lanes + lane];
+        }
+        out = warp_reduce_sum<lanes>(out);
+        if (lane == 0) {
+            dst[((int64_t) t * H + h) * S_v + col] = out * scale;
+        }
+        __syncwarp();
+    }
+}
 
 template <int S_v, bool KDA, bool keep_rs_t, int cols_per_warp = gdn_cols_per_warp, bool replay = false>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -96,7 +327,7 @@ gated_delta_net_cuda(const float * q,
         const float * st_rd = rp.stash + (int64_t) read_half * rp.w * rp.row;
         st_wr = rp.stash + (int64_t) (1 - read_half) * rp.w * rp.row;
         for (int t = 0; t < n_prefix; t++) {
-            const float * row    = st_rd + t * rp.row;
+            const float * row    = st_rd + (rp.indexed ? rp.ctl[3 + t] : t) * rp.row;
             const float * k_t    = row + iq1 * S_v;
             const float * g_t    = row + off_g + h_idx * (KDA ? S_v : 1);
             const float beta_val = row[off_b + h_idx];
@@ -461,13 +692,61 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
-    gdn_replay_args rp = { nullptr, nullptr, 0, 0, neqk1 };
+    gdn_replay_args rp = { nullptr, nullptr, 0, 0, neqk1, false };
     if (const ggml_tensor * stash = dst->src[6]) {
         GGML_ASSERT(!keep_rs && n_seqs == 1 && src_k->ne[0] == S_v);
         rp.stash = (float *) stash->data;
         rp.ctl   = (const int *) dst->src[7]->data;
         rp.row   = stash->ne[0];
         rp.w     = stash->ne[1] / 2;
+        rp.indexed = ggml_nelements(dst->src[7]) > 3;
+        if (dst->src[8]) {
+            GGML_ASSERT(!kda && S_v == 128 && n_tokens <= rp.w && n_tokens <= 32);
+            const int warp = std::min(128, ggml_cuda_info().devices[ctx.device].warp_size);
+            const int slots = ggml_get_op_params_i32(dst, 1);
+            if (slots) {
+                GGML_ASSERT(dst->src[8]->ne[0] == 4 * n_tokens);
+                auto scan = [&](auto count) {
+                    constexpr int N = decltype(count)::value;
+                    constexpr int W = N <= 4 ? 4 : 16 / N;
+                    const auto launch = ggml_cuda_kernel_launch_params(dim3(H, 1, 128 / (W * gdn_cols_per_warp)), dim3(warp, W), 0, stream);
+                    ggml_cuda_kernel_launch(gated_delta_net_tree_slots_cuda<128, N, W>, launch,
+                            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, (const int32_t *) dst->src[8]->data,
+                            H, (int32_t) n_tokens, sq1, sq2, sv1, sv2, sb1, sb2, init_fastdiv_values(neqk1), scale, rp);
+                };
+                switch (slots) {
+                    case  1: scan(std::integral_constant<int,  1>{}); break;
+                    case  2: scan(std::integral_constant<int,  2>{}); break;
+                    case  4: scan(std::integral_constant<int,  4>{}); break;
+                    case  8: scan(std::integral_constant<int,  8>{}); break;
+                    case 16: scan(std::integral_constant<int, 16>{}); break;
+                    default: GGML_ABORT("invalid recurrent tree slot count");
+                }
+                return;
+            }
+            const dim3 threads(warp, 4);
+            const dim3 blocks(H, n_tokens, 128 / (4 * gdn_cols_per_warp));
+            const auto launch = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+            static const bool commit_once = [] {
+                const char * value = std::getenv("GGML_CUDA_TREE_COMMIT_ONCE");
+                return value && strcmp(value, "1") == 0;
+            }();
+            if (commit_once) {
+                // Every node shares the same pending prefix. Materialize it once rather
+                // than replaying it independently for all nodes in the tree.
+                launch_gated_delta_net<false, false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+                    S_v, H, 0, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, rp, stream);
+                ggml_cuda_kernel_launch((gated_delta_net_tree_cuda<128, true>), launch, q_d, k_d, v_d, g_d, b_d,
+                        state_d, dst_d, state_d, (const int32_t *) dst->src[8]->data,
+                        H, sq1, sq2, sv1, sv2, sb1, sb2, init_fastdiv_values(neqk1), scale, rp);
+                return;
+            }
+            ggml_cuda_kernel_launch(gated_delta_net_tree_cuda<128>, launch, q_d, k_d, v_d, g_d, b_d,
+                    s_d, dst_d, state_d, (const int32_t *) dst->src[8]->data,
+                    H, sq1, sq2, sv1, sv2, sb1, sb2, init_fastdiv_values(neqk1), scale, rp);
+            return;
+        }
         if (!kda && n_tokens > rp.w && n_tokens >= 64) {
             // Commit the pending prefix before the existing tensor-core prefill.
             // Separate storage keeps the MMA readers independent of its state writers.

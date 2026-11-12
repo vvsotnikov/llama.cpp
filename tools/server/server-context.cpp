@@ -19,6 +19,8 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "llama-tree.h"
+#include "../../src/llama-ext.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 #include "base64.hpp"
@@ -293,6 +295,7 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    std::vector<int32_t> spec_tree;
 
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
@@ -467,6 +470,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_tree.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -598,6 +602,17 @@ struct server_slot {
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
     bool use_spec_rejection() const {
         return task && task->params.sampling.temp > 0.0f;
+    }
+
+    bool use_spec_tree() const {
+        const char * env = getenv("LLAMA_DFLASH_TREE");
+        if (!task || !can_speculate() || !ctx_dft || !llama_tree_supported(ctx_tgt) ||
+                llama_model_dflash_selector_top_k(llama_get_model(ctx_dft)) == 0 || !env || atoi(env) == 0) {
+            return false;
+        }
+        const auto & s = task->params.sampling;
+        return s.temp > 0 && s.penalty_repeat == 1 && s.penalty_freq == 0 && s.penalty_present == 0 &&
+            s.dry_multiplier == 0 && s.adaptive_target < 0 && s.mirostat == 0 && s.xtc_probability == 0;
     }
 
     void add_token(const completion_token_output & token) {
@@ -3931,6 +3946,7 @@ private:
 
                     // stale candidates: a replay never reads them, a new draft refills them
                     slot.spec_draft_q.clear();
+                    slot.spec_tree.clear();
 
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
@@ -3962,7 +3978,8 @@ private:
                             /* .result   = */ &slot.spec_draft,
                             /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
                             /* .temp     = */ slot.task->params.sampling.temp,
-                            /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .seed     = */ slot.use_spec_tree() ? common_sampler_get_seed(slot.smpl.get()) : slot.task->params.sampling.seed,
+                            /* .result_parents = */ slot.use_spec_tree() ? &slot.spec_tree : nullptr,
                         };
 
                         drafting.push_back(&slot);
@@ -4755,7 +4772,8 @@ private:
         }
 
         // Prepare device feature consumption before waiting for the target when supported.
-        const bool process_spec_early = common_speculative_can_process_async(spec.get());
+        const bool tree_batch = slots.size() == 1 && !slots.front().spec_tree.empty();
+        const bool process_spec_early = !tree_batch && common_speculative_can_process_async(spec.get());
         bool spec_ok = true;
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -4765,7 +4783,8 @@ private:
             slots.front().checkpoint_restored = nullptr;
         }
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            ret = tree_batch ? llama_tree_decode(ctx_tgt, batch.view.get(), slots.front().spec_tree.data(), slots.front().spec_tree.size()) :
+                llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && process_spec_early) {
                 spec_ok = common_speculative_process(spec.get(), batch.view);
             }
@@ -4830,7 +4849,7 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (spec) {
+        if (spec && !tree_batch) {
             bool ok = spec_ok;
             if (!process_spec_early) {
                 queue_tasks.yield_to_queue([&]() {
@@ -4953,7 +4972,9 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                id = slot.use_spec_tree() ? common_sampler_sample_tree(slot.smpl.get(), slot.ctx_tgt, tok_idx,
+                        common_sampler_get_seed(slot.smpl.get()), slot.prompt.tokens.pos_next()) :
+                    common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
 
             slot.i_batch = -1;
@@ -5025,7 +5046,27 @@ private:
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
                 std::vector<llama_token> accepted;
-                if (!synth_probs.empty()) {
+                const bool use_tree = !slot.spec_tree.empty();
+                if (use_tree) {
+                    GGML_ASSERT(!use_ckpt_tgt && synth_probs.empty() && !slot.spec_is_replay);
+                    std::vector<int32_t> kept;
+                    const auto pos0 = slot.prompt.tokens.pos_next() - n_draft - 1;
+                    accepted = common_sampler_sample_and_accept_tree(slot.smpl.get(), slot.ctx_tgt,
+                            spec_i_batch, slot.spec_draft, slot.spec_tree, kept,
+                            common_sampler_get_seed(slot.smpl.get()), pos0);
+                    common_batch selected(slot.ctx_tgt);
+                    std::vector<int> selected_idxs;
+                    for (size_t i = 0; i < kept.size(); ++i) {
+                        const int32_t row = kept[i];
+                        selected.add(row == 0 ? slot.sampled : slot.spec_draft[row - 1], pos0 + i, slot.id, true);
+                        selected.tokens.back().embd_row = spec_i_batch[row];
+                        selected_idxs.push_back(spec_i_batch[row]);
+                    }
+                    GGML_ASSERT(llama_tree_commit(slot.ctx_tgt, kept.data(), kept.size()));
+                    GGML_ASSERT(common_speculative_process(spec.get(), selected));
+                    spec_i_batch = std::move(selected_idxs);
+                    slot.spec_tree.clear();
+                } else if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
@@ -5043,7 +5084,7 @@ private:
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 // check for partial draft acceptance
-                if (n_rollback > 0) {
+                if (!use_tree && n_rollback > 0) {
                     if (use_ckpt_tgt) {
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());

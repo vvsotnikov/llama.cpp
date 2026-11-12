@@ -76,6 +76,9 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
+    std::vector<int32_t> tree_parents;
+    llama_pos tree_pos0 = 0;
+
     // return true if the memory was updated
     bool memory_update(bool optimize);
 

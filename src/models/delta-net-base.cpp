@@ -469,6 +469,34 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
+    if (inp->tree_parent) {
+        if (!inp->tree_conv) {
+            inp->tree_conv = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, conv_kernel_size * ubatch.n_tokens);
+            ggml_set_input(inp->tree_conv);
+            ggml_set_name(inp->tree_conv, "tree_conv_rows");
+        }
+        ggml_tensor * rows = ggml_cont(ctx0, ggml_transpose(ctx0, conv_input));
+        rows = ggml_get_rows(ctx0, rows, inp->tree_conv);
+        rows = ggml_reshape_3d(ctx0, rows, conv_channels, conv_kernel_size, ubatch.n_tokens);
+        conv_input = ggml_cont(ctx0, ggml_permute(ctx0, rows, 1, 0, 2, 3));
+
+        const int64_t K = cparams.n_rs_seq + 1;
+        GGML_ASSERT(ubatch.n_tokens <= K && n_seqs == 1);
+        if (!inp->s_slot_rev) {
+            inp->s_slot_rev = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+            ggml_set_input(inp->s_slot_rev);
+        }
+        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels,
+                ubatch.n_tokens, conv_input->nb[1], conv_input->nb[2], sizeof(float));
+        ggml_tensor * windows = ggml_permute(ctx0, tail, 0, 2, 1, 3);
+        const size_t row_size = ggml_row_size(conv_states_all->type, (conv_kernel_size - 1) * conv_channels);
+        ggml_tensor * slots = ggml_view_4d(ctx0, conv_states_all,
+                conv_kernel_size - 1, K, conv_channels, 1, (size_t) mem_size * row_size,
+                ggml_row_size(conv_states_all->type, conv_kernel_size - 1), conv_states_all->nb[1], kv_head * row_size);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, slots, windows, inp->s_slot_rev));
+        return conv_input;
+    }
+
     const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
@@ -561,6 +589,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             ggml_tensor * gdn = output->view_src;
             GGML_ASSERT(gdn && gdn->op == GGML_OP_GATED_DELTA_NET && "the deferred commit needs the fused gated delta net");
             ggml_gated_delta_net_set_replay(gdn, mctx_cur->get_st_l(il), inp->gdn_ctl);
+            if (inp->tree_parent) {
+                GGML_ASSERT(g->ne[0] == 1 && n_seq_tokens <= 32);
+                gdn->src[8] = inp->tree_parent;
+                gdn->op_params[1] = inp->tree_slots;
+            }
         }
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);

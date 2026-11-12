@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmq-few.cuh"
 #include "ggml-cuda/iq3-fragment.cuh"
+#include "ggml-cuda/iq4-fragment.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -795,7 +796,7 @@ struct ggml_backend_cuda_buffer_context {
         cudaEvent_t ready;
     };
     std::mutex fragment_mutex;
-    std::unordered_map<const void *, fragment_entry> iq3_fragments;
+    std::unordered_map<const void *, fragment_entry> quant_fragments;
 
     static constexpr size_t input_slot_bytes = 64*1024;
     struct input_slot {
@@ -809,7 +810,7 @@ struct ggml_backend_cuda_buffer_context {
 
     void invalidate_fragments() {
         std::lock_guard<std::mutex> lock(fragment_mutex);
-        for (auto & entry : iq3_fragments) entry.second.dirty = true;
+        for (auto & entry : quant_fragments) entry.second.dirty = true;
     }
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -828,7 +829,7 @@ struct ggml_backend_cuda_buffer_context {
         if (input_staging) {
             CUDA_CHECK(cudaFreeHost(input_staging));
         }
-        for (auto & entry : iq3_fragments) {
+        for (auto & entry : quant_fragments) {
             CUDA_CHECK(cudaFree(entry.second.data));
             CUDA_CHECK(cudaEventDestroy(entry.second.ready));
         }
@@ -2245,11 +2246,33 @@ static bool ggml_cuda_iq3_fragment_matches(const ggml_tensor * node, int device)
         x->ne[0]>=2048 && x->ne[0]%256==0 && x->ne[1]>=5120 && x->ne[1]%16==0 && y->ne[1]==8;
 }
 
-static thread_local ggml_backend_cuda_context * iq3_fragment_graph_owner = nullptr;
+static bool ggml_cuda_iq4_fragment_matches(const ggml_tensor * node, int device) {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_IQ4_FRAGMENT");
+    if (!enabled || !ampere_mma_available(ggml_cuda_info().devices[device].cc) || node->op != GGML_OP_MUL_MAT ||
+            ggml_get_op_params_i32(node, 1) != GGML_HINT_NONE) {
+        return false;
+    }
+    const auto x = node->src[0], y = node->src[1];
+    return x && y && x->buffer && ggml_backend_buffer_is_cuda(x->buffer) &&
+        ((ggml_backend_cuda_buffer_context *) x->buffer->context)->device == device &&
+        ggml_backend_buffer_get_usage(x->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        !(x->flags & GGML_TENSOR_FLAG_PARAM) && !x->view_src &&
+        x->type == GGML_TYPE_IQ4_XS && y->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+        ggml_is_matrix(x) && ggml_is_matrix(y) && ggml_is_contiguous(x) && ggml_is_contiguous(y) && ggml_is_contiguous(node) &&
+        ggml_cuda_is_aligned(x, sizeof(uint32_t)) && ggml_cuda_is_aligned(y, sizeof(float4)) &&
+        ggml_nbytes(x) / 4 <= INT_MAX && x->ne[1] <= INT_MAX && x->ne[0] <= INT_MAX &&
+        x->ne[0] >= 2048 && x->ne[0] % 256 == 0 && x->ne[1] >= 5120 && x->ne[1] % 16 == 0 && y->ne[1] == 16;
+}
 
-static void ggml_cuda_prepare_iq3_fragments(ggml_backend_cuda_context & ctx, ggml_cgraph * graph) {
-    iq3_fragment_graph_owner = nullptr;
-    if (!ggml_cuda_iq3_fragment_enabled()) return;
+static bool ggml_cuda_quant_fragment_matches(const ggml_tensor * node, int device) {
+    return ggml_cuda_iq3_fragment_matches(node, device) || ggml_cuda_iq4_fragment_matches(node, device);
+}
+
+static thread_local ggml_backend_cuda_context * quant_fragment_graph_owner = nullptr;
+
+static void ggml_cuda_prepare_quant_fragments(ggml_backend_cuda_context & ctx, ggml_cgraph * graph) {
+    quant_fragment_graph_owner = nullptr;
+    if (!ggml_cuda_iq3_fragment_enabled() && !ggml_cuda_env_flag("GGML_CUDA_IQ4_FRAGMENT")) return;
     bool writes_weights = false;
     for (int i = 0; i < graph->n_nodes; ++i) {
         const auto node = graph->nodes[i];
@@ -2265,23 +2288,23 @@ static void ggml_cuda_prepare_iq3_fragments(ggml_backend_cuda_context & ctx, ggm
         }
     }
     if (writes_weights) return;
-    iq3_fragment_graph_owner = &ctx;
+    quant_fragment_graph_owner = &ctx;
     for (int i=0;i<graph->n_nodes;++i) {
         auto node=graph->nodes[i];
-        if (!ggml_cuda_iq3_fragment_matches(node,ctx.device)) continue;
+        if (!ggml_cuda_quant_fragment_matches(node,ctx.device)) continue;
         auto x=node->src[0]; auto buffer=(ggml_backend_cuda_buffer_context *)x->buffer->context;
         if (buffer->device!=ctx.device) continue;
         std::lock_guard<std::mutex> lock(buffer->fragment_mutex);
-        auto it=buffer->iq3_fragments.find(x->data);
+        auto it=buffer->quant_fragments.find(x->data);
         const size_t bytes=ggml_nbytes(x);
-        if (it==buffer->iq3_fragments.end()) {
+        if (it==buffer->quant_fragments.end()) {
             size_t available,total;CUDA_CHECK(cudaMemGetInfo(&available,&total));
             if (available<bytes || available-bytes<(size_t(1)<<30)) continue;
             void * data=nullptr;auto error=cudaMalloc(&data,bytes);
             if (error!=cudaSuccess) { cudaGetLastError();continue; }
             cudaEvent_t ready;
             CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
-            it=buffer->iq3_fragments.emplace(x->data,ggml_backend_cuda_buffer_context::fragment_entry{data,bytes,x->ne[0],x->ne[1],true,ctx.stream(),ready}).first;
+            it=buffer->quant_fragments.emplace(x->data,ggml_backend_cuda_buffer_context::fragment_entry{data,bytes,x->ne[0],x->ne[1],true,ctx.stream(),ready}).first;
             GGML_LOG_INFO("%s: prepared %s, extra storage %.2f MiB\n",__func__,x->name,bytes/1048576.0);
         }
         if (it->second.size!=bytes || it->second.k!=x->ne[0] || it->second.n!=x->ne[1]) continue;
@@ -2289,7 +2312,11 @@ static void ggml_cuda_prepare_iq3_fragments(ggml_backend_cuda_context & ctx, ggm
             CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), it->second.ready, 0));
         }
         if (it->second.dirty) {
-            ggml_cuda_iq3_fragment_prepare(x,it->second.data,ctx.stream());
+            if (x->type == GGML_TYPE_IQ4_XS) {
+                ggml_cuda_iq4_fragment_prepare(x, it->second.data, ctx.stream());
+            } else {
+                ggml_cuda_iq3_fragment_prepare(x, it->second.data, ctx.stream());
+            }
             CUDA_CHECK(cudaEventRecord(it->second.ready, ctx.stream()));
             it->second.producer = ctx.stream();
             it->second.dirty=false;
@@ -2299,6 +2326,16 @@ static void ggml_cuda_prepare_iq3_fragments(ggml_backend_cuda_context & ctx, ggm
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (src0->type == GGML_TYPE_IQ4_XS && src1->type == GGML_TYPE_F32 &&
+            ggml_is_contiguous(src1) && !ggml_cuda_is_aligned(src1, sizeof(float4))) {
+        ggml_cuda_pool_alloc<float> aligned(ctx.pool(), ggml_nbytes(src1) / sizeof(float));
+        CUDA_CHECK(cudaMemcpyAsync(aligned.get(), src1->data, ggml_nbytes(src1), cudaMemcpyDeviceToDevice, ctx.stream()));
+        ggml_tensor input = *src1;
+        input.data = aligned.get();
+        ggml_cuda_mul_mat(ctx, src0, &input, dst);
+        return;
+    }
 
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
@@ -2357,13 +2394,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
-    if (iq3_fragment_graph_owner == &ctx && ggml_cuda_iq3_fragment_matches(dst,ctx.device)) {
+    if (quant_fragment_graph_owner == &ctx && ggml_cuda_quant_fragment_matches(dst,ctx.device)) {
         auto buffer=(ggml_backend_cuda_buffer_context *)src0->buffer->context;
         std::lock_guard<std::mutex> lock(buffer->fragment_mutex);
-        auto it=buffer->iq3_fragments.find(src0->data);
-        if (it!=buffer->iq3_fragments.end() && it->second.size==ggml_nbytes(src0) &&
+        auto it=buffer->quant_fragments.find(src0->data);
+        if (it!=buffer->quant_fragments.end() && it->second.size==ggml_nbytes(src0) &&
                 it->second.k==src0->ne[0] && it->second.n==src0->ne[1]) {
-            ggml_cuda_iq3_fragment_mul_mat(ctx,src0,src1,dst,it->second.data);
+            if (src0->type == GGML_TYPE_IQ4_XS) {
+                ggml_cuda_iq4_fragment_mul_mat(ctx, src0, src1, dst, it->second.data);
+            } else {
+                ggml_cuda_iq3_fragment_mul_mat(ctx,src0,src1,dst,it->second.data);
+            }
             return;
         }
     }
@@ -5462,7 +5503,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
-    ggml_cuda_prepare_iq3_fragments(*cuda_ctx,cgraph);
+    ggml_cuda_prepare_quant_fragments(*cuda_ctx,cgraph);
     bool graph_mode = false;
 #ifdef USE_CUDA_GRAPH
     static const bool graphs_disabled = getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;

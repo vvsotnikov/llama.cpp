@@ -6523,7 +6523,7 @@ void ggml_gated_delta_net_set_replay(
         struct ggml_tensor * ctl) {
     GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET && ggml_get_op_params_i32(gdn, 0) == 1);
     GGML_ASSERT(stash->type == GGML_TYPE_F32 && ggml_is_contiguous(stash) && stash->ne[1] % 2 == 0);
-    GGML_ASSERT(ctl->type == GGML_TYPE_I32 && ggml_nelements(ctl) == 3);
+    GGML_ASSERT(ctl->type == GGML_TYPE_I32 && (ggml_nelements(ctl) == 3 || ggml_nelements(ctl) == 3 + stash->ne[1] / 2));
     const struct ggml_tensor * k = gdn->src[1];
     const struct ggml_tensor * v = gdn->src[2];
     const struct ggml_tensor * g = gdn->src[3];

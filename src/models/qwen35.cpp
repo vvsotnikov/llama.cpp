@@ -404,6 +404,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(state, "state_predelta", il);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    if (inp->tree_parent) {
+        conv_output_proper = ggml_reshape_3d(ctx0, conv_output_proper, conv_channels, n_seq_tokens, 1);
+    }
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);

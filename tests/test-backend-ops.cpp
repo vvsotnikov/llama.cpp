@@ -5748,23 +5748,31 @@ static bool graph_mul_mat_hi_prec_act(ggml_cgraph * gf, ggml_op op) {
 }
 
 // GGML_OP_MUL_MAT
-// Keep immutable IQ3 weights in a weight buffer so prepared execution paths are exercised.
+// Keep immutable weights in a weight buffer so prepared execution paths are exercised.
 struct test_mul_mat_iq3_verify : public test_case {
     const int64_t m, n, k;
     const bool view;
+    const ggml_type type;
+    const int64_t input_offset;
 
-    test_mul_mat_iq3_verify(int64_t m, int64_t n, int64_t k, bool view = false) : m(m), n(n), k(k), view(view) {}
-    std::string vars() override { return VARS_TO_STR4(m, n, k, view); }
-    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_IQ3_VERIFY"; }
+    test_mul_mat_iq3_verify(int64_t m, int64_t n, int64_t k, bool view = false, ggml_type type = GGML_TYPE_IQ3_S, int64_t input_offset = 0) : m(m), n(n), k(k), view(view), type(type), input_offset(input_offset) {}
+    std::string vars() override { return VARS_TO_STR5(m, n, k, view, input_offset); }
+    std::string op_desc(ggml_tensor *) override { return type == GGML_TYPE_IQ4_XS ? "MUL_MAT_IQ4_VERIFY" : "MUL_MAT_IQ3_VERIFY"; }
     bool use_weight_context() override { return true; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
     ggml_tensor * build_graph(ggml_context * ctx) override { return build_graph(ctx, ctx); }
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * weights) override {
-        ggml_tensor * a = ggml_new_tensor_2d(weights, GGML_TYPE_IQ3_S, k, m + (view ? 16 : 0));
+        ggml_tensor * a = ggml_new_tensor_2d(weights, type, k, m + (view ? 16 : 0));
         ggml_set_name(a, "weight");
         if (view) a = ggml_view_2d(ctx, a, k, m, a->nb[1], 16*a->nb[1]);
-        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * b;
+        if (input_offset) {
+            b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k*n + input_offset);
+            b = ggml_view_2d(ctx, b, k, n, k*sizeof(float), input_offset*sizeof(float));
+        } else {
+            b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        }
         return ggml_mul_mat(ctx, a, b);
     }
 };
@@ -11676,6 +11684,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_iq3_verify(5136, 8, 2304));
     test_cases.emplace_back(new test_mul_mat_iq3_verify(5120, 8, 2048, true));
+    for (int64_t n : {8, 16, 17}) {
+        test_cases.emplace_back(new test_mul_mat_iq3_verify(5120, n, 2048, false, GGML_TYPE_IQ4_XS));
+    }
+    test_cases.emplace_back(new test_mul_mat_iq3_verify(5136, 16, 2304, false, GGML_TYPE_IQ4_XS));
+    test_cases.emplace_back(new test_mul_mat_iq3_verify(5120, 16, 2048, true, GGML_TYPE_IQ4_XS));
+    test_cases.emplace_back(new test_mul_mat_iq3_verify(5120, 16, 2048, false, GGML_TYPE_IQ4_XS, 1));
+    test_cases.emplace_back(new test_mul_mat_iq3_verify(5120, 16, 2048, false, GGML_TYPE_IQ4_XS, 4));
 
     test_cases.emplace_back(new test_ssm_scan_rollback(GGML_TYPE_F32, 96, 64, 16, 8, 8, 2, /*K=*/3)); // d_state=96 rollback snapshots match prefix states
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 32, 4)); // Mamba-2

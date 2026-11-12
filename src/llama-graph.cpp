@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-tree-schedule.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -24,6 +25,14 @@
 #include <sstream>
 #include <string>
 #include <unordered_set>
+
+static llama_tree_schedule make_tree_schedule(const llama_ubatch & ubatch) {
+    static const bool forward = [] {
+        const char * value = std::getenv("GGML_CUDA_TREE_FORWARD");
+        return value && strcmp(value, "1") == 0;
+    }();
+    return llama_tree_schedule_make(ubatch.tree_parent, ubatch.n_tokens, forward);
+}
 
 // dedup helpers
 
@@ -256,6 +265,19 @@ bool llm_graph_input_batch_idxs::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
+
+        if (ubatch->tree_parent) {
+            std::vector<llama_pos> values(n_tokens * n_pos_per_embd, 0);
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                const int32_t parent = ubatch->tree_parent[i];
+                const llama_pos p = parent < 0 ? ubatch->pos[0] : values[parent] + 1;
+                for (int64_t s = 0; s < std::min<int64_t>(3, n_pos_per_embd); ++s) {
+                    values[s * n_tokens + i] = p;
+                }
+            }
+            ggml_backend_tensor_set(pos, values.data(), 0, values.size() * sizeof(llama_pos));
+            return;
+        }
 
         const bool has_embd = ubatch->is_mixed() || ubatch->token == nullptr;
         if (rope_section_order == LLAMA_ROPE_SECTION_ORDER_TYXZ || !has_embd) {
@@ -492,7 +514,33 @@ static void set_input_s_slot_rev(ggml_tensor * s_slot_rev) {
     }
 }
 
+static void set_input_tree(llm_graph_input_rs * inp, const llama_ubatch * ubatch) {
+    if (!inp->tree_parent) {
+        return;
+    }
+    GGML_ASSERT(ubatch->tree_parent && ubatch->n_seqs == 1);
+    ggml_backend_tensor_set(inp->tree_parent, ubatch->tree_parent, 0, ubatch->n_tokens * sizeof(int32_t));
+    if (inp->tree_slots) {
+        const auto schedule = make_tree_schedule(*ubatch);
+        GGML_ASSERT(schedule.slots == inp->tree_slots);
+        ggml_backend_tensor_set(inp->tree_parent, schedule.steps.data(), ubatch->n_tokens * sizeof(int32_t), 3 * ubatch->n_tokens * sizeof(int32_t));
+    }
+    if (inp->tree_conv) {
+        const int64_t width = inp->tree_conv->ne[0] / ubatch->n_tokens;
+        std::vector<int32_t> idxs(inp->tree_conv->ne[0]);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            int32_t ancestor = i;
+            for (int64_t j = width - 1; j >= 0; --j) {
+                idxs[i * width + j] = width - 1 + ancestor;
+                ancestor = ancestor >= 0 ? ubatch->tree_parent[ancestor] : ancestor - 1;
+            }
+        }
+        ggml_backend_tensor_set(inp->tree_conv, idxs.data(), 0, idxs.size() * sizeof(int32_t));
+    }
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+    set_input_tree(this, ubatch);
     GGML_UNUSED(ubatch);
 
     const int64_t n_rs = mctx->get_n_rs();
@@ -532,6 +580,10 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= s_copy->ne[0] == mctx->get_n_rs();
     res &= (gdn_ctl != nullptr) == mctx->get_gdn_replay();
+    res &= (tree_parent != nullptr) == (params.ubatch.tree_parent != nullptr);
+    if (tree_slots && params.ubatch.tree_parent) {
+        res &= tree_slots == make_tree_schedule(params.ubatch).slots;
+    }
 
     res &= s_copy_main->ne[0] == params.ubatch.n_seqs;
 
@@ -1219,6 +1271,7 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+    set_input_tree(inp_rs.get(), ubatch);
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
@@ -1266,6 +1319,10 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
     res &= (inp_rs->gdn_ctl != nullptr) == mctx->get_recr()->get_gdn_replay();
+    res &= (inp_rs->tree_parent != nullptr) == (params.ubatch.tree_parent != nullptr);
+    if (inp_rs->tree_slots && params.ubatch.tree_parent) {
+        res &= inp_rs->tree_slots == make_tree_schedule(params.ubatch).slots;
+    }
 
     res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
 
@@ -4016,9 +4073,21 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
         ggml_set_input(inp->s_copy_s);
         ggml_set_name(inp->s_copy_s, "rs_s_copy_s");
         inp->s_copy_s_main = ggml_view_1d(ctx0, inp->s_copy_s, n_seqs, 0);
-        inp->gdn_ctl = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 3);
+        inp->gdn_ctl = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 3 + mctx_cur->get_gdn_width());
         ggml_set_input(inp->gdn_ctl);
         ggml_set_name(inp->gdn_ctl, "gdn_ctl");
+    }
+
+    if (ubatch.tree_parent) {
+        GGML_ASSERT(inp->gdn_ctl && ubatch.n_seqs == 1);
+        static const bool use_slots = [] {
+            const char * value = std::getenv("GGML_CUDA_TREE_SLOTS");
+            return value && strcmp(value, "1") == 0;
+        }();
+        inp->tree_slots = use_slots ? make_tree_schedule(ubatch).slots : 0;
+        inp->tree_parent = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens * (use_slots ? 4 : 1));
+        ggml_set_input(inp->tree_parent);
+        ggml_set_name(inp->tree_parent, "tree_parent");
     }
 
     inp->head = mctx_cur->get_head();

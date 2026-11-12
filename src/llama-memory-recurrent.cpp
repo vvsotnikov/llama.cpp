@@ -201,6 +201,7 @@ void llama_memory_recurrent::clear(bool data) {
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
     replay_n    = 0;
     replay_half = 0;
+    replay_rows.clear();
 }
 
 void llama_memory_recurrent::gdn_ctl_take(int32_t * ctl, uint32_t n_seq_tokens) {
@@ -208,6 +209,10 @@ void llama_memory_recurrent::gdn_ctl_take(int32_t * ctl, uint32_t n_seq_tokens) 
     ctl[0] = (int32_t) replay_n;
     ctl[1] = (int32_t) replay_half;
     ctl[2] = defer ? 1 : 0;
+    for (uint32_t i = 0; i < gdn_w; ++i) {
+        ctl[3 + i] = i < replay_rows.size() ? replay_rows[i] : (int32_t) i;
+    }
+    replay_rows.clear();
     if (defer) {
         replay_n    = n_seq_tokens;
         replay_half = 1 - replay_half;
@@ -236,6 +241,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (rm_all) {
         set_rs_idx(seq_id, 0);
         replay_n = 0;
+        replay_rows.clear();
     }
 
     // models like Mamba or RWKV can't have a state partially erased at the end
@@ -1039,7 +1045,13 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             for (uint32_t il = 0; il < n_layer; ++il) {
                 if (st_l[il] == nullptr || replay_n == 0) continue;
                 const size_t row = ggml_row_size(GGML_TYPE_F32, st_l[il]->ne[0]);
-                io.write_tensor(st_l[il], (size_t) replay_half * gdn_w * row, replay_n * row);
+                if (replay_rows.empty()) {
+                    io.write_tensor(st_l[il], (size_t) replay_half * gdn_w * row, replay_n * row);
+                } else {
+                    for (uint32_t i = 0; i < replay_n; ++i) {
+                        io.write_tensor(st_l[il], ((size_t) replay_half * gdn_w + replay_rows[i]) * row, row);
+                    }
+                }
             }
         }
     } else {
@@ -1282,6 +1294,7 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             }
             replay_n    = n;
             replay_half = 0;
+            replay_rows.clear();
         }
     } else {
         // For each layer, read the values for each cell (transposed)
@@ -1447,6 +1460,10 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
 
 bool llama_memory_recurrent_context::get_gdn_replay() const {
     return mem->gdn_replay;
+}
+
+uint32_t llama_memory_recurrent_context::get_gdn_width() const {
+    return mem->gdn_w;
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_st_l(int32_t il) const {

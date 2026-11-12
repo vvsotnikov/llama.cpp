@@ -121,6 +121,7 @@ public:
     uint32_t gdn_w       = 0;
     uint32_t replay_n    = 0;
     uint32_t replay_half = 0;
+    std::vector<int32_t> replay_rows;
 
     // the control of the next graph's replay (n_prefix, read_half, defer), and the state it leaves (once per graph)
     void gdn_ctl_take(int32_t * ctl, uint32_t n_seq_tokens);
@@ -200,6 +201,7 @@ public:
 
     // the deferred commit of the gated delta net states (llama_memory_recurrent::gdn_replay)
     bool          get_gdn_replay() const;
+    uint32_t      get_gdn_width() const;
     ggml_tensor * get_st_l(int32_t il) const;
     // the S rows have no rollback planes then: the cell itself
     int32_t       s_copy_s(int i) const;

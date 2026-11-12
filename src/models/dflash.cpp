@@ -4,6 +4,8 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <cstdlib>
+
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_EMBEDDING_SCALE, hparams.f_embedding_scale, false);
@@ -682,8 +684,11 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     }
 
     const int64_t tokens_per_block = n_tokens / n_blocks;
-    const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
-    const int64_t row_used   = top_k + top_k * top_k;
+    const int64_t block_size = tokens_per_block;
+    const char * tree_env = std::getenv("LLAMA_DFLASH_TREE");
+    const bool tree = tree_env && std::atoi(tree_env) != 0;
+    const int64_t row_used = (top_k + top_k * top_k) * (tree ? 2 : 1);
+    GGML_ASSERT(row_used <= n_embd);
 
     ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
     ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
@@ -722,12 +727,20 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
         if (n_pred == 1) {
             score = ggml_repeat_4d(ctx0, score, top_k, top_k, n_pos, n_blocks);
         }
+        ggml_tensor * edge = score;
         ggml_tensor * unary_bcast = ggml_reshape_4d(ctx0, unary_run, top_k, 1, n_pos, n_blocks);
         score = ggml_add(ctx0, score, ggml_repeat(ctx0, unary_bcast, score));
 
         ggml_tensor * row = ggml_concat(ctx0,
                 ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
                 ggml_reshape_3d(ctx0, score, top_k * top_k, n_pos, n_blocks), 0);
+        if (tree) {
+            // Chain mode keeps its original layout and arithmetic. Trees need
+            // unary and edge separately to apply the selector's 0.6 weight.
+            row = ggml_concat(ctx0, row, unary_run, 0);
+            row = ggml_concat(ctx0, row,
+                    ggml_reshape_3d(ctx0, edge, top_k * top_k, n_pos, n_blocks), 0);
+        }
         return ggml_pad(ctx0, row, n_embd - row_used, 0, 0, 0);
     };
 
