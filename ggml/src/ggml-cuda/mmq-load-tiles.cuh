@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vecdotq.cuh"
+#include "prefill-iq3.cuh"
 
 #include "mmq.cuh"
 
@@ -1400,6 +1401,44 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_df[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx] = (ls*d + d/2)/2;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
+}
+
+// Same signed integer codes and float scales as the native IQ3_S loader. Only
+// the codebook/sign unpacking is moved to model preparation.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_prepared(
+        const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ tile,
+        const int kbx0, const int i_max, const int stride) {
+    GGML_UNUSED(x_gate);
+#ifdef TURING_MMA_AVAILABLE
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps = ggml_cuda_mmq_get_nthreads(type, J, fallback, GGML_PREC_Q8) / warp_size;
+    constexpr int rows = ggml_cuda_mmq_get_I(type, J, fallback, GGML_PREC_Q8);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback, GGML_PREC_Q8);
+    constexpr int threads_per_row = (MMQ_ITER_K / (4 * QR3_S)) / 2;
+    constexpr int rows_per_warp = warp_size / threads_per_row;
+    const int q = threadIdx.x % threads_per_row;
+    float * scales = (float *) (tile + MMQ_TILE_NE_K * 2);
+    const auto * __restrict__ blocks = (const ggml_cuda_iq3_prefill_block *) x;
+#pragma unroll
+    for (int i0 = 0; i0 < rows; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / threads_per_row;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+        const auto & block = blocks[kbx0 + i * stride];
+#pragma unroll
+        for (int l = 0; l < QR3_S; ++l) {
+            const int v = block.qs[4 * q + l];
+            tile[i * sram_stride + 8 * q + 2 * l] = __vsub4((v & 0x0f0f0f0f) << 1, 0x0f0f0f0f);
+            tile[i * sram_stride + 8 * q + 2 * l + 1] = __vsub4(((v >> 4) & 0x0f0f0f0f) << 1, 0x0f0f0f0f);
+        }
+        scales[i * sram_stride + q] = block.d[q];
+    }
+#else
+    GGML_UNUSED(x); GGML_UNUSED(tile); GGML_UNUSED(kbx0); GGML_UNUSED(i_max); GGML_UNUSED(stride);
+    NO_DEVICE_CODE;
+#endif
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq3_s(

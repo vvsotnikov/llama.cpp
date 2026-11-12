@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmq-few.cuh"
 #include "ggml-cuda/iq3-fragment.cuh"
 #include "ggml-cuda/iq4-fragment.cuh"
+#include "ggml-cuda/prefill-iq3.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -797,6 +798,7 @@ struct ggml_backend_cuda_buffer_context {
     };
     std::mutex fragment_mutex;
     std::unordered_map<const void *, fragment_entry> quant_fragments;
+    std::unordered_map<const void *, fragment_entry> prefill_iq3;
 
     static constexpr size_t input_slot_bytes = 64*1024;
     struct input_slot {
@@ -811,6 +813,7 @@ struct ggml_backend_cuda_buffer_context {
     void invalidate_fragments() {
         std::lock_guard<std::mutex> lock(fragment_mutex);
         for (auto & entry : quant_fragments) entry.second.dirty = true;
+        for (auto & entry : prefill_iq3) entry.second.dirty = true;
     }
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -830,6 +833,10 @@ struct ggml_backend_cuda_buffer_context {
             CUDA_CHECK(cudaFreeHost(input_staging));
         }
         for (auto & entry : quant_fragments) {
+            CUDA_CHECK(cudaFree(entry.second.data));
+            CUDA_CHECK(cudaEventDestroy(entry.second.ready));
+        }
+        for (auto & entry : prefill_iq3) {
             CUDA_CHECK(cudaFree(entry.second.data));
             CUDA_CHECK(cudaEventDestroy(entry.second.ready));
         }
@@ -2234,6 +2241,115 @@ static bool ggml_cuda_iq3_fragment_enabled() {
     return enabled;
 }
 
+static bool ggml_cuda_prefill_iq3_matches(const ggml_tensor * node, int device) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(node); GGML_UNUSED(device);
+    return false;
+#else
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_PREFILL_IQ3");
+    if (!enabled || node->op != GGML_OP_MUL_MAT ||
+            !turing_mma_available(ggml_cuda_info().devices[device].cc) ||
+            ggml_get_op_params_i32(node, 1) != GGML_HINT_NONE) {
+        return false;
+    }
+    const auto w = node->src[0], x = node->src[1];
+    return w && x && w->buffer && ggml_backend_buffer_is_cuda(w->buffer) &&
+        ((ggml_backend_cuda_buffer_context *) w->buffer->context)->device == device &&
+        ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        !(w->flags & GGML_TENSOR_FLAG_PARAM) && !w->view_src && w->type == GGML_TYPE_IQ3_S &&
+        (ggml_prec_get_src(node, 1) == GGML_PREC_UNDEFINED || ggml_prec_get_src(node, 1) >= GGML_PREC_Q8) &&
+        ggml_cuda_should_use_mmq(w->type, ggml_cuda_info().devices[device].cc, x->ne[1], 1) &&
+        x->type == GGML_TYPE_F32 && node->type == GGML_TYPE_F32 &&
+        ggml_is_matrix(w) && ggml_is_matrix(x) && ggml_is_contiguous(w) &&
+        ggml_is_contiguous(x) && ggml_is_contiguous(node) &&
+        w->ne[0] >= 1024 && w->ne[0] <= 32768 && w->ne[0] % 256 == 0 &&
+        w->ne[1] >= 1024 && w->ne[1] <= 65536 && w->ne[1] % 4 == 0 &&
+        x->ne[1] >= 256 && x->ne[1] <= 8192 &&
+        size_t(w->ne[1]) <= SIZE_MAX / sizeof(float) / size_t(w->ne[0]);
+#endif
+}
+
+static thread_local ggml_backend_cuda_context * prefill_iq3_graph_owner = nullptr;
+
+static void ggml_cuda_prepare_prefill_iq3(ggml_backend_cuda_context & ctx, ggml_cgraph * graph) {
+    prefill_iq3_graph_owner = nullptr;
+    if (!ggml_cuda_env_flag("GGML_CUDA_PREFILL_IQ3")) {
+        return;
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto node = graph->nodes[i];
+        if (node->op != GGML_OP_NONE && node->op != GGML_OP_VIEW && node->op != GGML_OP_RESHAPE &&
+                node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE && node->buffer &&
+                ggml_backend_buffer_is_cuda(node->buffer) &&
+                ggml_backend_buffer_get_usage(node->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            ((ggml_backend_cuda_buffer_context *) node->buffer->context)->invalidate_fragments();
+            return;
+        }
+    }
+    prefill_iq3_graph_owner = &ctx;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto node = graph->nodes[i];
+        if (!ggml_cuda_prefill_iq3_matches(node, ctx.device)) {
+            continue;
+        }
+        const auto w = node->src[0];
+        const size_t bytes = size_t(ggml_nelements(w) / QK_K) * sizeof(ggml_cuda_iq3_prefill_block);
+        auto buffer = (ggml_backend_cuda_buffer_context *) w->buffer->context;
+        std::lock_guard<std::mutex> lock(buffer->fragment_mutex);
+        auto it = buffer->prefill_iq3.find(w->data);
+        if (it == buffer->prefill_iq3.end()) {
+            size_t available, total;
+            CUDA_CHECK(cudaMemGetInfo(&available, &total));
+            const size_t scratch = size_t(256) << 20;
+            if (available < bytes || available - bytes < scratch + (size_t(2) << 30)) {
+                continue;
+            }
+            void * data = nullptr;
+            if (cudaMalloc(&data, bytes) != cudaSuccess) {
+                cudaGetLastError();
+                continue;
+            }
+            cudaEvent_t ready;
+            CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+            it = buffer->prefill_iq3.emplace(w->data,
+                    ggml_backend_cuda_buffer_context::fragment_entry{data, bytes, w->ne[0], w->ne[1], true, ctx.stream(), ready}).first;
+            GGML_LOG_INFO("%s: prepared %s, extra storage %.2f MiB\n", __func__, w->name, bytes / 1048576.0);
+        }
+        auto & entry = it->second;
+        if (entry.size != bytes || entry.k != w->ne[0] || entry.n != w->ne[1]) {
+            continue;
+        }
+        if (entry.producer != ctx.stream()) {
+            CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), entry.ready, 0));
+        }
+        if (entry.dirty) {
+            ggml_cuda_iq3_prefill_prepare(w, entry.data, ctx.stream());
+            CUDA_CHECK(cudaEventRecord(entry.ready, ctx.stream()));
+            entry.producer = ctx.stream();
+            entry.dirty = false;
+        }
+    }
+}
+
+static bool ggml_cuda_try_prefill_iq3(ggml_backend_cuda_context & ctx, const ggml_tensor * node, ggml_tensor * dst) {
+    if (prefill_iq3_graph_owner != &ctx || !ggml_cuda_prefill_iq3_matches(node, ctx.device)) {
+        return false;
+    }
+    const auto weight = node->src[0];
+    auto buffer = (ggml_backend_cuda_buffer_context *) weight->buffer->context;
+    std::lock_guard<std::mutex> lock(buffer->fragment_mutex);
+    const auto it = buffer->prefill_iq3.find(weight->data);
+    if (it == buffer->prefill_iq3.end() || it->second.dirty ||
+            it->second.k != weight->ne[0] || it->second.n != weight->ne[1]) {
+        return false;
+    }
+    if (it->second.producer != ctx.stream()) {
+        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), it->second.ready, 0));
+    }
+    ggml_cuda_iq3_prefill_mul_mat(ctx, weight, node->src[1], dst, it->second.data);
+    return true;
+}
+
 static bool ggml_cuda_iq3_fragment_matches(const ggml_tensor * node, int device) {
     if (!ggml_cuda_iq3_fragment_enabled() || ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_ADA_LOVELACE || node->op != GGML_OP_MUL_MAT) return false;
     const auto x=node->src[0],y=node->src[1];
@@ -2326,6 +2442,10 @@ static void ggml_cuda_prepare_quant_fragments(ggml_backend_cuda_context & ctx, g
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    if (ggml_cuda_try_prefill_iq3(ctx, dst, dst)) {
+        return;
+    }
 
     if (src0->type == GGML_TYPE_IQ4_XS && src1->type == GGML_TYPE_F32 &&
             ggml_is_contiguous(src1) && !ggml_cuda_is_aligned(src1, sizeof(float4))) {
@@ -5504,6 +5624,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
 
     ggml_cuda_prepare_quant_fragments(*cuda_ctx,cgraph);
+    ggml_cuda_prepare_prefill_iq3(*cuda_ctx, cgraph);
     bool graph_mode = false;
 #ifdef USE_CUDA_GRAPH
     static const bool graphs_disabled = getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;

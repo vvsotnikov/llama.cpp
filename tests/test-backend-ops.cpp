@@ -5757,7 +5757,12 @@ struct test_mul_mat_iq3_verify : public test_case {
 
     test_mul_mat_iq3_verify(int64_t m, int64_t n, int64_t k, bool view = false, ggml_type type = GGML_TYPE_IQ3_S, int64_t input_offset = 0) : m(m), n(n), k(k), view(view), type(type), input_offset(input_offset) {}
     std::string vars() override { return VARS_TO_STR5(m, n, k, view, input_offset); }
-    std::string op_desc(ggml_tensor *) override { return type == GGML_TYPE_IQ4_XS ? "MUL_MAT_IQ4_VERIFY" : "MUL_MAT_IQ3_VERIFY"; }
+    std::string op_desc(ggml_tensor *) override {
+        if (type == GGML_TYPE_IQ3_S && n >= 256) {
+            return "MUL_MAT_IQ3_PREFILL";
+        }
+        return type == GGML_TYPE_IQ4_XS ? "MUL_MAT_IQ4_VERIFY" : "MUL_MAT_IQ3_VERIFY";
+    }
     bool use_weight_context() override { return true; }
     bool run_whole_graph() override { return true; }
     double max_nmse_err() override { return 5e-4; }
@@ -11682,6 +11687,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n : {7, 8, 9}) {
         test_cases.emplace_back(new test_mul_mat_iq3_verify(5120, n, 2048));
     }
+    // Prepared prefill: full tiles, a row/column tail, padded K, and a view fallback.
+    test_cases.emplace_back(new test_mul_mat_iq3_verify(5120, 512, 2048));
+    test_cases.emplace_back(new test_mul_mat_iq3_verify(1040, 513, 2048));
+    test_cases.emplace_back(new test_mul_mat_iq3_verify(1024, 256, 1280));
+    test_cases.emplace_back(new test_mul_mat_iq3_verify(1024, 256, 2048, true));
     test_cases.emplace_back(new test_mul_mat_iq3_verify(5136, 8, 2304));
     test_cases.emplace_back(new test_mul_mat_iq3_verify(5120, 8, 2048, true));
     for (int64_t n : {8, 16, 17}) {
