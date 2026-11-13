@@ -115,6 +115,7 @@ class ModelBase:
     is_mistral_format: bool = False
     disable_mistral_community_chat_template: bool = False
     sentence_transformers_dense_modules: bool = False
+    fp8_channel_scales: bool = False
 
     # MTP (multi-token prediction) export modes; set by main() before instantiation.
     # Architectures that implement the filtering/export behavior opt in by
@@ -461,7 +462,7 @@ class ModelBase:
                         s = self.model_tensors[name]
                         block_size = None
                         is_fp8_weight = False
-                        if self._fp8_as_q8 or fp8_configs is not None:
+                        if self._fp8_as_q8 or self._preserve_fp8 or fp8_configs is not None:
                             weight = w()
                             is_fp8_weight = weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
                         if fp8_configs is not None:
@@ -477,6 +478,13 @@ class ModelBase:
                                 if len(block_sizes) != 1:
                                     raise ValueError(f"FP8 weight {weight_name!r} has ambiguous block layouts")
                                 block_size = next(iter(block_sizes))
+                        if self._preserve_fp8 and weight.dtype == torch.float8_e4m3fn:
+                            scale = s()
+                            channel = (self.fp8_channel_scales and weight.ndim == 2
+                                       and scale.ndim in (1, 2) and scale.shape[0] == weight.shape[0]
+                                       and scale.numel() == weight.shape[0])
+                            if scale.numel() == 1 or channel:
+                                continue
                         self.model_tensors[weight_name] = lambda w=w, s=s, bs=block_size: dequant_simple(w(), s(), bs)
                         tensors_to_remove.append(name)
                         if self._fp8_as_q8 and is_fp8_weight:
@@ -618,6 +626,9 @@ class ModelBase:
         new_name = self.tensor_map.get_name(name, try_suffixes=(".weight",))
         return (new_name,) if new_name is not None else ()
 
+    def modify_fp8_channel_scales(self, scale: Tensor, name: str, bid: int | None):
+        yield self.map_tensor_name(name), scale
+
     def _prepare_fp8_e4m3_tensors(self):
         if not self._preserve_fp8:
             return
@@ -658,7 +669,10 @@ class ModelBase:
                 continue
 
             scale = self.model_tensors[scale_name]()
-            if prod(scale.shape) != 1:
+            channel = (self.fp8_channel_scales and weight.ndim == 2
+                       and scale.ndim in (1, 2) and scale.shape[0] == weight.shape[0]
+                       and scale.numel() == weight.shape[0])
+            if prod(scale.shape) != 1 and not channel:
                 continue
 
             merged_name = expert_pattern.sub(r"\1.", weight_name)
@@ -739,7 +753,13 @@ class ModelBase:
                     )
                     # Packed expert weights need one scale value per expert.
                     n_scales = shape[0] if is_packed_expert else 1
-                    scale_tensors[new_name.replace(".weight", ".scale")] = np.repeat(scale.numpy(), n_scales)
+                    if scale.numel() > 1:
+                        mapped_scales = dict(self.modify_fp8_channel_scales(scale.reshape(shape[0], 1), weight_name, None))
+                        if set(mapped_scales) != set(new_names):
+                            raise ValueError(f"FP8 channel scale mapping differs for {weight_name}")
+                        scale_tensors[new_name.replace(".weight", ".scale")] = mapped_scales[new_name].flatten().numpy()
+                    else:
+                        scale_tensors[new_name.replace(".weight", ".scale")] = np.repeat(scale.numpy(), n_scales)
                     if input_scale is not None:
                         input_scale_tensors[new_name.replace(".weight", ".input_scale")] = np.repeat(input_scale.numpy(), n_scales)
 

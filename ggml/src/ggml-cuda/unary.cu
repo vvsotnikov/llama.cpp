@@ -320,6 +320,31 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(x[j0])) * ggml_cuda_cast<float>(g[j1]));
 }
 
+static __global__ void scaled_swiglu_kernel(const float * gate, const float * up,
+        const float * gate_scale, const float * up_scale, float * dst, int64_t size, int64_t width,
+        bool gate_channel_scale, bool up_channel_scale) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
+    if (i >= size) {
+        return;
+    }
+    const int64_t row = i % width;
+    ggml_cuda_pdl_sync();
+    const float g = gate[i] * gate_scale[gate_channel_scale ? row : 0];
+    const float u = up[i] * up_scale[up_channel_scale ? row : 0];
+    dst[i] = op_silu(g) * u;
+}
+
+void ggml_cuda_op_scaled_swiglu(ggml_backend_cuda_context & ctx, const ggml_tensor * gate,
+        const ggml_tensor * up, const ggml_tensor * gate_scale, const ggml_tensor * up_scale, ggml_tensor * dst) {
+    const int64_t size = ggml_nelements(dst);
+    const auto launch = ggml_cuda_kernel_launch_params((dim3) ((size + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE),
+            CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(scaled_swiglu_kernel, launch, (const float *) gate->data, (const float *) up->data,
+            (const float *) gate_scale->data, (const float *) up_scale->data, (float *) dst->data, size, dst->ne[0],
+            ggml_nelements(gate_scale) != 1, ggml_nelements(up_scale) != 1);
+}
+
 template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;

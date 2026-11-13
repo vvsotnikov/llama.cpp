@@ -694,6 +694,15 @@ class _Qwen35MRopeMixin:
 @ModelBase.example("Qwen/Qwen3.5-9B")
 class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
+    fp8_channel_scales = True
+
+    def modify_fp8_channel_scales(self, scale: Tensor, name: str, bid: int | None):
+        # Output projection reorders input columns, leaving output-row scales intact.
+        if ".linear_attn.out_proj." in name:
+            yield self.map_tensor_name(name), scale
+        else:
+            yield from self.modify_tensors(scale, name, bid)
+
 
     def __init__(self, dir_model, *args, **kwargs):
         # Inner TextModel does not own mtp.*. Set no_mtp before mixin bumps block_count.

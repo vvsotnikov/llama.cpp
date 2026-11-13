@@ -8255,20 +8255,21 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_gate;
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
+    const bool channel_scale;
     const bool skip; // set some ids to a negative value (only for use_id)
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool skip = false)
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool skip = false, bool channel_scale = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), skip(skip) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), channel_scale(channel_scale), skip(skip) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
     }
 
     std::string vars() override {
-        return VARS_TO_STR14(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, skip);
+        return VARS_TO_STR14(type, glu_op, m, n, k, use_id, n_mats, n_used, b, with_bias, with_gate, with_lane_scale, batch_dims, skip) + ",channel_scale=" + std::to_string(channel_scale);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8277,6 +8278,9 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
+    bool use_graph_allocator() override { return !use_id && with_lane_scale && m >= 63; }
+
+
     bool use_weight_context() override { return use_id && with_lane_scale; }
 
     ggml_tensor * build_gate(ggml_context * ctx, ggml_tensor * ffn_gate, ggml_tensor * ffn_up) {
@@ -8297,7 +8301,7 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 
     ggml_tensor * build_lane_scale_dense(ggml_context * ctx, ggml_tensor * out) {
-        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, channel_scale ? out->ne[0] : 1);
         return ggml_mul(ctx, out, scale);
     }
 
@@ -8323,6 +8327,9 @@ struct test_mul_mat_vec_fusion : public test_case {
             std::array<int64_t, 4> ne0      = { k, n, channels, samples };
 
             ggml_tensor * cur  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+            if (with_lane_scale && m >= 63) {
+                ggml_set_name(cur, "scaled_swiglu_input");
+            }
             ggml_tensor * gate = with_gate ? ggml_new_tensor(ctx, type, 4, ne0.data()) : nullptr;
             ggml_tensor * up   = ggml_new_tensor(ctx, type, 4, ne0.data());
 
@@ -8421,10 +8428,51 @@ struct test_mul_mat_vec_fusion : public test_case {
         } else {
             init_mul_mat_id_tensors(ctx, n_mats, skip);
         }
+        if (auto * input = ggml_get_tensor(ctx, "scaled_swiglu_input")) {
+            // Exact Q4/Q8 input values isolate fusion errors from activation quantization differences.
+            std::vector<float> data(ggml_nelements(input));
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i] = float(int(i % 3) - 1);
+            }
+            ggml_backend_tensor_set(input, data.data(), 0, ggml_nbytes(input));
+        }
     }
 
     double max_nmse_err() override {
         return 5e-3;
+    }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (!use_id && with_lane_scale && m >= 63) {
+            return 5e-5;
+        }
+        // 4-bit activations on Blackwell, see test_mul_mat
+        if (type == GGML_TYPE_NVFP4 && !graph_mul_mat_hi_prec_act(gf, use_id ? GGML_OP_MUL_MAT_ID : GGML_OP_MUL_MAT) &&
+                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
+};
+
+// Fused gate/up/GLU with GGML_PREC_Q8 on src1, e.g. a W4A16 NVFP4 checkpoint (W4A8, see test_mul_mat_w4a8)
+struct test_mul_mat_vec_fusion_w4a8 : public test_mul_mat_vec_fusion {
+    using test_mul_mat_vec_fusion::test_mul_mat_vec_fusion;
+    using test_mul_mat_vec_fusion::build_graph;
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * out = test_mul_mat_vec_fusion::build_graph(ctx, ctx_weights);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) {
+                ggml_prec_set_src(t, GGML_PREC_Q8, 1);
+            }
+        }
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_VEC_FUSION_W4A8";
     }
 };
 
@@ -13117,6 +13165,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 16, 31, 257,
         false, 1, 1, false, false, false, true, {1, 1}));
 
+    for (ggml_type type : { GGML_TYPE_NVFP4, GGML_TYPE_F8_E4M3 }) {
+        for (int64_t tokens : { 63, 64, 65, 128 }) {
+            for (bool channel_scale : { false, true }) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, tokens, 96, 256,
+                    false, 1, 1, false, false, true, true, {1, 1}, false, channel_scale));
+            }
+        }
+    }
+
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {
             for (bool use_id : {false, true}) {
@@ -13213,6 +13270,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0,   GGML_GLU_OP_SWIGLU,      2048,   128, 256, true, 40, 8, false));
     // K = 2048: few-row MMQ, where enabled, takes the gate and up matmuls instead of the fused MMQ path
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K,   GGML_GLU_OP_SWIGLU,         9,   128, 2048, false, 1, 1, false, false, true, false, { 1, 1 }));
+
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, 150, 6912, 256,
+        false, 1, 1, false, false, true, true, {2, 3}));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, 150, 2560, 256,
+        true, 16, 8, false));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, 17, 5120, 256,
+        true, 16, 8, true, false, true, true));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion_w4a8(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, 150, 2560, 256,
+        true, 16, 8, false));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion_w4a8(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, 150, 40960, 256,
+        false, 1, 1, false, false, true, true, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_vec_fusion_w4a8(GGML_TYPE_NVFP4, GGML_GLU_OP_SWIGLU, 150, 2560, 256,
+        true, 16, 8, false, false, true, true));
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {

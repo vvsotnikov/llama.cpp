@@ -1797,6 +1797,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // call the per-model loading function
         load_arch_tensors(ml);
 
+        auto create_dense_scale = [&](const LLM_TN_IMPL & name, const ggml_tensor * weight) {
+            const auto * meta = ml.get_tensor_meta(name.str().c_str());
+            if (meta && weight->type == GGML_TYPE_F8_E4M3 && ggml_is_vector(meta) &&
+                    ggml_nelements(meta) == weight->ne[1] && weight->ne[1] != 1) {
+                if (meta->type != GGML_TYPE_F32) {
+                    throw std::runtime_error("FP8 channel scales must be F32: " + name.str());
+                }
+                return create_tensor(name, {weight->ne[1]}, TENSOR_NOT_REQUIRED);
+            }
+            return create_tensor(name, {1}, TENSOR_NOT_REQUIRED);
+        };
+
         // generic pass: load optional per-tensor/per-expert ".scale" tensors (e.g. NVFP4 scale2)
         // this avoids having to add scale loading to every architecture
         for (int i = 0; i < n_layer_all; ++i) {
@@ -1804,42 +1816,42 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             // attention weight scales (per-tensor, shape {1})
             if (!layer.wq_s && layer.wq) {
-                layer.wq_s = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wq_s = create_dense_scale(tn(LLM_TENSOR_ATTN_Q,   "scale", i), layer.wq);
             }
             if (!layer.wk_s && layer.wk) {
-                layer.wk_s = create_tensor(tn(LLM_TENSOR_ATTN_K,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wk_s = create_dense_scale(tn(LLM_TENSOR_ATTN_K,   "scale", i), layer.wk);
             }
             if (!layer.wv_s && layer.wv) {
-                layer.wv_s = create_tensor(tn(LLM_TENSOR_ATTN_V,   "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wv_s = create_dense_scale(tn(LLM_TENSOR_ATTN_V,   "scale", i), layer.wv);
             }
             if (!layer.wo_s && layer.wo) {
-                layer.wo_s = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wo_s = create_dense_scale(tn(LLM_TENSOR_ATTN_OUT, "scale", i), layer.wo);
             }
             if (!layer.wqkv_s && layer.wqkv) {
-                layer.wqkv_s = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_s = create_dense_scale(tn(LLM_TENSOR_ATTN_QKV, "scale", i), layer.wqkv);
             }
             if (!layer.wqkv_gate_s && layer.wqkv_gate) {
-                layer.wqkv_gate_s = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.wqkv_gate_s = create_dense_scale(tn(LLM_TENSOR_ATTN_GATE, "scale", i), layer.wqkv_gate);
             }
 
             // dense FFN weight scales (per-tensor, shape {1})
             if (!layer.ffn_gate_s && layer.ffn_gate) {
-                layer.ffn_gate_s = create_tensor(tn(LLM_TENSOR_FFN_GATE, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_s = create_dense_scale(tn(LLM_TENSOR_FFN_GATE, "scale", i), layer.ffn_gate);
             }
             if (!layer.ffn_down_s && layer.ffn_down) {
-                layer.ffn_down_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_s = create_dense_scale(tn(LLM_TENSOR_FFN_DOWN, "scale", i), layer.ffn_down);
             }
             if (!layer.ffn_up_s && layer.ffn_up) {
-                layer.ffn_up_s = create_tensor(tn(LLM_TENSOR_FFN_UP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_s = create_dense_scale(tn(LLM_TENSOR_FFN_UP, "scale", i), layer.ffn_up);
             }
             if (!layer.ffn_gate_shexp_s && layer.ffn_gate_shexp) {
-                layer.ffn_gate_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_gate_shexp_s = create_dense_scale(tn(LLM_TENSOR_FFN_GATE_SHEXP, "scale", i), layer.ffn_gate_shexp);
             }
             if (!layer.ffn_down_shexp_s && layer.ffn_down_shexp) {
-                layer.ffn_down_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_down_shexp_s = create_dense_scale(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "scale", i), layer.ffn_down_shexp);
             }
             if (!layer.ffn_up_shexp_s && layer.ffn_up_shexp) {
-                layer.ffn_up_shexp_s = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ffn_up_shexp_s = create_dense_scale(tn(LLM_TENSOR_FFN_UP_SHEXP, "scale", i), layer.ffn_up_shexp);
             }
 
             // MoE expert weight scales (per-expert, shape {n_expert})
@@ -1855,22 +1867,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
             if (!layer.ssm_in_s && layer.ssm_in) {
-                layer.ssm_in_s = create_tensor(tn(LLM_TENSOR_SSM_IN, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_in_s = create_dense_scale(tn(LLM_TENSOR_SSM_IN, "scale", i), layer.ssm_in);
             }
             if (!layer.ssm_out_s && layer.ssm_out) {
-                layer.ssm_out_s = create_tensor(tn(LLM_TENSOR_SSM_OUT, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_out_s = create_dense_scale(tn(LLM_TENSOR_SSM_OUT, "scale", i), layer.ssm_out);
             }
             if (!layer.ssm_alpha_s && layer.ssm_alpha) {
-                layer.ssm_alpha_s = create_tensor(tn(LLM_TENSOR_SSM_ALPHA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_alpha_s = create_dense_scale(tn(LLM_TENSOR_SSM_ALPHA, "scale", i), layer.ssm_alpha);
             }
             if (!layer.ssm_beta_s && layer.ssm_beta) {
-                layer.ssm_beta_s = create_tensor(tn(LLM_TENSOR_SSM_BETA, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.ssm_beta_s = create_dense_scale(tn(LLM_TENSOR_SSM_BETA, "scale", i), layer.ssm_beta);
             }
             if (!layer.nextn.eh_proj_s && layer.nextn.eh_proj) {
-                layer.nextn.eh_proj_s = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.nextn.eh_proj_s = create_dense_scale(tn(LLM_TENSOR_NEXTN_EH_PROJ, "scale", i), layer.nextn.eh_proj);
             }
             if (!layer.nextn.shared_head_head_s && layer.nextn.shared_head_head) {
-                layer.nextn.shared_head_head_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "scale", i), {1}, TENSOR_NOT_REQUIRED);
+                layer.nextn.shared_head_head_s = create_dense_scale(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "scale", i), layer.nextn.shared_head_head);
             }
 
             // input scales
@@ -1943,7 +1955,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // weight scale
             if (!output_s && (ml.get_weight(tn(LLM_TENSOR_OUTPUT, "scale").str().c_str()) ||
                               gguf_find_tensor(ml.metadata, tn(LLM_TENSOR_OUTPUT, "scale").str().c_str()) >= 0)) {
-                output_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "scale"), {1}, TENSOR_NOT_REQUIRED);
+                output_s = create_dense_scale(tn(LLM_TENSOR_OUTPUT, "scale"), output);
             }
             // input scale
             if (!output_in_s && (ml.get_weight(tn(LLM_TENSOR_OUTPUT, "input_scale").str().c_str()) ||
