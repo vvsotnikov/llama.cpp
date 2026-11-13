@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "mmq.cuh"
+#include "nvfp4-mlp.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
 
@@ -129,6 +130,11 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_type type, const ggml_pr
         return GGML_PREC_Q8;
     }
     return GGML_PREC_Q4;
+}
+
+
+bool ggml_cuda_nvfp4_mlp_precision(const ggml_tensor * mm, int cc) {
+    return ggml_cuda_mmq_get_prec_src1(GGML_TYPE_NVFP4, ggml_prec_get_src(mm, 1), cc) == GGML_PREC_Q4;
 }
 
 

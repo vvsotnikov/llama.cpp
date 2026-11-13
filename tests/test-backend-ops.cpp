@@ -8455,6 +8455,80 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+struct test_nvfp4_mlp : public test_case {
+    const int64_t tokens;
+    const bool channel_scale;
+    const bool retain_glu;
+    const bool zero_input;
+    const uint32_t seed;
+    const int64_t n;
+
+    test_nvfp4_mlp(int64_t tokens, bool channel_scale = false, bool retain_glu = false, bool zero_input = false, uint32_t seed = 1, int64_t n = 1024)
+        : tokens(tokens), channel_scale(channel_scale), retain_glu(retain_glu), zero_input(zero_input), seed(seed), n(n) {}
+
+    std::string vars() override { return VARS_TO_STR6(tokens, channel_scale, retain_glu, zero_input, seed, n); }
+    std::string op_desc(ggml_tensor *) override { return "NVFP4_MLP"; }
+    bool run_whole_graph() override { return true; }
+    bool use_graph_allocator() override { return true; }
+    bool use_weight_context() override { return true; }
+    double max_nmse_err() override { return 2e-2; }
+
+    ggml_tensor * build_graph(ggml_context *) override { GGML_ABORT("weight context required"); }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * weights) override {
+        const int64_t k = 512;
+        auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+        ggml_set_name(input, "nvfp4_mlp_input");
+        auto project = [&]() {
+            auto * w = ggml_new_tensor_2d(weights, GGML_TYPE_NVFP4, k, n);
+            auto * mm = ggml_mul_mat(ctx, w, input);
+            return ggml_mul(ctx, mm, ggml_new_tensor_1d(weights, GGML_TYPE_F32, channel_scale ? n : 1));
+        };
+        auto * up = project();
+        auto * gate = project();
+        auto * glu = ggml_swiglu_split(ctx, gate, up);
+        auto * down = ggml_new_tensor_2d(weights, GGML_TYPE_NVFP4, n, k);
+        auto * result = ggml_mul_mat(ctx, down, glu);
+        if (retain_glu) {
+            result = ggml_add(ctx, result, ggml_view_2d(ctx, glu, k, tokens, glu->nb[1], 0));
+        }
+        return ggml_add(ctx, result, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+            if (t->op != GGML_OP_NONE || (t->type != GGML_TYPE_NVFP4 && t->type != GGML_TYPE_F32)) {
+                continue;
+            }
+            uint32_t tensor_seed = seed;
+            for (const char * c = t->name; *c; ++c) {
+                tensor_seed = (tensor_seed ^ uint8_t(*c)) * 16777619u;
+            }
+            std::mt19937 rng(tensor_seed);
+            std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+            std::vector<float> values(ggml_nelements(t));
+            for (auto & value : values) {
+                value = distribution(rng);
+            }
+            if (t->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+            } else {
+                std::vector<uint8_t> packed(ggml_nbytes(t));
+                ggml_quantize_chunk(t->type, values.data(), packed.data(), 0, ggml_nrows(t), t->ne[0], nullptr);
+                ggml_backend_tensor_set(t, packed.data(), 0, packed.size());
+            }
+        }
+        if (auto * input = ggml_get_tensor(ctx, "nvfp4_mlp_input")) {
+            std::vector<float> values(ggml_nelements(input));
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = zero_input ? 0.0f : float(int(i % 3) - 1);
+            }
+            ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
+        }
+    }
+};
+
 struct test_fp8_pipeline : public test_case {
     const int64_t tokens;
     const int producer;
@@ -13224,6 +13298,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
+
+    for (uint32_t seed : {1, 2, 3}) {
+        for (int64_t tokens : {511, 512, 513, 640, 768, 1024}) {
+            test_cases.emplace_back(new test_nvfp4_mlp(tokens, false, false, false, seed));
+        }
+        test_cases.emplace_back(new test_nvfp4_mlp(512, true, false, false, seed));
+        test_cases.emplace_back(new test_nvfp4_mlp(512, false, true, false, seed));
+        test_cases.emplace_back(new test_nvfp4_mlp(512, false, false, true, seed));
+    }
+
+    test_cases.emplace_back(new test_nvfp4_mlp(512, false, false, false, 1, 32768));
 
     for (int64_t tokens : {63, 64, 65, 128}) {
         for (int producer : {0, 1, 2, 3, 4, 5}) {

@@ -29,6 +29,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fp8.cuh"
+#include "ggml-cuda/nvfp4-mlp.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -805,6 +806,11 @@ struct ggml_backend_cuda_buffer_context {
     std::mutex fragment_mutex;
     std::unordered_map<const void *, fragment_entry> quant_fragments;
     std::unordered_map<const void *, fragment_entry> prefill_iq3;
+    struct mlp_entry {
+        fragment_entry prepared;
+        const void * gate;
+    };
+    std::unordered_map<const void *, mlp_entry> nvfp4_mlp;
 
     static constexpr size_t input_slot_bytes = 64*1024;
     struct input_slot {
@@ -820,6 +826,7 @@ struct ggml_backend_cuda_buffer_context {
         std::lock_guard<std::mutex> lock(fragment_mutex);
         for (auto & entry : quant_fragments) entry.second.dirty = true;
         for (auto & entry : prefill_iq3) entry.second.dirty = true;
+        for (auto & entry : nvfp4_mlp) entry.second.prepared.dirty = true;
     }
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -845,6 +852,11 @@ struct ggml_backend_cuda_buffer_context {
         for (auto & entry : prefill_iq3) {
             CUDA_CHECK(cudaFree(entry.second.data));
             CUDA_CHECK(cudaEventDestroy(entry.second.ready));
+        }
+        for (auto & entry : nvfp4_mlp) {
+            CUDA_CHECK(cudaEventSynchronize(entry.second.prepared.ready));
+            CUDA_CHECK(cudaFree(entry.second.prepared.data));
+            CUDA_CHECK(cudaEventDestroy(entry.second.prepared.ready));
         }
         CUDA_CHECK(cudaFree(dev_ptr));
     }
@@ -3967,7 +3979,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const ggml_tensor * consumed_input = nullptr) {
     bool is_ok = true;
     // one block reads all logits before it writes, so logits may alias the out nodes
     const ggml_tensor * logits_may_alias = nullptr;
@@ -3986,7 +3999,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
+                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias || src == consumed_input) {
                     continue;
                 }
 
@@ -4651,6 +4664,168 @@ static bool ggml_cuda_try_scaled_swiglu(ggml_backend_cuda_context & ctx, ggml_cg
     return true;
 }
 
+struct ggml_cuda_nvfp4_mlp_match {
+    const ggml_tensor * input;
+    const ggml_tensor * up;
+    const ggml_tensor * gate;
+    const ggml_tensor * up_scale;
+    const ggml_tensor * gate_scale;
+    const ggml_tensor * down;
+    ggml_tensor * output;
+};
+
+static bool ggml_cuda_match_nvfp4_mlp(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i, ggml_cuda_nvfp4_mlp_match & result, bool prepare_only = false) {
+    if (i + 5 >= graph->n_nodes || !ctx.stream_context().concurrent_events.empty() ||
+            !ggml_cuda_nvfp4_mlp_available(ggml_cuda_info().devices[ctx.device].cc)) {
+        return false;
+    }
+    const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_GLU, GGML_OP_MUL_MAT };
+    const int retained[] = { i + 5 };
+    if (!ggml_can_fuse_subgraph(graph, i, 6, ops, retained, 1)) {
+        return false;
+    }
+    const auto * first = graph->nodes[i];
+    const auto * second = graph->nodes[i + 2];
+    const auto * first_scaled = graph->nodes[i + 1];
+    const auto * second_scaled = graph->nodes[i + 3];
+    const auto * glu = graph->nodes[i + 4];
+    auto * output = graph->nodes[i + 5];
+    const auto * input = first->src[1];
+    const auto * down = output->src[0];
+    if (second->src[1] != input || output->src[1] != glu || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+            ggml_get_op_params_i32(glu, 1) || !ggml_are_same_shape(first, second) || !ggml_are_same_shape(first, glu) ||
+            !((glu->src[0] == first_scaled && glu->src[1] == second_scaled) ||
+              (glu->src[0] == second_scaled && glu->src[1] == first_scaled))) {
+        return false;
+    }
+    const int64_t k = input->ne[0], rows = input->ne[1], n = first->ne[0];
+    if (k < 512 || k > 32768 || k % 512 || n < 256 || n > 65536 || n % 512 ||
+            rows < 1 || rows > 8192 || (!prepare_only && (rows < 512 || rows % 128)) || !ggml_is_matrix(input) || !ggml_is_matrix(down) || !ggml_cuda_is_aligned(input, 32) ||
+            down->ne[0] != n || down->ne[1] != k) {
+        return false;
+    }
+    const ggml_tensor * weights[] = { first->src[0], second->src[0], down };
+    for (const auto * w : weights) {
+        if (w->type != GGML_TYPE_NVFP4 || !ggml_is_contiguous(w) || !ggml_is_matrix(w) || !w->buffer ||
+                !ggml_backend_buffer_is_cuda(w->buffer) || ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                ((ggml_backend_cuda_buffer_context *) w->buffer->context)->device != ctx.device) {
+            return false;
+        }
+    }
+    if (first->src[0]->buffer != second->src[0]->buffer) {
+        return false;
+    }
+    for (const auto * t : { input, first, second, first_scaled, second_scaled, glu, static_cast<const ggml_tensor *>(output) }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    for (const auto * mm : { first, second, static_cast<const ggml_tensor *>(output) }) {
+        if (ggml_get_op_params_i32(mm, 3) == GGML_PREC_F32 ||
+                !ggml_cuda_nvfp4_mlp_precision(mm, ggml_cuda_info().devices[ctx.device].cc)) {
+            return false;
+        }
+    }
+    auto get_scale = [](const ggml_tensor * mm, const ggml_tensor * scaled) -> const ggml_tensor * {
+        const auto * scale = scaled->src[0] == mm ? scaled->src[1] : scaled->src[1] == mm ? scaled->src[0] : nullptr;
+        return scale && scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale) &&
+                (ggml_nelements(scale) == 1 || (ggml_is_vector(scale) && scale->ne[0] == mm->ne[0])) ? scale : nullptr;
+    };
+    const auto * first_scale = get_scale(first, first_scaled);
+    const auto * second_scale = get_scale(second, second_scaled);
+    if (!first_scale || !second_scale || !ggml_cuda_check_fusion_memory_ranges(graph, i, 6, retained, 1, false, input)) {
+        return false;
+    }
+    // Input packing completes before the down projection writes, so its output may reuse input storage.
+    const ggml_tensor * sources[] = { first->src[0], second->src[0], down, first_scale, second_scale };
+    for (const auto * src : sources) {
+        if (ggml_cuda_tensors_overlap(output, src)) {
+            return false;
+        }
+    }
+    const bool gate_first = glu->src[0] == first_scaled;
+    result = { input, gate_first ? second->src[0] : first->src[0], gate_first ? first->src[0] : second->src[0],
+            gate_first ? second_scale : first_scale, gate_first ? first_scale : second_scale, down, output };
+    return true;
+}
+
+static thread_local ggml_backend_cuda_context * nvfp4_mlp_graph_owner = nullptr;
+
+static void ggml_cuda_prepare_nvfp4_mlp(ggml_backend_cuda_context & ctx, ggml_cgraph * graph) {
+    nvfp4_mlp_graph_owner = nullptr;
+    if (!ggml_cuda_env_flag("GGML_CUDA_NVFP4_MLP") || ggml_cuda_fusion_disabled()) {
+        return;
+    }
+    // A graph writing a weight buffer cannot reuse its prepared representation.
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto * node = graph->nodes[i];
+        if (node->op != GGML_OP_NONE && node->op != GGML_OP_VIEW && node->op != GGML_OP_RESHAPE &&
+                node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE && node->buffer &&
+                ggml_backend_buffer_is_cuda(node->buffer) &&
+                ggml_backend_buffer_get_usage(node->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            ((ggml_backend_cuda_buffer_context *) node->buffer->context)->invalidate_fragments();
+            return;
+        }
+    }
+    nvfp4_mlp_graph_owner = &ctx;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_cuda_nvfp4_mlp_match match;
+        if (!ggml_cuda_match_nvfp4_mlp(ctx, graph, i, match, true)) {
+            continue;
+        }
+        auto * buffer = (ggml_backend_cuda_buffer_context *) match.up->buffer->context;
+        std::lock_guard<std::mutex> lock(buffer->fragment_mutex);
+        const size_t bytes = ggml_cuda_nvfp4_mlp_weight_bytes(match.up->ne[0], match.up->ne[1]);
+        auto it = buffer->nvfp4_mlp.find(match.up->data);
+        if (it == buffer->nvfp4_mlp.end()) {
+            size_t available, total;
+            CUDA_CHECK(cudaMemGetInfo(&available, &total));
+            if (available < bytes || available - bytes < (size_t(2) << 30)) {
+                continue;
+            }
+            void * data = nullptr;
+            if (cudaMalloc(&data, bytes) != cudaSuccess) {
+                cudaGetLastError();
+                continue;
+            }
+            cudaEvent_t ready;
+            CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+            it = buffer->nvfp4_mlp.emplace(match.up->data, ggml_backend_cuda_buffer_context::mlp_entry {
+                    { data, bytes, match.up->ne[0], match.up->ne[1], true, ctx.stream(), ready }, match.gate->data }).first;
+            GGML_LOG_INFO("%s: prepared %s, extra storage %.2f MiB\n", __func__, match.up->name, bytes / 1048576.0);
+        }
+        auto & entry = it->second.prepared;
+        if (entry.size != bytes || entry.k != match.up->ne[0] || entry.n != match.up->ne[1] || it->second.gate != match.gate->data) {
+            continue;
+        }
+        if (entry.dirty) {
+            ggml_cuda_nvfp4_mlp_prepare(match.up, match.gate, entry.data, ctx.stream());
+            CUDA_CHECK(cudaEventRecord(entry.ready, ctx.stream()));
+            entry.producer = ctx.stream();
+            entry.dirty = false;
+        }
+        // Finish preparation before capture can switch to another execution stream.
+        CUDA_CHECK(cudaEventSynchronize(entry.ready));
+    }
+}
+
+static int ggml_cuda_try_nvfp4_mlp(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    if (nvfp4_mlp_graph_owner != &ctx) {
+        return 0;
+    }
+    ggml_cuda_nvfp4_mlp_match match;
+    if (!ggml_cuda_match_nvfp4_mlp(ctx, graph, i, match)) {
+        return 0;
+    }
+    auto * buffer = (ggml_backend_cuda_buffer_context *) match.up->buffer->context;
+    std::lock_guard<std::mutex> lock(buffer->fragment_mutex);
+    const auto it = buffer->nvfp4_mlp.find(match.up->data);
+    if (it == buffer->nvfp4_mlp.end() || it->second.prepared.dirty || it->second.gate != match.gate->data) {
+        return 0;
+    }
+    return ggml_cuda_nvfp4_mlp(ctx, match.input, match.up_scale, match.gate_scale, match.down, match.output, it->second.prepared.data) ? 5 : 0;
+}
+
 static int ggml_cuda_try_fp8_pipeline(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
     static const bool enabled = [] {
         const char * value = getenv("GGML_CUDA_FP8_PIPELINE");
@@ -4757,6 +4932,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 0;
     }
 
+    const int mlp_skip = ggml_cuda_try_nvfp4_mlp(*cuda_ctx, cgraph, i);
+    if (mlp_skip) {
+        return mlp_skip;
+    }
     const int fp8_skip = ggml_cuda_try_fp8_pipeline(*cuda_ctx, cgraph, i);
     if (fp8_skip) {
         return fp8_skip;
@@ -5889,6 +6068,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_prepare_quant_fragments(*cuda_ctx,cgraph);
     ggml_cuda_prepare_prefill_iq3(*cuda_ctx, cgraph);
+    ggml_cuda_prepare_nvfp4_mlp(*cuda_ctx, cgraph);
     bool graph_mode = false;
 #ifdef USE_CUDA_GRAPH
     static const bool graphs_disabled = getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;

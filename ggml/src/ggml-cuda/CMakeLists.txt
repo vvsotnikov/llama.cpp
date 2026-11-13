@@ -140,7 +140,7 @@ if (CUDAToolkit_FOUND)
         if (NOT EXISTS "${GGML_CUDA_CUTLASS_PATH}/include/cutlass/cutlass.h")
             message(FATAL_ERROR "GGML_CUDA_CUTLASS_PATH must contain include/cutlass/cutlass.h")
         endif()
-        set_source_files_properties(fp8-pipeline.cu PROPERTIES
+        set_source_files_properties(fp8-pipeline.cu nvfp4-mlp.cu PROPERTIES
             INCLUDE_DIRECTORIES "${GGML_CUDA_CUTLASS_PATH}/include"
             COMPILE_DEFINITIONS GGML_CUDA_FP8_CUTLASS
             COMPILE_OPTIONS --expt-relaxed-constexpr)
