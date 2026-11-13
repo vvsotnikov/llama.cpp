@@ -132,6 +132,20 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    set(GGML_CUDA_CUTLASS_PATH "" CACHE PATH "CUTLASS root for the optional FP8 producer pipeline")
+    if (GGML_CUDA_CUTLASS_PATH)
+        if (CUDAToolkit_VERSION VERSION_LESS "12.8")
+            message(FATAL_ERROR "The CUTLASS FP8 producer pipeline requires CUDA 12.8 or newer")
+        endif()
+        if (NOT EXISTS "${GGML_CUDA_CUTLASS_PATH}/include/cutlass/cutlass.h")
+            message(FATAL_ERROR "GGML_CUDA_CUTLASS_PATH must contain include/cutlass/cutlass.h")
+        endif()
+        set_source_files_properties(fp8-pipeline.cu PROPERTIES
+            INCLUDE_DIRECTORIES "${GGML_CUDA_CUTLASS_PATH}/include"
+            COMPILE_DEFINITIONS GGML_CUDA_FP8_CUTLASS
+            COMPILE_OPTIONS --expt-relaxed-constexpr)
+    endif()
+
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()

@@ -4651,9 +4651,115 @@ static bool ggml_cuda_try_scaled_swiglu(ggml_backend_cuda_context & ctx, ggml_cg
     return true;
 }
 
+static int ggml_cuda_try_fp8_pipeline(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_FP8_PIPELINE");
+        return value && strcmp(value, "0") != 0;
+    }();
+    if (!enabled || !ctx.stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    auto * first = graph->nodes[i];
+    int mm_start = i;
+    const ggml_tensor * producer = nullptr;
+    const ggml_tensor * residual = nullptr;
+    const int add_index = first->op == GGML_OP_MUL ? i + 1 : i;
+    if ((first->op == GGML_OP_MUL || first->op == GGML_OP_ADD) && add_index + 4 < graph->n_nodes &&
+            graph->nodes[add_index]->op == GGML_OP_ADD &&
+            (add_index == i || graph->nodes[add_index]->src[0] == first) &&
+            graph->nodes[add_index + 1]->op == GGML_OP_RMS_NORM &&
+            graph->nodes[add_index + 1]->src[0] == graph->nodes[add_index] &&
+            graph->nodes[add_index + 2]->op == GGML_OP_MUL &&
+            graph->nodes[add_index + 2]->src[0] == graph->nodes[add_index + 1]) {
+        residual = graph->nodes[add_index];
+        producer = graph->nodes[add_index + 2];
+        mm_start = add_index + 3;
+    } else if (first->op == GGML_OP_RMS_NORM && i + 3 < graph->n_nodes && graph->nodes[i + 1]->op == GGML_OP_MUL &&
+            graph->nodes[i + 1]->src[0] == first) {
+        producer = graph->nodes[i + 1];
+        mm_start = i + 2;
+    } else if (first->op == GGML_OP_GLU) {
+        producer = first;
+        mm_start = i + 1;
+    } else if (first->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    if (mm_start + 1 >= graph->n_nodes || graph->nodes[mm_start]->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const auto * input = graph->nodes[mm_start]->src[1];
+    if ((producer && input != producer) || input->ne[1] < 64) {
+        return 0;
+    }
+    const ggml_tensor * weights[2];
+    const ggml_tensor * scales[2];
+    ggml_tensor * outputs[2];
+    int count = 0;
+    for (int j = mm_start; j + 1 < graph->n_nodes && count < 2; j += 2) {
+        const auto * mm = graph->nodes[j];
+        const auto * scaled = graph->nodes[j + 1];
+        if (mm->op != GGML_OP_MUL_MAT || mm->src[0]->type != GGML_TYPE_F8_E4M3 || mm->src[1] != input ||
+                scaled->op != GGML_OP_MUL || ggml_get_op_params_i32(mm, 3) == GGML_PREC_F32 ||
+                !ggml_are_same_shape(mm, scaled)) {
+            break;
+        }
+        const auto * scale = scaled->src[0] == mm ? scaled->src[1] : scaled->src[1] == mm ? scaled->src[0] : nullptr;
+        if (!scale || scale->type != GGML_TYPE_F32 || !ggml_is_vector(scale) || scale->ne[0] != mm->ne[0]) {
+            break;
+        }
+        weights[count] = mm->src[0];
+        scales[count] = scale;
+        outputs[count++] = graph->nodes[j + 1];
+    }
+    for (; count > 0; --count) {
+        const int nodes = mm_start - i + 2 * count;
+        ggml_op ops[8];
+        for (int j = 0; j < nodes; ++j) {
+            ops[j] = graph->nodes[i + j]->op;
+        }
+        int retained[4], retained_count = 0;
+        if (residual) {
+            retained[retained_count++] = add_index;
+        }
+        // Other projections can still read the normalized F32 input.
+        if (producer) {
+            retained[retained_count++] = mm_start - 1;
+        }
+        for (int j = 0; j < count; ++j) {
+            retained[retained_count++] = mm_start + 2 * j + 1;
+        }
+        if (!ggml_can_fuse_subgraph(graph, i, nodes, ops, retained, retained_count) ||
+                !ggml_cuda_check_fusion_memory_ranges(graph, i, nodes, retained, retained_count)) {
+            continue;
+        }
+        bool overlaps_leaf = false;
+        for (int d = 0; d < retained_count; ++d) {
+            for (int j = i; j < i + nodes; ++j) {
+                for (const auto * src : graph->nodes[j]->src) {
+                    if (src && src->op == GGML_OP_NONE && ggml_cuda_tensors_overlap(graph->nodes[retained[d]], src)) {
+                        overlaps_leaf = true;
+                    }
+                }
+            }
+        }
+        if (overlaps_leaf || (count == 2 && ggml_cuda_tensors_overlap(outputs[0], outputs[1]))) {
+            continue;
+        }
+        if (ggml_cuda_mul_mat_fp8_pipeline(ctx, input, weights, scales, outputs, count, producer, residual, residual && first->op == GGML_OP_MUL)) {
+            return nodes - 1;
+        }
+    }
+    return 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, std::vector<bool> & nodes_fused) {
     if (ggml_cuda_fusion_disabled()) {
         return 0;
+    }
+
+    const int fp8_skip = ggml_cuda_try_fp8_pipeline(*cuda_ctx, cgraph, i);
+    if (fp8_skip) {
+        return fp8_skip;
     }
 
     ggml_tensor * node = cgraph->nodes[i];

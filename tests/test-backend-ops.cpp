@@ -8455,6 +8455,75 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+struct test_fp8_pipeline : public test_case {
+    const int64_t tokens;
+    const int producer;
+    const bool pair;
+    const bool keep_normalized;
+    const int64_t k;
+    const int input_pattern;
+
+    test_fp8_pipeline(int64_t tokens, int producer, bool pair, bool keep_normalized, int64_t k = 256, int input_pattern = 0)
+        : tokens(tokens), producer(producer), pair(pair), keep_normalized(keep_normalized), k(k), input_pattern(input_pattern) {}
+
+    std::string vars() override {
+        return VARS_TO_STR6(tokens, producer, pair, keep_normalized, k, input_pattern);
+    }
+
+    std::string op_desc(ggml_tensor *) override { return "FP8_PIPELINE"; }
+    bool run_whole_graph() override { return true; }
+    bool use_graph_allocator() override { return true; }
+    double max_nmse_err() override { return 5e-3; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n = 96;
+        auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+        ggml_set_name(x, "fp8_pipeline_input");
+        ggml_tensor * residual = nullptr;
+        if (producer >= 3) {
+            if (producer >= 4) {
+                x = ggml_mul(ctx, x, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, producer == 4 ? k : 1));
+            }
+            residual = ggml_add(ctx, x, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens));
+            x = residual;
+        }
+        if (producer == 1 || producer >= 3) {
+            auto * norm = ggml_rms_norm(ctx, x, 1e-5f);
+            x = ggml_mul(ctx, norm, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k));
+        } else if (producer == 2) {
+            x = ggml_glu_split(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens), x, GGML_GLU_OP_SWIGLU);
+        }
+        auto project = [&]() {
+            auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, k, n);
+            auto * mm = ggml_mul_mat(ctx, w, x);
+            return ggml_mul(ctx, mm, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n));
+        };
+        auto * first = project();
+        auto * result = pair ? ggml_add(ctx, first, project()) : first;
+        if (keep_normalized) {
+            result = ggml_add(ctx, result, ggml_view_2d(ctx, x, n, tokens, x->nb[1], 0));
+        }
+        if (residual) {
+            result = ggml_add(ctx, result, ggml_view_2d(ctx, residual, n, tokens, residual->nb[1], 0));
+        }
+        return result;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t);
+        }
+        if (input_pattern) {
+            auto * input = ggml_get_tensor(ctx, "fp8_pipeline_input");
+            std::vector<float> values(ggml_nelements(input));
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = input_pattern == 1 || (i / k) % 2 == 0 ? 0.0f : float(int(i % 3) - 1);
+            }
+            ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
+        }
+    }
+};
+
 // Fused gate/up/GLU with GGML_PREC_Q8 on src1, e.g. a W4A16 NVFP4 checkpoint (W4A8, see test_mul_mat_w4a8)
 struct test_mul_mat_vec_fusion_w4a8 : public test_mul_mat_vec_fusion {
     using test_mul_mat_vec_fusion::test_mul_mat_vec_fusion;
@@ -13155,6 +13224,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
+
+    for (int64_t tokens : {63, 64, 65, 128}) {
+        for (int producer : {0, 1, 2, 3, 4, 5}) {
+            for (bool pair : {false, true}) {
+                test_cases.emplace_back(new test_fp8_pipeline(tokens, producer, pair, producer == 1 || producer >= 3));
+            }
+        }
+    }
+
+    for (int producer : {1, 3, 4, 5}) {
+        test_cases.emplace_back(new test_fp8_pipeline(128, producer, true, true, 5120));
+    }
+    for (int input_pattern : {1, 2}) {
+        test_cases.emplace_back(new test_fp8_pipeline(128, 0, true, false, 256, input_pattern));
+    }
 
     for (bool with_bias : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 16, 32, 256,

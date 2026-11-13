@@ -301,6 +301,11 @@ The environment variable [`CUDA_SCALE_LAUNCH_QUEUES`](https://docs.nvidia.com/cu
 
 Consider setting `CUDA_SCALE_LAUNCH_QUEUES=4x`, which increases the CUDA command buffer to 4 times its default size. This optimization is particularly beneficial for **Multi-GPU setups with pipeline parallelism**, where it significantly improves prompt processing throughput by allowing more operations to be enqueued across GPUs.
 
+#### Optional FP8 producer pipeline
+
+A build with `-DGGML_CUDA_CUTLASS_PATH=/path/to/cutlass` can enable the optional
+Blackwell FP8 producer pipeline. See [configuration and validation](development/cuda-fp8-pipeline.md).
+
 #### GGML_CUDA_CUBLAS_COMPUTE_TYPE
 
 Override default, speed-optimized compute types for cuBLAS matrix multiplications.
