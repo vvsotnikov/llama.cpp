@@ -2843,7 +2843,7 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         if (!reuse) {
-            auto dev = params_base.devices.empty() ? ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) : params_base.devices.front();
+            auto * dev = llama_model_get_device(model_tgt, 0);
             const bool device_storage = slots.size() == 1 && params_base.n_gpu_layers != 0 && dev &&
                 strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0;
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, device_storage);
