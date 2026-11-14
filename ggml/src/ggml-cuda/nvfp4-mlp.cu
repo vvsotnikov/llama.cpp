@@ -196,6 +196,9 @@ struct nvfp4_mlp_consumer {
               reinterpret_cast<const cutlass::float_ue4m3_t *>(sb), config::tile_atom_to_shape_SFB(shape) },
             { scaling, nullptr, { n, cute::_1{}, int64_t(0) }, output, { n, cute::_1{}, int64_t(0) } }
         };
+        args.hw_info.device_id = ctx.device;
+        args.hw_info.sm_count = ggml_cuda_info().devices[ctx.device].nsm;
+        args.scheduler.max_swizzle_size = 4;
         const auto status = gemm::can_implement(args);
         GGML_ASSERT(status == cutlass::Status::kSuccess);
         ggml_cuda_pool_alloc<uint8_t> workspace(ctx.pool(), std::max<size_t>(1, gemm::get_workspace_size(args)));
