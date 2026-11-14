@@ -108,6 +108,13 @@ for ncols in [8, 16, 32, 64]:
                 head_size_v = HEAD_SIZES_V_OVERRIDE.get(head_size_kq, head_size_kq)
                 f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=ncols1, ncols2=ncols2, head_size_kq=head_size_kq, head_size_v=head_size_v))
 
+# Wide prefill tile for 256-dimensional GQA attention.
+with open("fattn-mma-f16-instance-ncols1_64-ncols2_2.cu", "w") as f:
+    f.write(SOURCE_FATTN_MMA_START)
+    f.write("#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)\n")
+    f.write(SOURCE_FATTN_MMA_CASE.format(ncols1=64, ncols2=2, head_size_kq=256, head_size_v=256))
+    f.write("#endif\n")
+
 for type in TYPES_MMQ:
     with open(f"mmq-instance-{get_short_name(type)}.cu", "w") as f:
         f.write(SOURCE_MMQ.format(type=type))

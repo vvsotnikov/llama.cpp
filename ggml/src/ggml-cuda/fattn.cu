@@ -184,6 +184,20 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     }
 #endif // !defined(GGML_USE_MUSA)
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if constexpr (DKQ == 256 && DV == 256 && ncols2 == 2) {
+        static const bool wide_prefill = [] {
+            const char * value = getenv("GGML_CUDA_FA_WIDE_PREFILL");
+            return value && atoi(value) != 0;
+        }();
+        // The KV mask scan consumes every row of a complete query tile.
+        if (wide_prefill && Q->ne[1] >= 64 && Q->ne[1] % 64 == 0 && ampere_mma_available(cc)) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64, ncols2>(ctx, dst);
+            return;
+        }
+    }
+#endif
+
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);

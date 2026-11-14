@@ -13206,6 +13206,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Wide prefill query tiles: causal masks, short/tail queries, and GQA ratio six.
+    for (int kv : {256, 2048}) {
+        for (int nb : {63, 64, 65, 127, 128, 129, 257, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb,
+                    true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+    for (int kv : {256, 2048, 4096}) {
+        for (int nb : {64, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb,
+                    true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
+            for (const auto & permute : {std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3}}) {
+                test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256, 4, {6, 1}, kv, nb,
+                        true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, permute));
+            }
+        }
+    }
+
     // KV-head counts that do not divide the device count
     for (int hs : { 128, 256, 512, }) {
         for (int nh : { 1, 2, 6, }) {

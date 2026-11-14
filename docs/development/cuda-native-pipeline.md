@@ -67,6 +67,7 @@ export GGML_CUDA_NVFP4_MLP_DOWN=1
 export GGML_CUDA_NVFP4_DIRECT_PACK=1
 export GGML_CUDA_NORM_INPUT_REUSE=1
 export GGML_CUDA_FA_PREFILL_GQA=2
+export GGML_CUDA_FA_WIDE_PREFILL=1
 ```
 
 Split convolution reads the current projection and retained convolution history
@@ -83,6 +84,11 @@ packing kernel completes. Partial aliases of retained row outputs are rejected.
 
 `GGML_CUDA_FA_PREFILL_GQA=2` selects a measured attention grouping; it is a tuning
 choice, not a claim that this grouping is best on every CUDA device.
+`GGML_CUDA_FA_WIDE_PREFILL=1` doubles the query tile for 256-dimensional
+attention with this grouping on NVIDIA Ampere or newer devices. It applies to
+complete 64-query tiles; short batches and partial tiles retain the original
+dispatch. The qualified configuration uses F16 KV and preserves the original
+32-token softmax update interval.
 
 ## Serving with DFlash2
 
