@@ -1087,6 +1087,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
+    "SSM_CONV_SPLIT",
     "SSM_SCAN",
     "WIN_PART",
     "WIN_UNPART",
@@ -1119,7 +1120,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1203,6 +1204,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
+    "ssm_conv_split(x)",
     "ssm_scan(x)",
     "win_part(x)",
     "win_unpart(x)",
@@ -1235,7 +1237,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5778,6 +5780,24 @@ struct ggml_tensor * ggml_ssm_conv(
     result->src[0] = sx;
     result->src[1] = c;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_ssm_conv_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * history) {
+    GGML_ASSERT(ggml_is_3d(x) && ggml_is_matrix(c) && ggml_is_3d(history));
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && c->type == GGML_TYPE_F32 && history->type == GGML_TYPE_F32);
+    GGML_ASSERT(x->ne[0] > 0 && c->ne[0] > 1);
+    GGML_ASSERT(history->ne[0] == c->ne[0] - 1 && history->ne[1] == c->ne[1]);
+    GGML_ASSERT(x->ne[1] == c->ne[1] && x->ne[2] == history->ne[2]);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c->ne[1], x->ne[0], x->ne[2]);
+    result->op = GGML_OP_SSM_CONV_SPLIT;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = history;
     return result;
 }
 

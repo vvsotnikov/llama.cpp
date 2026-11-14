@@ -243,10 +243,19 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    static const bool early_projections = [] {
+        const char * value = getenv("GGML_CUDA_EARLY_QKVZ");
+        return value && strcmp(value, "0") != 0;
+    }();
+    if (early_projections && n_seq_tokens >= 64 && !ubatch.tree_parent &&
+            model.layers[il].wqkv->type == GGML_TYPE_F8_E4M3 && model.layers[il].wqkv_gate->type == GGML_TYPE_F8_E4M3) {
+        // Keep the shared-input projections adjacent before allocating graph storage.
+        ggml_build_forward_expand(gf, qkv_mixed);
+        ggml_build_forward_expand(gf, z);
+    }
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
-
-    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -368,13 +377,19 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * z         = qkvz.second;
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    static const bool shared_bf16 = [] { const char * value = getenv("GGML_CUDA_BF16_SHARED_INPUT"); return value && strcmp(value, "0") != 0; }();
+    if (shared_bf16 && ubatch.n_tokens >= 64 && !inp->tree_parent && beta->op == GGML_OP_MUL_MAT && alpha->op == GGML_OP_MUL_MAT &&
+            beta->src[0]->type == GGML_TYPE_BF16 && alpha->src[0]->type == GGML_TYPE_BF16) {
+        ggml_build_forward_expand(gf, beta);
+        ggml_build_forward_expand(gf, alpha);
+    }
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
     beta = ggml_sigmoid(ctx0, beta);
     cb(beta, "beta_sigmoid", il);
 
-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
@@ -394,7 +409,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+    static const bool split_conv = [] {
+        const char * value = getenv("GGML_CUDA_SSM_CONV_SPLIT");
+        return value && strcmp(value, "0") != 0;
+    }();
+    ggml_tensor * separate_history = nullptr;
+    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il,
+            split_conv ? &separate_history : nullptr);
 
     ggml_tensor * state = inp->gdn_ctl ?
         build_rs(ssm_states_all, inp->s_copy_s, inp->s_copy_s_main, hparams.n_embd_s(), n_seqs,
@@ -403,7 +424,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    ggml_tensor * conv_output_proper = separate_history ?
+        ggml_ssm_conv_split(ctx0, conv_input, conv_kernel, separate_history) : ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     if (inp->tree_parent) {
         conv_output_proper = ggml_reshape_3d(ctx0, conv_output_proper, conv_channels, n_seq_tokens, 1);
     }
@@ -492,6 +514,29 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
         model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
         NULL,
         LLM_FFN_SILU, LLM_FFN_PAR, il);
+    static const bool calibrated_nvfp4 = [] { const char * value = getenv("GGML_CUDA_NVFP4_CALIBRATED"); return value && strcmp(value, "0") != 0; }();
+    const auto & layer = model.layers[il];
+    if (calibrated_nvfp4 && layer.ffn_up->type == GGML_TYPE_NVFP4 && cur->op == GGML_OP_MUL) {
+        auto * down_mm = cur->src[0];
+        auto * glu = down_mm && down_mm->op == GGML_OP_MUL_MAT ? down_mm->src[1] : nullptr;
+        auto get_mm = [](ggml_tensor * scaled, ggml_tensor * weight) -> ggml_tensor * {
+            auto * mm = scaled && scaled->op == GGML_OP_MUL ? scaled->src[0] : nullptr;
+            return mm && mm->op == GGML_OP_MUL_MAT && mm->src[0] == weight ? mm : nullptr;
+        };
+        if (down_mm && down_mm->op == GGML_OP_MUL_MAT && down_mm->src[0] == layer.ffn_down &&
+                glu && glu->op == GGML_OP_GLU && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                layer.ffn_up_in_s && layer.ffn_gate_in_s && layer.ffn_down_in_s) {
+            auto * gate_mm = get_mm(glu->src[0], layer.ffn_gate);
+            auto * up_mm = get_mm(glu->src[1], layer.ffn_up);
+            if (gate_mm && up_mm) {
+                // Private CUDA prefill metadata. Slot 2 is reserved for routed-matmul IDs.
+                // Generic consumers ignore slot 3 and retain their original arithmetic.
+                gate_mm->src[3] = layer.ffn_gate_in_s;
+                up_mm->src[3] = layer.ffn_up_in_s;
+                down_mm->src[3] = layer.ffn_down_in_s;
+            }
+        }
+    }
     cb(cur, "ffn_out", il);
 
     return cur;

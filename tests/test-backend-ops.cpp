@@ -5044,6 +5044,72 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+struct test_ssm_conv_split : public test_case {
+    const int tokens, channels, sequences, kernel;
+    const bool silu, transposed;
+    test_ssm_conv_split(int tokens, int channels, int sequences, int kernel, bool silu, bool transposed)
+        : tokens(tokens), channels(channels), sequences(sequences), kernel(kernel), silu(silu), transposed(transposed) {}
+    std::string vars() override { return VARS_TO_STR6(tokens, channels, sequences, kernel, silu, transposed); }
+    std::string op_desc(ggml_tensor *) override { return "SSM_CONV_SPLIT"; }
+    bool run_whole_graph() override { return true; }
+    bool use_graph_allocator() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * x = transposed ? ggml_transpose(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, tokens, sequences)) :
+                               ggml_new_tensor_3d(ctx, GGML_TYPE_F32, tokens, channels, sequences);
+        auto * history = transposed ?
+                ggml_transpose(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, kernel - 1, sequences)) :
+                ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kernel - 1, channels, sequences);
+        auto * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kernel, channels);
+        auto * result = ggml_ssm_conv_split(ctx, x, weight, history);
+        if (silu) {
+            result = ggml_silu(ctx, result);
+        }
+        auto * reference = ggml_ssm_conv(ctx, ggml_concat(ctx, history, x, 0), weight);
+        if (silu) {
+            reference = ggml_silu(ctx, reference);
+        }
+        return ggml_concat(ctx, result, reference, 0);
+    }
+};
+
+struct test_ssm_conv_split_qkv : public test_case {
+    const int tokens, heads, sequences;
+    const bool transposed, retain_raw;
+    test_ssm_conv_split_qkv(int tokens, int heads, int sequences, bool transposed, bool retain_raw = false)
+        : tokens(tokens), heads(heads), sequences(sequences), transposed(transposed), retain_raw(retain_raw) {}
+    std::string vars() override { return VARS_TO_STR5(tokens,heads,sequences,transposed,retain_raw); }
+    std::string op_desc(ggml_tensor *) override { return "SSM_CONV_SPLIT_QKV"; }
+    bool run_whole_graph() override { return true; }
+    bool use_graph_allocator() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int d = 128, vh = 3*heads, channels = (2*heads + vh)*d;
+        auto * input = transposed ? ggml_transpose(ctx,ggml_new_tensor_3d(ctx,GGML_TYPE_F32,channels,tokens,sequences)) :
+                                    ggml_new_tensor_3d(ctx,GGML_TYPE_F32,tokens,channels,sequences);
+        auto * history = ggml_new_tensor_3d(ctx,GGML_TYPE_F32,3,channels,sequences);
+        auto * weight = ggml_new_tensor_2d(ctx,GGML_TYPE_F32,4,channels);
+        auto * silu = ggml_silu(ctx,ggml_ssm_conv_split(ctx,input,weight,history));
+        auto view = [&](int nheads,size_t offset) {
+            return ggml_view_4d(ctx,silu,d,nheads,tokens,sequences,d*4,channels*4,size_t(channels)*tokens*4,offset);
+        };
+        auto normalize = [&](ggml_tensor * v) {
+            return ggml_scale(ctx,ggml_rms_norm(ctx,v,1e-6f/d),1.0f/sqrtf(float(d)));
+        };
+        auto * q = normalize(view(heads,0));
+        auto * k = normalize(view(heads,heads*d*4));
+        auto * v = view(vh,2*heads*d*4);
+        auto * g = ggml_scale(ctx,ggml_sqr(ctx,ggml_new_tensor_4d(ctx,GGML_TYPE_F32,1,vh,tokens,sequences)),-0.1f);
+        auto * beta = ggml_sigmoid(ctx,ggml_new_tensor_4d(ctx,GGML_TYPE_F32,1,vh,tokens,sequences));
+        auto * state = ggml_new_tensor_4d(ctx,GGML_TYPE_F32,d,d,vh,sequences);
+        auto * result = ggml_gated_delta_net(ctx,q,k,v,g,beta,state,1);
+        if (retain_raw) {
+            // Retain the convolution output as well as the recurrent result.
+            result = ggml_concat(ctx,ggml_reshape_1d(ctx,result,ggml_nelements(result)),
+                    ggml_reshape_1d(ctx,silu,ggml_nelements(silu)),0);
+        }
+        return result;
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -8462,12 +8528,14 @@ struct test_nvfp4_mlp : public test_case {
     const bool zero_input;
     const uint32_t seed;
     const int64_t n;
+    const int norm;
+    const bool calibrated;
 
-    test_nvfp4_mlp(int64_t tokens, bool channel_scale = false, bool retain_glu = false, bool zero_input = false, uint32_t seed = 1, int64_t n = 1024)
-        : tokens(tokens), channel_scale(channel_scale), retain_glu(retain_glu), zero_input(zero_input), seed(seed), n(n) {}
+    test_nvfp4_mlp(int64_t tokens, bool channel_scale = false, bool retain_glu = false, bool zero_input = false, uint32_t seed = 1, int64_t n = 1024, int norm = 0, bool calibrated = false)
+        : tokens(tokens), channel_scale(channel_scale), retain_glu(retain_glu), zero_input(zero_input), seed(seed), n(n), norm(norm), calibrated(calibrated) {}
 
-    std::string vars() override { return VARS_TO_STR6(tokens, channel_scale, retain_glu, zero_input, seed, n); }
-    std::string op_desc(ggml_tensor *) override { return "NVFP4_MLP"; }
+    std::string vars() override { return VARS_TO_STR8(tokens, channel_scale, retain_glu, zero_input, seed, n, norm, calibrated); }
+    std::string op_desc(ggml_tensor *) override { return norm >= 4 ? "NVFP4_NORM_REUSE" : calibrated ? "NVFP4_MLP_CALIBRATED" : norm ? "NVFP4_MLP_NORM" : "NVFP4_MLP"; }
     bool run_whole_graph() override { return true; }
     bool use_graph_allocator() override { return true; }
     bool use_weight_context() override { return true; }
@@ -8476,12 +8544,25 @@ struct test_nvfp4_mlp : public test_case {
     ggml_tensor * build_graph(ggml_context *) override { GGML_ABORT("weight context required"); }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * weights) override {
-        const int64_t k = 512;
+        const int64_t k = norm ? 5120 : 512;
         auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
         ggml_set_name(input, "nvfp4_mlp_input");
+        ggml_tensor * residual = nullptr;
+        if (norm) {
+            if (norm >= 2) {
+                if (norm >= 4) { input = ggml_dup(ctx, input); }
+                auto * skip = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+                input = residual = norm >= 4 ? ggml_add_inplace(ctx, input, skip) : ggml_add(ctx, input, skip);
+            }
+            input = ggml_mul(ctx, ggml_rms_norm(ctx, input, 1e-6f), ggml_new_tensor_1d(weights, GGML_TYPE_F32, k));
+        }
         auto project = [&]() {
             auto * w = ggml_new_tensor_2d(weights, GGML_TYPE_NVFP4, k, n);
             auto * mm = ggml_mul_mat(ctx, w, input);
+            if (calibrated) {
+                mm->src[3] = ggml_new_tensor_1d(weights, GGML_TYPE_F32, 1);
+                ggml_set_name(mm->src[3], "nvfp4_input_calibration");
+            }
             return ggml_mul(ctx, mm, ggml_new_tensor_1d(weights, GGML_TYPE_F32, channel_scale ? n : 1));
         };
         auto * up = project();
@@ -8489,6 +8570,12 @@ struct test_nvfp4_mlp : public test_case {
         auto * glu = ggml_swiglu_split(ctx, gate, up);
         auto * down = ggml_new_tensor_2d(weights, GGML_TYPE_NVFP4, n, k);
         auto * result = ggml_mul_mat(ctx, down, glu);
+        if (calibrated) {
+            result->src[3] = ggml_new_tensor_1d(weights, GGML_TYPE_F32, 1);
+            ggml_set_name(result->src[3], "nvfp4_down_calibration");
+        }
+        if (norm == 2 || norm == 4) { result = ggml_add(ctx, result, residual); }
+        if (norm == 3 || norm == 5) { result = ggml_add(ctx, result, input); }
         if (retain_glu) {
             result = ggml_add(ctx, result, ggml_view_2d(ctx, glu, k, tokens, glu->nb[1], 0));
         }
@@ -8512,6 +8599,8 @@ struct test_nvfp4_mlp : public test_case {
                 value = distribution(rng);
             }
             if (t->type == GGML_TYPE_F32) {
+                if (strcmp(t->name, "nvfp4_input_calibration") == 0) { values[0] = 0.01f; }
+                if (strcmp(t->name, "nvfp4_down_calibration") == 0) { values[0] = 1.0f; }
                 ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
             } else {
                 std::vector<uint8_t> packed(ggml_nbytes(t));
@@ -8526,6 +8615,25 @@ struct test_nvfp4_mlp : public test_case {
             }
             ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
         }
+    }
+};
+
+struct test_bf16_shared_input : public test_case {
+    const int64_t tokens;
+    const bool offset;
+    test_bf16_shared_input(int64_t tokens, bool offset) : tokens(tokens), offset(offset) {}
+    std::string vars() override { return VARS_TO_STR2(tokens, offset); }
+    std::string op_desc(ggml_tensor *) override { return "BF16_SHARED_INPUT"; }
+    bool run_whole_graph() override { return true; }
+    bool use_graph_allocator() override { return true; }
+    double max_nmse_err() override { return 1e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t k = 5120;
+        auto * input = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k*tokens + (offset ? 1 : 0));
+        input = ggml_view_2d(ctx, input, k, tokens, k*sizeof(float), offset ? sizeof(float) : 0);
+        auto * first = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, k, 48), input);
+        auto * second = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_BF16, k, 48), input);
+        return ggml_add(ctx, first, second);
     }
 };
 
@@ -8544,7 +8652,7 @@ struct test_fp8_pipeline : public test_case {
         return VARS_TO_STR6(tokens, producer, pair, keep_normalized, k, input_pattern);
     }
 
-    std::string op_desc(ggml_tensor *) override { return "FP8_PIPELINE"; }
+    std::string op_desc(ggml_tensor *) override { return producer >= 6 ? "FP8_NORM_REUSE" : "FP8_PIPELINE"; }
     bool run_whole_graph() override { return true; }
     bool use_graph_allocator() override { return true; }
     double max_nmse_err() override { return 5e-3; }
@@ -8558,7 +8666,8 @@ struct test_fp8_pipeline : public test_case {
             if (producer >= 4) {
                 x = ggml_mul(ctx, x, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, producer == 4 ? k : 1));
             }
-            residual = ggml_add(ctx, x, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens));
+            auto * skip = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+            residual = producer >= 6 ? ggml_add_inplace(ctx, x, skip) : ggml_add(ctx, x, skip);
             x = residual;
         }
         if (producer == 1 || producer >= 3) {
@@ -8593,6 +8702,45 @@ struct test_fp8_pipeline : public test_case {
             for (size_t i = 0; i < values.size(); ++i) {
                 values[i] = input_pattern == 1 || (i / k) % 2 == 0 ? 0.0f : float(int(i % 3) - 1);
             }
+            ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
+        }
+    }
+};
+
+struct test_fp8_gated_norm : public test_case {
+    const int tokens, heads;
+    const bool pair, keep, zero;
+    test_fp8_gated_norm(int tokens, int heads, bool pair, bool keep, bool zero = false)
+        : tokens(tokens), heads(heads), pair(pair), keep(keep), zero(zero) {}
+    std::string vars() override { return VARS_TO_STR5(tokens, heads, pair, keep, zero); }
+    std::string op_desc(ggml_tensor *) override { return "FP8_GATED_NORM"; }
+    bool run_whole_graph() override { return true; }
+    bool use_graph_allocator() override { return true; }
+    double max_nmse_err() override { return 5e-3; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int k = 128*heads, n = 96;
+        auto * raw = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, heads, tokens);
+        ggml_set_name(raw, "gated_norm_input");
+        auto * normalized = ggml_mul(ctx, ggml_rms_norm(ctx, raw, 1e-5f), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128));
+        auto * gate = ggml_silu(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, heads, tokens));
+        auto * input = ggml_reshape_2d(ctx, ggml_mul(ctx, normalized, gate), k, tokens);
+        auto project = [&]() {
+            auto * mm = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, k, n), input);
+            return ggml_mul(ctx, mm, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n));
+        };
+        auto * result = project();
+        if (pair) { result = ggml_add(ctx, result, project()); }
+        if (keep) {
+            auto * flat = ggml_reshape_2d(ctx, normalized, k, tokens);
+            result = ggml_add(ctx, result, ggml_view_2d(ctx, flat, n, tokens, flat->nb[1], 0));
+        }
+        return result;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) { init_tensor_uniform(t); }
+        if (zero) {
+            auto * input = ggml_get_tensor(ctx, "gated_norm_input");
+            std::vector<float> values(ggml_nelements(input), 0.0f);
             ggml_backend_tensor_set(input, values.data(), 0, ggml_nbytes(input));
         }
     }
@@ -13299,6 +13447,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
 
+    for (int tokens : {1, 3, 31, 32, 33, 512, 2048}) {
+        for (bool silu : {false, true}) {
+            test_cases.emplace_back(new test_ssm_conv_split(tokens, 128, 2, 4, silu, true));
+            test_cases.emplace_back(new test_ssm_conv_split(tokens, 256, 1, 3, silu, false));
+        }
+    }
+
+    for (int tokens : {63, 64, 128}) {
+        for (int heads : {40, 48}) {
+            for (bool pair : {false, true}) {
+                for (bool keep : {false, true}) {
+                    test_cases.emplace_back(new test_fp8_gated_norm(tokens, heads, pair, keep));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_fp8_gated_norm(64, 48, false, false, true));
+
     for (uint32_t seed : {1, 2, 3}) {
         for (int64_t tokens : {511, 512, 513, 640, 768, 1024}) {
             test_cases.emplace_back(new test_nvfp4_mlp(tokens, false, false, false, seed));
@@ -13309,6 +13475,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_nvfp4_mlp(512, false, false, false, 1, 32768));
+    for (int64_t tokens : { 63, 64, 128, 513, 2048 }) {
+        for (bool offset : { false, true }) {
+            test_cases.emplace_back(new test_bf16_shared_input(tokens, offset));
+        }
+    }
+    for (int norm : { 0, 1, 2 }) {
+        for (int64_t tokens : { 512, 513 }) {
+            test_cases.emplace_back(new test_nvfp4_mlp(tokens, false, false, false, 1, 1024, norm, true));
+        }
+    }
+    for (int norm : { 1, 2, 3 }) {
+        for (int64_t tokens : { 511, 512, 513, 1024 }) {
+            test_cases.emplace_back(new test_nvfp4_mlp(tokens, false, false, false, 1, 1024, norm));
+        }
+    }
 
     for (int64_t tokens : {63, 64, 65, 128}) {
         for (int producer : {0, 1, 2, 3, 4, 5}) {
@@ -13320,6 +13501,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (int producer : {1, 3, 4, 5}) {
         test_cases.emplace_back(new test_fp8_pipeline(128, producer, true, true, 5120));
+    }
+    for (int tokens : {63, 64, 128, 513, 2048}) {
+        for (bool pair : {false, true}) {
+            test_cases.emplace_back(new test_fp8_pipeline(tokens, 6, pair, true, 5120));
+        }
+    }
+    for (int tokens : {511, 512, 513, 2048}) {
+        for (int norm : {4, 5}) {
+            test_cases.emplace_back(new test_nvfp4_mlp(tokens, false, false, false, 1, 1024, norm));
+        }
     }
     for (int input_pattern : {1, 2}) {
         test_cases.emplace_back(new test_fp8_pipeline(128, 0, true, false, 256, input_pattern));
@@ -13494,6 +13685,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_reduce(2048, 16, 32, false, true));
 
+    for (int kernel : {5, 7, 9, 15}) {
+        for (int tokens : {1, 33}) {
+            for (bool transposed : {false, true}) {
+                test_cases.emplace_back(new test_ssm_conv_split(tokens, 128, 2, kernel, false, transposed));
+            }
+        }
+    }
+    for (int tokens : {63,64,65,128}) {
+        for (bool transposed : {false,true}) {
+            test_cases.emplace_back(new test_ssm_conv_split_qkv(tokens,1,1,transposed));
+        }
+    }
+    test_cases.emplace_back(new test_ssm_conv_split_qkv(65,16,2,true));
+    test_cases.emplace_back(new test_ssm_conv_split_qkv(64,1,1,true,true));
+    test_cases.emplace_back(new test_ssm_conv_split_qkv(65,16,1,true,true));
     for (bool kda : { false, true }) {
         for (int n_prefix : { 0, 1, 3 }) {
             for (bool defer : { false, true }) {

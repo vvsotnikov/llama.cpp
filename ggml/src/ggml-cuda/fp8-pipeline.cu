@@ -1,4 +1,5 @@
 #include "fp8.cuh"
+#include "unary.cuh"
 
 #if defined(GGML_CUDA_FP8_CUTLASS)
 #include <cutlass/cutlass.h>
@@ -60,10 +61,98 @@ static __global__ void fp8_prepare_global(
     }
 }
 
-template <int block_size, int vpt>
+template <bool token_scale>
+static __global__ void fp8_gated_normalize_global(
+        const float * x, const float * gate, const float * weight, float * produced, float * row_amax,
+        int heads, float eps, uint8_t * packed) {
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    const int64_t base = int64_t(blockIdx.x)*heads*128;
+    const float4 w = ((const float4 *) weight)[lane];
+    float amax = 0.0f;
+    float4 values[4];
+    for (int head = warp; head < heads; head += 16) {
+        const int64_t index = base/4 + head*32 + lane;
+        const float4 v = ((const float4 *) x)[index];
+        float sum = 0.0f;
+        sum += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+        sum = block_reduce<block_reduce_method::SUM, WARP_SIZE>(sum, (float *) nullptr);
+        const float scale = rsqrtf(sum/128 + eps);
+        const float4 g = ((const float4 *) gate)[index];
+        float4 y;
+        y.x = __fmul_rn(__fmul_rn(scale*v.x, w.x), ggml_cuda_op_silu_single(g.x));
+        y.y = __fmul_rn(__fmul_rn(scale*v.y, w.y), ggml_cuda_op_silu_single(g.y));
+        y.z = __fmul_rn(__fmul_rn(scale*v.z, w.z), ggml_cuda_op_silu_single(g.z));
+        y.w = __fmul_rn(__fmul_rn(scale*v.w, w.w), ggml_cuda_op_silu_single(g.w));
+        if constexpr (token_scale) { values[head/16] = y; }
+        else { ((float4 *) produced)[index] = y; }
+        amax = fmaxf(amax, isfinite(y.x) ? fabsf(y.x) : 448.0f);
+        amax = fmaxf(amax, isfinite(y.y) ? fabsf(y.y) : 448.0f);
+        amax = fmaxf(amax, isfinite(y.z) ? fabsf(y.z) : 448.0f);
+        amax = fmaxf(amax, isfinite(y.w) ? fabsf(y.w) : 448.0f);
+    }
+    __shared__ float scratch[WARP_SIZE];
+    amax = block_reduce<block_reduce_method::MAX, 512>(amax, scratch);
+    const float scale = amax > 0.0f ? amax/448.0f : 1.0f;
+    if (threadIdx.x == 0) { row_amax[blockIdx.x] = token_scale ? scale : amax; }
+    if constexpr (token_scale) {
+        for (int head = warp; head < heads; head += 16) {
+            const float4 y = values[head/16];
+            const __nv_fp8x4_e4m3 q(make_float4(y.x/scale, y.y/scale, y.z/scale, y.w/scale));
+            ((uint32_t *) packed)[base/4 + head*32 + lane] = q.__x;
+        }
+    }
+}
+
+template <int vpt>
+static __global__ void fp8_pack_tokens(
+        const float * x, const float * gate, float * produced, uint8_t * packed, float * scales, int k) {
+    const int64_t base = int64_t(blockIdx.x)*k;
+    float4 values[vpt];
+    float amax = 0.0f;
+    __shared__ float scratch[WARP_SIZE];
+#pragma unroll
+    for (int j = 0; j < vpt; ++j) {
+        const int col = threadIdx.x + j*256;
+        if (col < k/4) {
+            float4 v = ((const float4 *) (x + base))[col];
+            if (gate) {
+                const float4 g = ((const float4 *) (gate + base))[col];
+                v.x *= g.x/(1.0f + expf(-g.x));
+                v.y *= g.y/(1.0f + expf(-g.y));
+                v.z *= g.z/(1.0f + expf(-g.z));
+                v.w *= g.w/(1.0f + expf(-g.w));
+                ((float4 *) (produced + base))[col] = v;
+            }
+            values[j] = v;
+            amax = fmaxf(amax, isfinite(v.x) ? fabsf(v.x) : 448.0f);
+            amax = fmaxf(amax, isfinite(v.y) ? fabsf(v.y) : 448.0f);
+            amax = fmaxf(amax, isfinite(v.z) ? fabsf(v.z) : 448.0f);
+            amax = fmaxf(amax, isfinite(v.w) ? fabsf(v.w) : 448.0f);
+        }
+    }
+    amax = block_reduce<block_reduce_method::MAX, 256>(amax, scratch);
+    const float scale = amax > 0.0f ? amax/448.0f : 1.0f;
+    if (threadIdx.x == 0) {
+        scales[blockIdx.x] = scale;
+    }
+#pragma unroll
+    for (int j = 0; j < vpt; ++j) {
+        const int col = threadIdx.x + j*256;
+        if (col < k/4) {
+            const float4 v = values[j];
+            packed[base + 4*col]     = ggml_cuda_fp32_to_f8_e4m3(v.x/scale);
+            packed[base + 4*col + 1] = ggml_cuda_fp32_to_f8_e4m3(v.y/scale);
+            packed[base + 4*col + 2] = ggml_cuda_fp32_to_f8_e4m3(v.z/scale);
+            packed[base + 4*col + 3] = ggml_cuda_fp32_to_f8_e4m3(v.w/scale);
+        }
+    }
+}
+
+template <int block_size, int vpt, bool token_scale>
 static __global__ void fp8_normalize_global(
         const float * x, const float * weight, float * produced, float * row_scales,
-        const float * residual, float * residual_out, const float * input_scale, bool scalar_scale, int k, float eps) {
+        const float * residual, float * residual_out, const float * input_scale, bool scalar_scale, int k, float eps, uint8_t * packed) {
     const int64_t base = int64_t(blockIdx.x) * k;
     float4 values[vpt];
     float sum = 0.0f;
@@ -106,6 +195,9 @@ static __global__ void fp8_normalize_global(
             y.z *= w.z;
             y.w *= w.w;
             ((float4 *) (produced + base))[index] = y;
+            if constexpr (token_scale) {
+                values[j] = y;
+            }
             amax = fmaxf(amax, isfinite(y.x) ? fabsf(y.x) : 448.0f);
             amax = fmaxf(amax, isfinite(y.y) ? fabsf(y.y) : 448.0f);
             amax = fmaxf(amax, isfinite(y.z) ? fabsf(y.z) : 448.0f);
@@ -113,8 +205,22 @@ static __global__ void fp8_normalize_global(
         }
     }
     amax = block_reduce<block_reduce_method::MAX, block_size>(amax, scratch);
+    const float scale = amax > 0.0f ? amax/448.0f : 1.0f;
     if (threadIdx.x == 0) {
-        row_scales[blockIdx.x] = amax;
+        row_scales[blockIdx.x] = token_scale ? scale : amax;
+    }
+    if constexpr (token_scale) {
+#pragma unroll
+        for (int j = 0; j < vpt; ++j) {
+            const int index = threadIdx.x + j*block_size;
+            if (index < k/4) {
+                const float4 y = values[j];
+                packed[base + 4*index]     = ggml_cuda_fp32_to_f8_e4m3(y.x/scale);
+                packed[base + 4*index + 1] = ggml_cuda_fp32_to_f8_e4m3(y.y/scale);
+                packed[base + 4*index + 2] = ggml_cuda_fp32_to_f8_e4m3(y.z/scale);
+                packed[base + 4*index + 3] = ggml_cuda_fp32_to_f8_e4m3(y.w/scale);
+            }
+        }
     }
 }
 
@@ -163,14 +269,43 @@ bool ggml_cuda_mul_mat_fp8_pipeline(
     }
     const int k = input->ne[0];
     const int m = input->ne[1];
+    static const bool token_scale = [] {
+        const char * value = getenv("GGML_CUDA_FP8_TOKEN_SCALE");
+        return value && strcmp(value, "0") != 0;
+    }();
     const ggml_tensor * raw = input;
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * norm_weight = nullptr;
     const ggml_tensor * residual_input = nullptr;
     const ggml_tensor * input_scale = nullptr;
     float eps = 0.0f;
+    bool head_norm = false;
     if (producer) {
-        if (producer == input && producer->op == GGML_OP_GLU &&
+        if (producer == input && producer->op == GGML_OP_RESHAPE) {
+            const auto * gated = producer->src[0];
+            if (!gated || gated->op != GGML_OP_MUL) {
+                return false;
+            }
+            const auto * activation = gated->src[1];
+            const auto * weighted = gated->src[0];
+            if (!activation || activation->op != GGML_OP_UNARY || ggml_get_unary_op(activation) != GGML_UNARY_OP_SILU ||
+                    !weighted || weighted->op != GGML_OP_MUL || !weighted->src[0] || weighted->src[0]->op != GGML_OP_RMS_NORM) {
+                return false;
+            }
+            const auto * norm = weighted->src[0];
+            raw = norm->src[0];
+            gate = activation->src[0];
+            norm_weight = weighted->src[1];
+            if (!raw || !gate || !norm_weight || raw->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(raw) || !ggml_is_contiguous(gate) || !ggml_are_same_shape(raw, gate) ||
+                    raw->ne[0] != 128 || raw->ne[1] > 64 || k != 128*raw->ne[1] || ggml_nelements(raw) != ggml_nelements(input) ||
+                    norm_weight->type != GGML_TYPE_F32 || !ggml_is_vector(norm_weight) || norm_weight->ne[0] != 128 ||
+                    !ggml_is_contiguous(norm_weight) || !ggml_cuda_is_aligned(gate, 16)) {
+                return false;
+            }
+            memcpy(&eps, norm->op_params, sizeof(eps));
+            head_norm = true;
+        } else if (producer == input && producer->op == GGML_OP_GLU &&
                 ggml_get_glu_op(producer) == GGML_GLU_OP_SWIGLU && !ggml_get_op_params_i32(producer, 1)) {
             gate = producer->src[0];
             raw = producer->src[1];
@@ -225,6 +360,10 @@ bool ggml_cuda_mul_mat_fp8_pipeline(
             (input_scale && ggml_nelements(input_scale) > 1 && !ggml_cuda_is_aligned(input_scale, 16)))) {
         return false;
     }
+    if (token_scale && (k > 32768 || !ggml_cuda_is_aligned(raw, 16) ||
+            (gate && !ggml_cuda_is_aligned(gate, 16)))) {
+        return false;
+    }
     for (int i = 0; i < count; ++i) {
         const auto * w = weights[i];
         const auto * s = scales[i];
@@ -258,11 +397,18 @@ bool ggml_cuda_mul_mat_fp8_pipeline(
         workspace_size = std::max(workspace_size, fp8_gemm::get_workspace_size(args[i]));
     }
     ggml_cuda_pool_alloc<uint8_t> workspace(ctx.pool(), std::max<size_t>(workspace_size, 1));
-    if (norm_weight) {
-#define FP8_NORM(B, V) fp8_normalize_global<B, V><<<m, B, 0, ctx.stream()>>>( \
+    if (head_norm) {
+#define FP8_GATED(T) fp8_gated_normalize_global<T><<<m, 512, 0, ctx.stream()>>>( \
+        (const float *) raw->data, (const float *) gate->data, (const float *) norm_weight->data, \
+        (float *) input->data, token_scales.ptr, k/128, eps, packed.ptr)
+        if (token_scale) { FP8_GATED(true); } else { FP8_GATED(false); }
+#undef FP8_GATED
+    } else if (norm_weight) {
+#define FP8_NORM_IMPL(B, V, T) fp8_normalize_global<B, V, T><<<m, B, 0, ctx.stream()>>>( \
         (const float *) raw->data, (const float *) norm_weight->data, (float *) input->data, token_scales.ptr, \
         residual_input ? (const float *) residual_input->data : nullptr, residual ? (float *) residual->data : nullptr, \
-        input_scale ? (const float *) input_scale->data : nullptr, input_scale && ggml_nelements(input_scale) == 1, k, eps)
+        input_scale ? (const float *) input_scale->data : nullptr, input_scale && ggml_nelements(input_scale) == 1, k, eps, packed.ptr)
+#define FP8_NORM(B, V) do { if (token_scale) { FP8_NORM_IMPL(B, V, true); } else { FP8_NORM_IMPL(B, V, false); } } while (0)
         const int n4 = k / 4;
         if      (n4 <=   32) { FP8_NORM(  32, 1); }
         else if (n4 <=  128) { FP8_NORM( 128, 1); }
@@ -271,17 +417,31 @@ bool ggml_cuda_mul_mat_fp8_pipeline(
         else if (n4 <= 1024) { FP8_NORM(1024, 1); }
         else                { FP8_NORM(1024, 4); }
 #undef FP8_NORM
+#undef FP8_NORM_IMPL
+    } else if (token_scale) {
+#define FP8_PACK(V) fp8_pack_tokens<V><<<m, 256, 0, ctx.stream()>>>( \
+        (const float *) raw->data, gate ? (const float *) gate->data : nullptr, \
+        gate ? (float *) input->data : nullptr, packed.ptr, token_scales.ptr, k)
+        if      (k <=  4096) { FP8_PACK( 4); }
+        else if (k <=  8192) { FP8_PACK( 8); }
+        else if (k <= 16384) { FP8_PACK(16); }
+        else if (k <= 20480) { FP8_PACK(20); }
+        else                { FP8_PACK(32); }
+#undef FP8_PACK
     } else {
         fp8_prepare_global<<<m, 256, 0, ctx.stream()>>>(
                 (const float *) raw->data, gate ? (const float *) gate->data : nullptr,
                 gate ? (float *) input->data : nullptr, token_scales.ptr, k);
     }
     CUDA_CHECK(cudaGetLastError());
-    ggml_cuda_pool_alloc<float> maximum(ctx.pool(), 1);
-    fp8_scale_max<<<1, 256, 0, ctx.stream()>>>(token_scales.ptr, maximum.ptr, m);
-    fp8_pack_global<<<(int64_t(k)*m + 255)/256, 256, 0, ctx.stream()>>>(
-            (const float *) input->data, packed.ptr, token_scales.ptr, maximum.ptr, int64_t(k)*m, m);
-    CUDA_CHECK(cudaGetLastError());
+    ggml_cuda_pool_alloc<float> maximum(ctx.pool());
+    if (!token_scale) {
+        maximum.alloc(1);
+        fp8_scale_max<<<1, 256, 0, ctx.stream()>>>(token_scales.ptr, maximum.ptr, m);
+        fp8_pack_global<<<(int64_t(k)*m + 255)/256, 256, 0, ctx.stream()>>>(
+                (const float *) input->data, packed.ptr, token_scales.ptr, maximum.ptr, int64_t(k)*m, m);
+        CUDA_CHECK(cudaGetLastError());
+    }
     for (int i = 0; i < count; ++i) {
         fp8_gemm gemm;
         GGML_ASSERT(gemm.initialize(args[i], workspace.ptr, ctx.stream()) == cutlass::Status::kSuccess);

@@ -449,7 +449,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         ggml_tensor *        qkv_mixed,
         int64_t              conv_kernel_size,
         int64_t              conv_channels,
-        int                  il) {
+        int                  il,
+        ggml_tensor **       separate_history) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head  = mctx_cur->get_head();
@@ -466,7 +467,16 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
-    ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
+    const bool separate = separate_history && !inp->tree_parent &&
+            qkv_mixed->ne[0] >= int64_t(cparams.n_rs_seq) + conv_kernel_size;
+    if (separate_history) {
+        *separate_history = separate ? ggml_dup(ctx0, conv_states) : nullptr;
+        if (separate) {
+            // Cache writes below can overwrite the old history before the convolution executes.
+            ggml_build_forward_expand(gf, *separate_history);
+        }
+    }
+    ggml_tensor * conv_input = separate ? qkv_mixed : ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
     if (inp->tree_parent) {
@@ -509,7 +519,8 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
             ggml_view_3d(ctx0, conv_input,
                     conv_kernel_size - 1, conv_channels, n_seqs,
                     conv_input->nb[1], conv_input->nb[2],
-                    ggml_row_size(conv_input->type, s_idx));
+                    s_idx*conv_input->nb[0]);
+        conv_state_last->nb[0] = conv_input->nb[0];
         cb(conv_state_last, "conv_state_last", il);
 
         ggml_tensor * conv_state_update =
@@ -525,7 +536,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
 
         const int64_t K  = (int64_t) cparams.n_rs_seq + 1;
-        const int64_t n  = conv_input->ne[0] - conv_states->ne[0]; // n_seq_tokens
+        const int64_t n  = qkv_mixed->ne[0]; // n_seq_tokens
         const int64_t Kw = std::min(n + 1, K);                     // windows that exist in this ubatch
 
         // {Kw-1, ..., 0}, filled on the host and shared by every layer of the graph
@@ -540,9 +551,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // the windows overlap, so the view is created with one window and widened after the size check
         ggml_tensor * windows = ggml_view_4d(ctx0, conv_input,
                 conv_kernel_size - 1, 1, conv_channels, n_seqs,
-                ggml_element_size(conv_input), conv_input->nb[1], conv_input->nb[2],
-                ggml_row_size(conv_input->type, n - (Kw - 1)));
+                conv_input->nb[0], conv_input->nb[1], conv_input->nb[2],
+                (n - (Kw - 1) - (separate ? conv_kernel_size - 1 : 0))*conv_input->nb[0]);
         windows->ne[1] = Kw;
+        windows->nb[0] = conv_input->nb[0];
+        if (separate) {
+            windows = ggml_cont(ctx0, windows);
+        }
 
         // [d-1, slot, channel, seq] view of the cells of this ubatch
         ggml_tensor * slots = ggml_view_4d(ctx0, conv_states_all,
