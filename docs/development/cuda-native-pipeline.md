@@ -15,6 +15,23 @@ cmake -S . -B "$LLAMA_BUILD_DIR" \
 cmake --build "$LLAMA_BUILD_DIR" --target llama-server test-backend-ops -j 4
 ```
 
+## Target checkpoint conversion
+
+Set `TARGET_SNAPSHOT` to the cached safetensors snapshot of
+`unsloth/Qwen3.8-27B-NVFP4`. The converter retains the checkpoint's FP8
+projections and repacks its NVFP4 weights and scales. Use `auto` to preserve
+this mixed layout:
+
+```sh
+export TARGET_GGUF="$HOME/.cache/huggingface/local-builds/unsloth--Qwen3.8-27B-NVFP4/Qwen3.8-27B-NVFP4-FP8.gguf"
+mkdir -p "$(dirname "$TARGET_GGUF")"
+python convert_hf_to_gguf.py "$TARGET_SNAPSHOT" \
+    --outtype auto --outfile "$TARGET_GGUF"
+```
+
+Keep `DRAFTER_GGUF` separate: the serving example below expects the original
+`incoai/Qwen3.8-27B-DFlash2` checkpoint converted to Q4_K_M.
+
 ## Precision and execution options
 
 The options default to off. The reference path remains available by leaving
