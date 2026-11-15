@@ -122,7 +122,7 @@ static __global__ void fp8_pack_tokens(
                 v.y *= g.y/(1.0f + expf(-g.y));
                 v.z *= g.z/(1.0f + expf(-g.z));
                 v.w *= g.w/(1.0f + expf(-g.w));
-                ((float4 *) (produced + base))[col] = v;
+                if (produced) { ((float4 *) (produced + base))[col] = v; }
             }
             values[j] = v;
             amax = fmaxf(amax, isfinite(v.x) ? fabsf(v.x) : 448.0f);
@@ -152,7 +152,8 @@ static __global__ void fp8_pack_tokens(
 template <int block_size, int vpt, bool token_scale>
 static __global__ void fp8_normalize_global(
         const float * x, const float * weight, float * produced, float * row_scales,
-        const float * residual, float * residual_out, const float * input_scale, bool scalar_scale, int k, float eps, uint8_t * packed) {
+        const float * residual, float * residual_out, const float * input_scale, bool scalar_scale, int k, float eps, uint8_t * packed,
+        uint16_t * normalized_bf16) {
     const int64_t base = int64_t(blockIdx.x) * k;
     float4 values[vpt];
     float sum = 0.0f;
@@ -194,7 +195,12 @@ static __global__ void fp8_normalize_global(
             y.y *= w.y;
             y.z *= w.z;
             y.w *= w.w;
-            ((float4 *) (produced + base))[index] = y;
+            if (produced) { ((float4 *) (produced + base))[index] = y; }
+            if (normalized_bf16) {
+                const nv_bfloat162 lo = __float22bfloat162_rn(make_float2(y.x, y.y));
+                const nv_bfloat162 hi = __float22bfloat162_rn(make_float2(y.z, y.w));
+                ((uint2 *) (normalized_bf16 + base))[index] = make_uint2(*reinterpret_cast<const uint32_t *>(&lo), *reinterpret_cast<const uint32_t *>(&hi));
+            }
             if constexpr (token_scale) {
                 values[j] = y;
             }
@@ -254,14 +260,14 @@ bool ggml_cuda_mul_mat_fp8_pipeline(
         ggml_backend_cuda_context & ctx, const ggml_tensor * input,
         const ggml_tensor * const * weights, const ggml_tensor * const * scales,
         ggml_tensor * const * outputs, int count, const ggml_tensor * producer,
-        const ggml_tensor * residual, bool fuse_input_scale) {
+        const ggml_tensor * residual, bool fuse_input_scale, uint16_t * normalized_bf16, bool retain_producer) {
 #if defined(GGML_CUDA_FP8_CUTLASS)
     static const bool enabled = [] {
         const char * value = getenv("GGML_CUDA_FP8_PIPELINE");
         return value && strcmp(value, "0") != 0;
     }();
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (!enabled || !blackwell_mma_available(cc) || cc >= GGML_CUDA_CC_RUBIN || count < 1 || count > 2 ||
+    if (!enabled || !blackwell_mma_available(cc) || cc >= GGML_CUDA_CC_RUBIN || count < 1 || count > 3 ||
             !ggml_is_matrix(input) || !ggml_is_contiguous(input) || input->type != GGML_TYPE_F32 ||
             input->ne[0] <= 0 || input->ne[0] % 16 != 0 || input->ne[1] < 64 ||
             input->ne[0] > INT_MAX || input->ne[1] > INT_MAX) {
@@ -364,6 +370,10 @@ bool ggml_cuda_mul_mat_fp8_pipeline(
             (gate && !ggml_cuda_is_aligned(gate, 16)))) {
         return false;
     }
+    if ((normalized_bf16 && (!token_scale || !norm_weight || head_norm)) ||
+            (!retain_producer && (!token_scale || !producer))) {
+        return false;
+    }
     for (int i = 0; i < count; ++i) {
         const auto * w = weights[i];
         const auto * s = scales[i];
@@ -379,7 +389,7 @@ bool ggml_cuda_mul_mat_fp8_pipeline(
     }
     ggml_cuda_pool_alloc<uint8_t> packed(ctx.pool(), size_t(k) * m);
     ggml_cuda_pool_alloc<float> token_scales(ctx.pool(), m);
-    fp8_gemm::Arguments args[2];
+    fp8_gemm::Arguments args[3];
     size_t workspace_size = 0;
     for (int i = 0; i < count; ++i) {
         const int n = weights[i]->ne[1];
@@ -405,9 +415,9 @@ bool ggml_cuda_mul_mat_fp8_pipeline(
 #undef FP8_GATED
     } else if (norm_weight) {
 #define FP8_NORM_IMPL(B, V, T) fp8_normalize_global<B, V, T><<<m, B, 0, ctx.stream()>>>( \
-        (const float *) raw->data, (const float *) norm_weight->data, (float *) input->data, token_scales.ptr, \
+        (const float *) raw->data, (const float *) norm_weight->data, retain_producer ? (float *) input->data : nullptr, token_scales.ptr, \
         residual_input ? (const float *) residual_input->data : nullptr, residual ? (float *) residual->data : nullptr, \
-        input_scale ? (const float *) input_scale->data : nullptr, input_scale && ggml_nelements(input_scale) == 1, k, eps, packed.ptr)
+        input_scale ? (const float *) input_scale->data : nullptr, input_scale && ggml_nelements(input_scale) == 1, k, eps, packed.ptr, normalized_bf16)
 #define FP8_NORM(B, V) do { if (token_scale) { FP8_NORM_IMPL(B, V, true); } else { FP8_NORM_IMPL(B, V, false); } } while (0)
         const int n4 = k / 4;
         if      (n4 <=   32) { FP8_NORM(  32, 1); }
@@ -421,7 +431,7 @@ bool ggml_cuda_mul_mat_fp8_pipeline(
     } else if (token_scale) {
 #define FP8_PACK(V) fp8_pack_tokens<V><<<m, 256, 0, ctx.stream()>>>( \
         (const float *) raw->data, gate ? (const float *) gate->data : nullptr, \
-        gate ? (float *) input->data : nullptr, packed.ptr, token_scales.ptr, k)
+        gate && retain_producer ? (float *) input->data : nullptr, packed.ptr, token_scales.ptr, k)
         if      (k <=  4096) { FP8_PACK( 4); }
         else if (k <=  8192) { FP8_PACK( 8); }
         else if (k <= 16384) { FP8_PACK(16); }
@@ -449,7 +459,7 @@ bool ggml_cuda_mul_mat_fp8_pipeline(
     }
     return true;
 #else
-    GGML_UNUSED_VARS(ctx, input, weights, scales, outputs, count, producer, residual, fuse_input_scale);
+    GGML_UNUSED_VARS(ctx, input, weights, scales, outputs, count, producer, residual, fuse_input_scale, normalized_bf16, retain_producer);
     return false;
 #endif
 }

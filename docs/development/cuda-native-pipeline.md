@@ -60,6 +60,8 @@ export GGML_CUDA_SCALED_SWIGLU=1
 export GGML_CUDA_SSM_CONV_SPLIT=1
 export GGML_CUDA_EARLY_QKVZ=1
 export GGML_CUDA_BF16_SHARED_INPUT=1
+export GGML_CUDA_FP8_BF16_NORM=1
+export GGML_CUDA_FP8_QKV_PREPARE=1
 export GGML_CUDA_FP8_GATED_NORM=1
 export GGML_CUDA_NVFP4_MLP_IRREGULAR=1
 export GGML_CUDA_NVFP4_MLP_NORM=1
@@ -77,6 +79,19 @@ and activation packing are fused where the graph and storage permit it.
 Prepared matrix layouts are retained for later calls. Direct packing produces
 the selected consumer's values and scale layout without an intermediate MMQ
 layout conversion.
+
+`GGML_CUDA_FP8_BF16_NORM=1` lets a closed group of two FP8 and two BF16
+projections share normalized input preparation. It requires per-token FP8
+scaling and `GGML_CUDA_BF16_SHARED_INPUT=1`. The normalization kernel writes
+the BF16 input alongside packed FP8 values; the F32 intermediate is omitted
+only when no other graph consumer needs it. Explicit in-place normalization
+retains the existing path.
+
+`GGML_CUDA_FP8_QKV_PREPARE=1` groups the three FP8 attention projections
+before query/key normalization for batches of at least 64 tokens. They reuse
+one packed activation buffer. Dead normalization and SwiGLU outputs can also
+be omitted when the graph and storage checks permit it. Other consumers and
+retained outputs keep the original materialization.
 
 The row-normalization fusion permits exact in-place row writes after the entire
 row has been read. Matrix outputs may reuse consumed input storage after the
@@ -126,7 +141,7 @@ including integrated CUDA GPUs selected automatically.
 
 Run the relevant backend tests against the intended CUDA build, including
 `SSM_CONV_SPLIT`, `SSM_CONV_SPLIT_QKV`, `BF16_SHARED_INPUT`, `FP8_PIPELINE`,
-`FP8_GATED_NORM`, `FP8_NORM_REUSE`, `NVFP4_MLP`, `NVFP4_MLP_NORM`, and
+`FP8_GATED_NORM`, `FP8_NORM_REUSE`, `FP8_BF16_NORM`, `FP8_QKV_PREPARE`, `NVFP4_MLP`, `NVFP4_MLP_NORM`, and
 `NVFP4_NORM_REUSE`. Require nonzero test counts. For calibrated activation
 quantization, compare packed values and scales against an independent native
 quantizer as well as evaluating model likelihood and task quality. Some

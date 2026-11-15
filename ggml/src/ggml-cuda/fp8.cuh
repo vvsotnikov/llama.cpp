@@ -10,4 +10,5 @@ bool ggml_cuda_mul_mat_fp8_pipeline(
         ggml_backend_cuda_context & ctx, const ggml_tensor * input,
         const ggml_tensor * const * weights, const ggml_tensor * const * scales,
         ggml_tensor * const * outputs, int count, const ggml_tensor * producer = nullptr,
-        const ggml_tensor * residual = nullptr, bool fuse_input_scale = false);
+        const ggml_tensor * residual = nullptr, bool fuse_input_scale = false,
+        uint16_t * normalized_bf16 = nullptr, bool retain_producer = true);

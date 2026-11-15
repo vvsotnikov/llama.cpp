@@ -5004,6 +5004,30 @@ static int ggml_cuda_try_fp8_gated_norm(ggml_backend_cuda_context & ctx, ggml_cg
     return 0;
 }
 
+static bool ggml_cuda_bf16_pair_supported(ggml_backend_cuda_context & ctx, const ggml_tensor * input,
+        const ggml_tensor * first, const ggml_tensor * second) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ctx.device].cc) ||
+            !fast_bf16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ||
+            first->op != GGML_OP_MUL_MAT || second->op != GGML_OP_MUL_MAT ||
+            first->src[1] != input || second->src[1] != input || input->type != GGML_TYPE_F32 ||
+            !ggml_is_matrix(input) || !ggml_is_contiguous(input) || !ggml_cuda_is_aligned(input, 16) ||
+            input->ne[0] % 8 || input->ne[1] < 64 || ggml_cuda_tensors_overlap(first, second)) {
+        return false;
+    }
+    for (const auto * mm : { first, second }) {
+        const auto * weight = mm->src[0];
+        if (weight->type != GGML_TYPE_BF16 || !ggml_is_contiguous(weight) || !ggml_is_matrix(weight) ||
+                mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || !ggml_is_matrix(mm) ||
+                ggml_prec_get_acc(mm) == GGML_PREC_F32 || ggml_prec_get_src(mm, 1) != GGML_PREC_UNDEFINED ||
+                !weight->buffer || !ggml_backend_buffer_is_cuda(weight->buffer) ||
+                ((ggml_backend_cuda_buffer_context *) weight->buffer->context)->device != ctx.device ||
+                ggml_cuda_tensors_overlap(first, weight) || ggml_cuda_tensors_overlap(second, weight)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fp8_pipeline(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
     static const bool enabled = [] {
         const char * value = getenv("GGML_CUDA_FP8_PIPELINE");
@@ -5044,11 +5068,12 @@ static int ggml_cuda_try_fp8_pipeline(ggml_backend_cuda_context & ctx, ggml_cgra
     if ((producer && input != producer) || input->ne[1] < 64) {
         return 0;
     }
-    const ggml_tensor * weights[2];
-    const ggml_tensor * scales[2];
-    ggml_tensor * outputs[2];
+    const ggml_tensor * weights[3];
+    const ggml_tensor * scales[3];
+    ggml_tensor * outputs[3];
+    const int max_projections = ggml_cuda_env_flag("GGML_CUDA_FP8_QKV_PREPARE") ? 3 : 2;
     int count = 0;
-    for (int j = mm_start; j + 1 < graph->n_nodes && count < 2; j += 2) {
+    for (int j = mm_start; j + 1 < graph->n_nodes && count < max_projections; j += 2) {
         const auto * mm = graph->nodes[j];
         const auto * scaled = graph->nodes[j + 1];
         if (mm->op != GGML_OP_MUL_MAT || mm->src[0]->type != GGML_TYPE_F8_E4M3 || mm->src[1] != input ||
@@ -5066,11 +5091,57 @@ static int ggml_cuda_try_fp8_pipeline(ggml_backend_cuda_context & ctx, ggml_cgra
     }
     for (; count > 0; --count) {
         const int nodes = mm_start - i + 2 * count;
-        ggml_op ops[8];
+        const int bf16_index = i + nodes;
+        if (count == 2 && producer && producer->op == GGML_OP_MUL && !producer->view_src && !producer->src[0]->view_src &&
+                ggml_cuda_env_flag("GGML_CUDA_FP8_BF16_NORM") &&
+                ggml_cuda_env_flag("GGML_CUDA_FP8_TOKEN_SCALE") &&
+                ggml_cuda_env_flag("GGML_CUDA_BF16_SHARED_INPUT") && bf16_index + 1 < graph->n_nodes &&
+                ggml_cuda_bf16_pair_supported(ctx, input, graph->nodes[bf16_index], graph->nodes[bf16_index + 1])) {
+            const int fused_count = nodes + 2;
+            ggml_op fused_ops[10];
+            for (int j = 0; j < fused_count; ++j) { fused_ops[j] = graph->nodes[i + j]->op; }
+            int retained[5], retained_count = 0;
+            if (residual) { retained[retained_count++] = add_index; }
+            retained[retained_count++] = mm_start + 1;
+            retained[retained_count++] = mm_start + 3;
+            retained[retained_count++] = bf16_index;
+            retained[retained_count++] = bf16_index + 1;
+            bool safe = ggml_can_fuse_subgraph(graph, i, fused_count, fused_ops, retained, retained_count) &&
+                    ggml_cuda_check_norm_fusion_memory_ranges(graph, i, fused_count, retained, retained_count,
+                            producer->src[0]->src[0], residual, producer);
+            for (int d = 0; d < retained_count; ++d) {
+                for (int e = 0; e < d; ++e) {
+                    if (ggml_cuda_tensors_overlap(graph->nodes[retained[d]], graph->nodes[retained[e]])) { safe = false; }
+                }
+                for (int j = i; j < i + fused_count; ++j) {
+                    for (const auto * src : graph->nodes[j]->src) {
+                        if (src && src->op == GGML_OP_NONE && ggml_cuda_tensors_overlap(graph->nodes[retained[d]], src)) { safe = false; }
+                    }
+                }
+            }
+            if (safe) {
+                using bf16 = batched_mul_mat_traits<GGML_TYPE_BF16>::cuda_type;
+                ggml_cuda_pool_alloc<bf16> packed_bf16(ctx.pool(), ggml_nelements(input));
+                if (ggml_cuda_mul_mat_fp8_pipeline(ctx, input, weights, scales, outputs, count, producer, residual,
+                        residual && first->op == GGML_OP_MUL, reinterpret_cast<uint16_t *>(packed_bf16.ptr), false)) {
+                    ggml_tensor converted = *input;
+                    converted.type = GGML_TYPE_BF16;
+                    converted.data = packed_bf16.ptr;
+                    for (int j = 0; j < GGML_MAX_DIMS; ++j) { converted.nb[j] = input->nb[j]/2; }
+                    for (int j = 0; j < 2; ++j) {
+                        auto * mm = graph->nodes[bf16_index + j];
+                        ggml_cuda_mul_mat_cublas(ctx, mm->src[0], &converted, mm);
+                    }
+                    CUDA_CHECK(cudaGetLastError());
+                    return fused_count - 1;
+                }
+            }
+        }
+        ggml_op ops[10];
         for (int j = 0; j < nodes; ++j) {
             ops[j] = graph->nodes[i + j]->op;
         }
-        int retained[4], retained_count = 0;
+        int retained[5], retained_count = 0;
         if (residual) {
             retained[retained_count++] = add_index;
         }
@@ -5080,6 +5151,19 @@ static int ggml_cuda_try_fp8_pipeline(ggml_backend_cuda_context & ctx, ggml_cgra
         }
         for (int j = 0; j < count; ++j) {
             retained[retained_count++] = mm_start + 2 * j + 1;
+        }
+        bool retain_producer = true;
+        if (producer && !producer->view_src && (producer->op != GGML_OP_MUL || !producer->src[0]->view_src) &&
+                ggml_cuda_env_flag("GGML_CUDA_FP8_QKV_PREPARE") && ggml_cuda_env_flag("GGML_CUDA_FP8_TOKEN_SCALE")) {
+            int packed_outputs[4], packed_count = 0;
+            for (int j = 0; j < retained_count; ++j) {
+                if (retained[j] != mm_start - 1) { packed_outputs[packed_count++] = retained[j]; }
+            }
+            if (ggml_can_fuse_subgraph(graph, i, nodes, ops, packed_outputs, packed_count)) {
+                retain_producer = false;
+                retained_count = packed_count;
+                std::copy(packed_outputs, packed_outputs + packed_count, retained);
+            }
         }
         if (!ggml_can_fuse_subgraph(graph, i, nodes, ops, retained, retained_count) ||
                 !(producer && producer->op == GGML_OP_MUL ?
@@ -5098,10 +5182,16 @@ static int ggml_cuda_try_fp8_pipeline(ggml_backend_cuda_context & ctx, ggml_cgra
                 }
             }
         }
-        if (overlaps_leaf || (count == 2 && ggml_cuda_tensors_overlap(outputs[0], outputs[1]))) {
+        for (int d = 0; d < count; ++d) {
+            for (int e = 0; e < d; ++e) {
+                if (ggml_cuda_tensors_overlap(outputs[d], outputs[e])) { overlaps_leaf = true; }
+            }
+        }
+        if (overlaps_leaf) {
             continue;
         }
-        if (ggml_cuda_mul_mat_fp8_pipeline(ctx, input, weights, scales, outputs, count, producer, residual, residual && first->op == GGML_OP_MUL)) {
+        if (ggml_cuda_mul_mat_fp8_pipeline(ctx, input, weights, scales, outputs, count, producer, residual,
+                residual && first->op == GGML_OP_MUL, nullptr, retain_producer)) {
             return nodes - 1;
         }
     }
@@ -5126,17 +5216,7 @@ static int ggml_cuda_try_bf16_shared_input(ggml_backend_cuda_context & ctx, ggml
             !ggml_cuda_check_fusion_memory_ranges(graph, i, 2, outputs, 2, false, input)) {
         return 0;
     }
-    for (const auto * mm : { first, second }) {
-        const auto * weight = mm->src[0];
-        if (weight->type != GGML_TYPE_BF16 || !ggml_is_contiguous(weight) || !ggml_is_matrix(weight) ||
-                mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || !ggml_is_matrix(mm) ||
-                ggml_prec_get_acc(mm) == GGML_PREC_F32 || ggml_prec_get_src(mm, 1) != GGML_PREC_UNDEFINED ||
-                !weight->buffer || !ggml_backend_buffer_is_cuda(weight->buffer) ||
-                ((ggml_backend_cuda_buffer_context *) weight->buffer->context)->device != ctx.device ||
-                ggml_cuda_tensors_overlap(first, weight) || ggml_cuda_tensors_overlap(second, weight)) {
-            return 0;
-        }
-    }
+    if (!ggml_cuda_bf16_pair_supported(ctx, input, first, second)) { return 0; }
     using bf16 = batched_mul_mat_traits<GGML_TYPE_BF16>::cuda_type;
     ggml_cuda_pool_alloc<bf16> packed(ctx.pool(), ggml_nelements(input));
     const auto convert = batched_mul_mat_traits<GGML_TYPE_BF16>::convert(input->type);

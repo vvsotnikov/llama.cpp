@@ -281,7 +281,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
-    // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
+    // Order the projections together when they can share activation preparation.
 
     // Qwen3Next uses a single Q projection that outputs query + gate
     auto [Qcur_full, Kcur, Vcur] = build_qkv(model.layers[il], cur,
@@ -289,6 +289,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
             n_embd_head,     n_head_kv,
             n_embd_head,     n_head_kv,
             il, false);
+    static const bool early_qkv = [] {
+        const char * value = getenv("GGML_CUDA_FP8_QKV_PREPARE");
+        return value && atoi(value) != 0;
+    }();
+    const auto & layer = model.layers[il];
+    if (early_qkv && ubatch.n_tokens >= 64 && layer.wq && layer.wk && layer.wv &&
+            layer.wq->type == GGML_TYPE_F8_E4M3 && layer.wk->type == GGML_TYPE_F8_E4M3 && layer.wv->type == GGML_TYPE_F8_E4M3) {
+        ggml_build_forward_expand(gf, Qcur_full);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+    }
     cb(Qcur_full, "Qcur_full", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);

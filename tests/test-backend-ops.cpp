@@ -8707,6 +8707,83 @@ struct test_fp8_pipeline : public test_case {
     }
 };
 
+struct test_fp8_bf16_norm : public test_fp8_pipeline {
+    std::vector<ggml_tensor *> checked;
+    test_fp8_bf16_norm(int64_t tokens, int producer, bool keep, int64_t k)
+        : test_fp8_pipeline(tokens, producer, true, keep, k) {}
+    std::string op_desc(ggml_tensor *) override { return "FP8_BF16_NORM"; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checked.clear();
+        auto * raw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+        ggml_tensor * residual = nullptr;
+        if (producer >= 3) {
+            auto * skip = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+            residual = producer == 6 ? ggml_add_inplace(ctx, raw, skip) : ggml_add(ctx, raw, skip);
+            raw = residual;
+        }
+        auto * rms = ggml_rms_norm(ctx, raw, 1e-5f);
+        auto * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+        auto * norm = producer == 7 ? ggml_mul_inplace(ctx, rms, gamma) : ggml_mul(ctx, rms, gamma);
+        if (producer == 7) { ggml_set_output(rms); }
+        for (int j = 0; j < 4; ++j) {
+            const ggml_type type = j < 2 ? GGML_TYPE_F8_E4M3 : GGML_TYPE_BF16;
+            auto * out = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, type, k, 96), norm);
+            if (j < 2) { out = ggml_mul(ctx, out, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 96)); }
+            ggml_set_output(out);
+            if (mode == MODE_TEST) { ggml_build_forward_expand(gf, out); }
+            checked.push_back(out);
+        }
+        auto * out = ggml_add(ctx, ggml_add(ctx, checked[0], checked[1]), ggml_add(ctx, checked[2], checked[3]));
+        if (producer == 7) { checked.push_back(rms); }
+        if (keep_normalized) { ggml_set_output(norm); checked.push_back(norm); out = ggml_add(ctx, out, ggml_view_2d(ctx, norm, 96, tokens, norm->nb[1], 0)); }
+        if (residual) { ggml_set_output(residual); checked.push_back(residual); out = ggml_add(ctx, out, ggml_view_2d(ctx, residual, 96, tokens, residual->nb[1], 0)); }
+        return out;
+    }
+};
+
+struct test_fp8_qkv_prepare : public test_fp8_pipeline {
+    std::vector<ggml_tensor *> checked;
+    test_fp8_qkv_prepare(int64_t tokens, int producer, bool keep, int64_t k, int pattern = 0)
+        : test_fp8_pipeline(tokens, producer, true, keep, k, pattern) {}
+    std::string op_desc(ggml_tensor *) override { return "FP8_QKV_PREPARE"; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return checked; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        checked.clear();
+        auto * raw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+        ggml_set_name(raw, "fp8_pipeline_input");
+        ggml_tensor * residual = nullptr;
+        if (producer >= 3) {
+            auto * skip = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+            residual = producer == 6 ? ggml_add_inplace(ctx, raw, skip) : ggml_add(ctx, raw, skip);
+            raw = residual;
+        }
+        ggml_tensor * rms = nullptr;
+        ggml_tensor * input;
+        if (producer == 2) {
+            input = ggml_glu_split(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens), raw, GGML_GLU_OP_SWIGLU);
+        } else {
+            rms = ggml_rms_norm(ctx, raw, 1e-5f);
+            auto * gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            input = producer == 7 ? ggml_mul_inplace(ctx, rms, gamma) : ggml_mul(ctx, rms, gamma);
+            if (producer == 7) { ggml_set_output(rms); }
+        }
+        for (int j = 0; j < 3; ++j) {
+            const int n = j == 0 ? 192 : 96;
+            auto * out = ggml_mul(ctx, ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F8_E4M3, k, n), input), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n));
+            ggml_set_output(out);
+            if (mode == MODE_TEST) { ggml_build_forward_expand(gf, out); }
+            checked.push_back(out);
+        }
+        auto * first = ggml_view_2d(ctx, checked[0], 96, tokens, checked[0]->nb[1], 0);
+        auto * out = ggml_add(ctx, first, ggml_add(ctx, checked[1], checked[2]));
+        if (producer == 7) { checked.push_back(rms); }
+        if (keep_normalized) { ggml_set_output(input); checked.push_back(input); out = ggml_add(ctx, out, ggml_view_2d(ctx, input, 96, tokens, input->nb[1], 0)); }
+        if (residual) { ggml_set_output(residual); checked.push_back(residual); out = ggml_add(ctx, out, ggml_view_2d(ctx, residual, 96, tokens, residual->nb[1], 0)); }
+        return out;
+    }
+};
+
 struct test_fp8_gated_norm : public test_case {
     const int tokens, heads;
     const bool pair, keep, zero;
@@ -13517,6 +13594,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int tokens : {63, 64, 65, 128, 513}) {
+        for (int producer : {1, 3, 6}) {
+            for (bool keep : {false, true}) {
+                test_cases.emplace_back(new test_fp8_bf16_norm(tokens, producer, keep, tokens >= 128 ? 5120 : 256));
+            }
+        }
+    }
+    for (int tokens : {63, 64, 65, 128, 513}) {
+        for (int producer : {1, 3, 6}) {
+            for (bool keep : {false, true}) {
+                test_cases.emplace_back(new test_fp8_qkv_prepare(tokens, producer, keep, tokens >= 128 ? 5120 : 256));
+            }
+        }
+    }
+    for (bool keep : {false, true}) {
+        test_cases.emplace_back(new test_fp8_qkv_prepare(128, 2, keep, 5120));
+        test_cases.emplace_back(new test_fp8_qkv_prepare(65, 1, keep, 256, 1));
+    }
+    for (int tokens : {65, 128}) {
+        for (bool keep : {false, true}) {
+            test_cases.emplace_back(new test_fp8_bf16_norm(tokens, 7, keep, 256));
+            test_cases.emplace_back(new test_fp8_qkv_prepare(tokens, 7, keep, 256));
+        }
+    }
     for (int producer : {1, 3, 4, 5}) {
         test_cases.emplace_back(new test_fp8_pipeline(128, producer, true, true, 5120));
     }
