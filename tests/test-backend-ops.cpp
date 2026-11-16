@@ -5110,6 +5110,85 @@ struct test_ssm_conv_split_qkv : public test_case {
     }
 };
 
+struct test_ssm_conv_qk_norm : public test_case {
+    const int  tokens, heads, sequences;
+    const bool transposed, strided_heads;
+    const int  retain;
+
+    test_ssm_conv_qk_norm(int  tokens,
+                          int  heads,
+                          int  sequences,
+                          bool transposed,
+                          int  retain        = 0,
+                          bool strided_heads = false) :
+        tokens(tokens),
+        heads(heads),
+        sequences(sequences),
+        transposed(transposed),
+        strided_heads(strided_heads),
+        retain(retain) {}
+
+    std::string vars() override { return VARS_TO_STR6(tokens, heads, sequences, transposed, retain, strided_heads); }
+
+    std::string op_desc(ggml_tensor *) override { return "SSM_CONV_QK_NORM"; }
+
+    bool run_whole_graph() override { return true; }
+
+    bool use_graph_allocator() override { return true; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+            if (tensor->op != GGML_OP_NONE || tensor->type != GGML_TYPE_F32) {
+                continue;
+            }
+            std::vector<float> values(ggml_nelements(tensor));
+            for (size_t i = 0; i < values.size(); ++i) {
+                const uint32_t bits = uint32_t(i) * 1664525u + 1013904223u + uint32_t(tensor->ne[0]) * 101u;
+                values[i]           = float(int(bits >> 24) - 128) / 256.0f;
+            }
+            ggml_backend_tensor_set(tensor, values.data(), 0, values.size() * sizeof(float));
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int     d = 128, vh = 3 * heads, channels = (2 * heads + vh) * d;
+        auto *        input   = transposed ?
+                                    ggml_transpose(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, tokens, sequences)) :
+                                    ggml_new_tensor_3d(ctx, GGML_TYPE_F32, tokens, channels, sequences);
+        auto *        history = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, channels, sequences);
+        auto *        weight  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, channels);
+        auto *        conv    = ggml_ssm_conv_split(ctx, input, weight, history);
+        auto *        silu    = ggml_silu(ctx, conv);
+        ggml_tensor * q_rms   = nullptr;
+        auto          view    = [&](int nheads, size_t offset) {
+            return ggml_view_4d(ctx, silu, d, nheads, tokens, sequences,
+                                            (strided_heads && nheads == heads ? 2 * d : d) * 4, channels * 4,
+                                            size_t(channels) * tokens * 4, offset);
+        };
+        auto normalize = [&](ggml_tensor * v) {
+            auto * rms = ggml_rms_norm(ctx, v, 1e-6f / d);
+            if (!q_rms) {
+                q_rms = rms;
+            }
+            return ggml_scale(ctx, rms, 1.0f / sqrtf(float(d)));
+        };
+        auto * q = normalize(view(heads, 0));
+        auto * k = normalize(view(heads, heads * d * 4));
+        auto * v = view(vh, 2 * heads * d * 4);
+        auto * g =
+            ggml_scale(ctx, ggml_sqr(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, vh, tokens, sequences)), -0.1f);
+        auto * beta   = ggml_sigmoid(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, vh, tokens, sequences));
+        auto * state  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, d, vh, sequences);
+        auto * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        if (retain) {
+            auto * retained = retain == 1 ? silu : retain == 2 ? conv : q_rms;
+            result          = ggml_concat(ctx, ggml_reshape_1d(ctx, result, ggml_nelements(result)),
+                                          ggml_reshape_1d(ctx, retained, ggml_nelements(retained)), 0);
+        }
+        return result;
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -12071,9 +12150,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // ne[2] > 65535 exceeds the CUDA gridDim.y limit (#27901)
     test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, false, false, GGML_ROPE_TYPE_NORMAL));
     test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, true,  false, GGML_ROPE_TYPE_NEOX));
+    for (int tokens : { 64, 65 }) {
+        for (int heads : { 1, 3 }) {
+            for (int sequences : { 1, 2 }) {
+                test_cases.emplace_back(new test_ssm_conv_qk_norm(tokens, heads, sequences, true));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_ssm_conv_qk_norm(63, 1, 1, true));
+    test_cases.emplace_back(new test_ssm_conv_qk_norm(65, 1, 1, false));
+    test_cases.emplace_back(new test_ssm_conv_qk_norm(65, 3, 1, true, 0, true));
+    for (int retain : { 1, 2, 3 }) {
+        test_cases.emplace_back(new test_ssm_conv_qk_norm(65, 1, 1, true, retain));
+    }
     for (int64_t d_conv : {3, 4, 7, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
-            test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
+            test_cases.emplace_back(
+                new test_ssm_conv(GGML_TYPE_F32, { d_conv, d_inner, 1, 1 }, { d_conv, d_inner, 1, 1 }));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {2 * d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
             // long token (n_t > 32, exercises the long_token kernel path)

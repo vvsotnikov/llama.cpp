@@ -5231,6 +5231,86 @@ static int ggml_cuda_try_bf16_shared_input(ggml_backend_cuda_context & ctx, ggml
     return 1;
 }
 
+static int ggml_cuda_try_ssm_conv_qk_norm(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    if (!ggml_cuda_env_flag("GGML_CUDA_SSM_CONV_QK_NORM") || i + 8 >= graph->n_nodes ||
+        !ctx.stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    const ggml_op ops[] = { GGML_OP_SSM_CONV_SPLIT, GGML_OP_UNARY,    GGML_OP_VIEW,  GGML_OP_RMS_NORM, GGML_OP_SCALE,
+                            GGML_OP_VIEW,           GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_VIEW };
+    const int     retained[] = { i + 4, i + 7, i + 8 };
+    if (!ggml_can_fuse_subgraph(graph, i, 9, ops, retained, 3) ||
+        !ggml_cuda_check_fusion_memory_ranges(graph, i, 9, retained, 3)) {
+        return 0;
+    }
+    auto * conv  = graph->nodes[i];
+    auto * silu  = graph->nodes[i + 1];
+    auto * qview = graph->nodes[i + 2];
+    auto * qnorm = graph->nodes[i + 3];
+    auto * q     = graph->nodes[i + 4];
+    auto * kview = graph->nodes[i + 5];
+    auto * knorm = graph->nodes[i + 6];
+    auto * k     = graph->nodes[i + 7];
+    auto * v     = graph->nodes[i + 8];
+    if (!conv->src[0] || !conv->src[1] || !conv->src[2]) {
+        return 0;
+    }
+    for (int j = 0; j < 9; ++j) {
+        if (graph->nodes[i + j]->type != GGML_TYPE_F32) {
+            return 0;
+        }
+    }
+    if (conv->ne[0] < 128 || conv->ne[0] > INT_MAX || q->ne[0] != 128 || q->ne[1] < 1 ||
+        q->ne[1] >= conv->ne[0] / 256 || !ggml_is_contiguous(silu) || !ggml_are_same_shape(silu, conv) ||
+        !ggml_are_same_shape(qview, q) || !ggml_are_same_shape(kview, k) || qview->view_src != silu ||
+        kview->view_src != silu || v->view_src != silu || qview->nb[0] != 4 || kview->nb[0] != 4 ||
+        qview->nb[1] != 512 || kview->nb[1] != 512 || qview->nb[2] != silu->nb[1] || kview->nb[2] != silu->nb[1] ||
+        qview->nb[3] != silu->nb[2] || kview->nb[3] != silu->nb[2]) {
+        return 0;
+    }
+    if (silu->src[0] != conv || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || qview->src[0] != silu ||
+        kview->src[0] != silu || v->src[0] != silu || qnorm->src[0] != qview || knorm->src[0] != kview ||
+        q->src[0] != qnorm || k->src[0] != knorm || qview->view_offs != 0 ||
+        kview->view_offs != size_t(q->ne[0] * q->ne[1]) * 4 || v->view_offs != size_t(2 * q->ne[0] * q->ne[1]) * 4 ||
+        ggml_get_op_params_f32(q, 1) != 0 || ggml_get_op_params_f32(k, 1) != 0 ||
+        ggml_get_op_params_f32(qnorm, 0) != ggml_get_op_params_f32(knorm, 0) ||
+        ggml_get_op_params_f32(q, 0) != ggml_get_op_params_f32(k, 0)) {
+        return 0;
+    }
+    const float eps = ggml_get_op_params_f32(qnorm, 0), scale = ggml_get_op_params_f32(q, 0);
+    if (!std::isfinite(eps) || eps <= 0.0f || !std::isfinite(scale)) {
+        return 0;
+    }
+    for (int d = 0; d < 3; ++d) {
+        auto * out = graph->nodes[retained[d]];
+        for (int e = 0; e < d; ++e) {
+            if (ggml_cuda_tensors_overlap(out, graph->nodes[retained[e]])) {
+                return 0;
+            }
+        }
+        for (const auto * input : { conv->src[0], conv->src[1], conv->src[2] }) {
+            if (ggml_cuda_tensors_overlap(out, input)) {
+                return 0;
+            }
+        }
+    }
+    const ggml_tensor * tensors[] = { conv->src[0], conv->src[1], conv->src[2], q, k, v };
+    for (const auto * tensor : tensors) {
+        if (!tensor || !tensor->buffer || !ggml_backend_buffer_is_cuda(tensor->buffer) ||
+            ((ggml_backend_cuda_buffer_context *) tensor->buffer->context)->device != ctx.device) {
+            return 0;
+        }
+    }
+    if (!ggml_cuda_op_ssm_conv_qk_norm(ctx, conv, q, k, v, eps, scale)) {
+        return 0;
+    }
+    if (ggml_cuda_env_flag("GGML_CUDA_SSM_CONV_QK_NORM_TRACE")) {
+        fprintf(stderr, "SSM_CONV_QK_NORM_SELECTED tokens=%lld sequences=%lld heads=%lld\n", (long long) conv->ne[1],
+                (long long) conv->ne[2], (long long) q->ne[1]);
+    }
+    return 8;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, std::vector<bool> & nodes_fused) {
     if (ggml_cuda_fusion_disabled()) {
         return 0;
@@ -5238,6 +5318,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     const int bf16_skip = ggml_cuda_try_bf16_shared_input(*cuda_ctx, cgraph, i);
     if (bf16_skip) { return bf16_skip; }
+    const int conv_norm_skip = ggml_cuda_try_ssm_conv_qk_norm(*cuda_ctx, cgraph, i);
+    if (conv_norm_skip) {
+        return conv_norm_skip;
+    }
     const int mlp_skip = ggml_cuda_try_nvfp4_mlp(*cuda_ctx, cgraph, i);
     if (mlp_skip) {
         return mlp_skip;

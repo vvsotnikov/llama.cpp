@@ -157,9 +157,8 @@ static __global__ void repack_activation(const block_fp4_mmq * src, uint8_t * ds
     scales[sf_offset(row, subblock, k / 16)] = reinterpret_cast<const uint8_t *>(block.d4)[sub];
 }
 
-template <typename output_type>
-struct nvfp4_mlp_consumer {
-    using tile = cute::Shape<cute::_128, cute::_128, cute::_128>;
+template <typename output_type, int tile_k = 128> struct nvfp4_mlp_consumer {
+    using tile        = cute::Shape<cute::_128, cute::_128, cute::Int<tile_k>>;
     using cluster = cute::Shape<cute::_1, cute::_1, cute::_1>;
     using element = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
     using token_scale = cutlass::epilogue::fusion::Sm90ColBroadcast<
@@ -518,8 +517,9 @@ bool ggml_cuda_nvfp4_mlp(ggml_backend_cuda_context & ctx, const ggml_tensor * in
         prepare_unit_scale<<<(k+255)/256, 256, 0, stream>>>(channel_scales.ptr, k);
         const auto * down_values = weight_scales + size_t(2*n)*k/16;
         const auto * down_weight_scales = down_values + size_t(n)*k/2;
-        nvfp4_mlp_consumer<float>::run(ctx, values.ptr, scales.ptr, down_values, down_weight_scales,
-                down_scales.ptr, channel_scales.ptr, static_cast<float *>(output->data), rows, k, n);
+        nvfp4_mlp_consumer<float, 256>::run(ctx, values.ptr, scales.ptr, down_values, down_weight_scales,
+                                            down_scales.ptr, channel_scales.ptr, static_cast<float *>(output->data),
+                                            rows, k, n);
         CUDA_CHECK(cudaGetLastError());
         return true;
     }

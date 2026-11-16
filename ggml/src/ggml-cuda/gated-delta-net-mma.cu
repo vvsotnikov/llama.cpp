@@ -3,6 +3,7 @@
 
 #include <climits>
 #include <mutex>
+#include <type_traits>
 
 namespace ggml_cuda_gated_delta_net_mma {
 constexpr int D = 128;
@@ -52,6 +53,29 @@ template <int C, int V> struct alignas(128) shared {
     } scratch;
 
     float lower[C * C], prefix[C], beta[C];
+
+    static __device__ __forceinline__ int lower_index(int r, int c) { return r * C + c; }
+};
+
+template <int C, int V> struct alignas(128) shared_reuse {
+    union {
+        matrix<C, D> q;
+        matrix<C, V> delta;
+    } first;
+
+    matrix<C, D> k;
+
+    union {
+        matrix<D, V> state;
+
+        struct {
+            matrix<C, C> p, inverse;
+            float        lower[C * C];
+            matrix<C, V> solved;
+        } later;
+    } scratch;
+
+    float prefix[C], beta[C];
 
     static __device__ __forceinline__ int lower_index(int r, int c) { return r * C + c; }
 };
@@ -122,19 +146,63 @@ template <int R, int C> __device__ __forceinline__ void store(matrix<R, C> & m, 
 
 // Each block owns V independent value columns and advances by C tokens.
 // Keep recurrent state in FP32; pack high/residual BF16 operands inside the block.
-template <int C, int V, int BLOCKS = 1>
-static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_mma_args a) {
+template <int C, int V, int BLOCKS = 1, bool REUSE = false>
+static __global__ __launch_bounds__(REUSE ? 512 : 256, BLOCKS) void gdn_single(ggml_cuda_gdn_mma_args a) {
 #if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
     static_assert(ggml_cuda_get_physical_warp_size() == 32, "GDN MMA requires 32-lane warps");
-    constexpr int WARPS = 8;
-#ifdef GGML_USE_HIP
+    constexpr int WARPS = REUSE ? 16 : 8;
+    static_assert(!REUSE || (C == 16 && V == 128), "scratch reuse requires a C16 whole head");
+#    ifdef GGML_USE_HIP
     constexpr int N = 16;
 #else
     constexpr int N = 8;
 #endif // GGML_USE_HIP
     static_assert(C >= 16 && (C & (C - 1)) == 0 && V % N == 0 && D % V == 0, "invalid GDN tile");
     extern __shared__ __align__(128) unsigned char bytes[];
-    auto &                                         s    = *reinterpret_cast<shared<C, V> *>(bytes);
+    using storage = std::conditional_t<REUSE, shared_reuse<C, V>, shared<C, V>>;
+    auto & s      = *reinterpret_cast<storage *>(bytes);
+    auto & q_tile = [&]() -> auto & {
+        if constexpr (REUSE) {
+            return s.first.q;
+        } else {
+            return s.q;
+        }
+    }();
+    auto & delta_tile = [&]() -> auto & {
+        if constexpr (REUSE) {
+            return s.first.delta;
+        } else {
+            return s.delta;
+        }
+    }();
+    auto & p_tile = [&]() -> auto & {
+        if constexpr (REUSE) {
+            return s.scratch.later.p;
+        } else {
+            return s.p;
+        }
+    }();
+    auto & inverse_tile = [&]() -> auto & {
+        if constexpr (REUSE) {
+            return s.scratch.later.inverse;
+        } else {
+            return s.inverse;
+        }
+    }();
+    auto & lower = [&]() -> auto & {
+        if constexpr (REUSE) {
+            return s.scratch.later.lower;
+        } else {
+            return s.lower;
+        }
+    }();
+    auto & solved = [&]() -> auto & {
+        if constexpr (REUSE) {
+            return s.scratch.later.solved;
+        } else {
+            return s.scratch.solved;
+        }
+    }();
     const int                                      lane = threadIdx.x, warp = threadIdx.y, tid = warp * 32 + lane;
     const int                                      slice = blockIdx.x % (D / V);
     const int                                      h     = (blockIdx.x / (D / V)) % a.H;
@@ -180,17 +248,17 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
     for (int64_t t0 = 0; t0 < a.n_tokens; t0 += C) {
         const int valid = min((int64_t) C, a.n_tokens - t0);
 #pragma unroll
-        for (int j = 0; j < C / 8; ++j) {
-            const int t = warp + 8 * j, d = 4 * lane;
+        for (int j = 0; j < C / WARPS; ++j) {
+            const int t = warp + WARPS * j, d = 4 * lane;
             float4    q, k;
             if (PREFETCH && j == 0) {
                 q = next_q;
                 k = next_k;
             } else {
-                read_qk(t0 + 8 * j, q, k);
+                read_qk(t0 + WARPS * j, q, k);
             }
-            s.q.store2(t, d, make_float2(q.x * a.scale, q.y * a.scale));
-            s.q.store2(t, d + 2, make_float2(q.z * a.scale, q.w * a.scale));
+            q_tile.store2(t, d, make_float2(q.x * a.scale, q.y * a.scale));
+            q_tile.store2(t, d + 2, make_float2(q.z * a.scale, q.w * a.scale));
             s.k.store2(t, d, make_float2(k.x, k.y));
             s.k.store2(t, d + 2, make_float2(k.z, k.w));
         }
@@ -230,6 +298,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         // V32 overlaps Gram work with one output tile per projection warp.
         constexpr bool SPLIT_PROJECTION = C == 16 && V == 32;
         acc            base_output[((C / 16) * (V / N) + WARPS - 1) / WARPS];
+        acc            delta_values[((C / 16) * (V / N) + WARPS - 1) / WARPS];
         // delta = beta * (v - decay * K S), base output = decay * Q S
         auto           project = [&]() {
             if constexpr (V == 32) {
@@ -240,18 +309,26 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             for (int ti = (V == 32 ? warp - 4 : warp); ti < (C / 16) * (V / N); ti += (V == 32 ? 4 : WARPS)) {
                 const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
                 acc       qs, ks;
-                product<D, false, true>(qs, s.q, s.scratch.state, r, c);
+                product<D, false, true>(qs, q_tile, s.scratch.state, r, c);
                 product<D, false, true>(ks, s.k, s.scratch.state, r, c);
 #pragma unroll
                 for (int i = 0; i < acc::ne; ++i) {
                     const int   t = r + acc::get_i(i), v = c + acc::get_j(i);
                     const float decay = expf(s.prefix[t]);
                     const float vv    = t < valid ? a.v[voff + (t0 + t) * a.sv2 + v] : 0.f;
-                    s.delta.store(t, v, s.beta[t] * (vv - decay * ks.x[i]));
+                    if constexpr (REUSE) {
+                        delta_values[ti / WARPS].x[i] = s.beta[t] * (vv - decay * ks.x[i]);
+                    } else {
+                        delta_tile.store(t, v, s.beta[t] * (vv - decay * ks.x[i]));
+                    }
                     base_output[ti / WARPS].x[i] = decay * qs.x[i];
                 }
             }
         };
+        if constexpr (REUSE) {
+            project();
+            __syncthreads();
+        }
         // A = beta * strict_tril(K K^T * decay), P = tril(Q K^T * decay)
         for (int ti = warp; ti < 2 * (C / 16) * (C / N) && (V != 32 || warp < 4); ti += (V == 32 ? 4 : WARPS)) {
             const bool gram = ti < (C / 16) * (C / N);
@@ -260,7 +337,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             if (gram) {
                 product<D>(x, s.k, s.k, r, c);
             } else {
-                product<D>(x, s.q, s.k, r, c);
+                product<D>(x, q_tile, s.k, r, c);
             }
 #pragma unroll
             for (int i = 0; i < acc::ne; ++i) {
@@ -268,10 +345,10 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 const float v = rr < valid && cc <= rr ? x.x[i] * expf(s.prefix[rr] - s.prefix[cc]) : 0.f;
                 if (gram) {
                     if (cc < rr) {
-                        s.lower[s.lower_index(rr, cc)] = v * s.beta[rr];
+                        lower[s.lower_index(rr, cc)] = v * s.beta[rr];
                     }
                 } else {
-                    s.p.store(rr, cc, v);
+                    p_tile.store(rr, cc, v);
                 }
             }
         }
@@ -279,13 +356,20 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             project();
         }
         __syncthreads();
+        if constexpr (REUSE) {
+            // Gram construction has consumed Q; its storage can now hold delta.
+            for (int ti = warp; ti < (C / 16) * (V / N); ti += WARPS) {
+                store(delta_tile, delta_values[ti / WARPS], (ti / (V / N)) * 16, (ti % (V / N)) * N);
+            }
+            __syncthreads();
+        }
         // inverse = (I + A)^-1 by forward substitution
         for (int row = warp; row < C; row += WARPS) {
             float x[(C + 31) / 32];
 #pragma unroll
             for (int j = 0; j < (C + 31) / 32; ++j) {
                 const int col = lane + 32 * j;
-                x[j]          = col == row ? 1.f : (col < row ? -s.lower[s.lower_index(row, col)] : 0.f);
+                x[j]          = col == row ? 1.f : (col < row ? -lower[s.lower_index(row, col)] : 0.f);
             }
             for (int pivot = row - 1; pivot > 0; --pivot) {
                 const float xp = __shfl_sync(0xffffffff, x[pivot / 32], pivot % 32, 32);
@@ -293,18 +377,18 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 for (int j = 0; j < (C + 31) / 32; ++j) {
                     const int col = lane + 32 * j;
                     if (col < pivot) {
-                        x[j] -= xp * s.lower[s.lower_index(pivot, col)];
+                        x[j] -= xp * lower[s.lower_index(pivot, col)];
                     }
                 }
             }
 #pragma unroll
             for (int j = 0; j < (C + 31) / 32; ++j) {
                 if (lane + 32 * j < C) {
-                    s.inverse.store(row, lane + 32 * j, x[j]);
+                    inverse_tile.store(row, lane + 32 * j, x[j]);
                 }
             }
         }
-        if constexpr (V != 32) {
+        if constexpr (V != 32 && !REUSE) {
             project();
         }
         __syncthreads();
@@ -312,8 +396,8 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         for (int ti = warp; ti < (C / 16) * (V / N); ti += WARPS) {
             const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
             acc       x;
-            product<C, false, true>(x, s.inverse, s.delta, r, c);
-            store(s.scratch.solved, x, r, c);
+            product<C, false, true>(x, inverse_tile, delta_tile, r, c);
+            store(solved, x, r, c);
         }
         __syncthreads();
         // out = base output + P * solved
@@ -321,7 +405,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
              ti += WARPS) {
             const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
             acc       x;
-            product<C, false, true>(x, s.p, s.scratch.solved, r, c);
+            product<C, false, true>(x, p_tile, solved, r, c);
 #pragma unroll
             for (int i = 0; i < acc::ne; ++i) {
                 const int t = r + acc::get_i(i), v = c + acc::get_j(i);
@@ -331,10 +415,10 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             }
         }
         // S = decay(chunk) * S + K^T * (solved * decay to chunk end)
-        for (int i = tid; i < C * V; i += 256) {
-            const int   t = i / V, v = i % V, j = s.scratch.solved.index(t, v);
-            const float x = __bfloat162float(s.scratch.solved.hi[j]) + __bfloat162float(s.scratch.solved.lo[j]);
-            s.delta.store(t, v, x * expf(s.prefix[valid - 1] - s.prefix[t]));
+        for (int i = tid; i < C * V; i += 32 * WARPS) {
+            const int   t = i / V, v = i % V, j = solved.index(t, v);
+            const float x = __bfloat162float(solved.hi[j]) + __bfloat162float(solved.lo[j]);
+            delta_tile.store(t, v, x * expf(s.prefix[valid - 1] - s.prefix[t]));
         }
         __syncthreads();
         const float decay = expf(s.prefix[valid - 1]);
@@ -345,7 +429,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             for (int i = 0; i < acc::ne; ++i) {
                 state[j].x[i] *= decay;
             }
-            product<C, true, true>(state[j], s.k, s.delta, r, c);
+            product<C, true, true>(state[j], s.k, delta_tile, r, c);
         }
         __syncthreads();
     }
@@ -363,16 +447,18 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
 #endif // defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
 }
 
-template <int C, int V, int BLOCKS = 1> bool init(int device) {
+template <int C, int V, int BLOCKS = 1, bool REUSE = false> bool init(int device) {
     static std::once_flag once[GGML_CUDA_MAX_DEVICES];
     static bool           available[GGML_CUDA_MAX_DEVICES] = {};
     std::call_once(once[device], [device] {
         ggml_cuda_set_device(device);
-        if (sizeof(shared<C, V>) > ggml_cuda_info().devices[device].smpbo) {
+        if (sizeof(std::conditional_t<REUSE, shared_reuse<C, V>, shared<C, V>>) >
+            ggml_cuda_info().devices[device].smpbo) {
             return;
         }
-        const auto status = cudaFuncSetAttribute((const void *) gdn_single<C, V, BLOCKS>,
-                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(shared<C, V>));
+        const auto status = cudaFuncSetAttribute((const void *) gdn_single<C, V, BLOCKS, REUSE>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 sizeof(std::conditional_t<REUSE, shared_reuse<C, V>, shared<C, V>>));
         available[device] = status == cudaSuccess;
         if (status != cudaSuccess) {
             (void) cudaGetLastError();
@@ -430,7 +516,21 @@ bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cuda
 #ifdef GGML_USE_HIP
     gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
 #else
-    if (path == gdn_path::slice32_two_blocks) {
+    static const bool reuse = [] {
+        const char * value = getenv("GGML_CUDA_GDN_SCRATCH_REUSE");
+        return value && atoi(value) != 0;
+    }();
+    static const bool trace = [] {
+        const char * value = getenv("GGML_CUDA_GDN_SCRATCH_REUSE_TRACE");
+        return value && atoi(value) != 0;
+    }();
+    if (path == gdn_path::whole_head && reuse && init<16, 128, 1, true>(device)) {
+        gdn_single<16, 128, 1, true><<<a.H * a.n_seqs, dim3(32, 16), sizeof(shared_reuse<16, 128>), stream>>>(a);
+        if (trace) {
+            GGML_LOG_INFO("%s: scratch reuse tokens=%lld sequences=%lld heads=%lld\n", __func__, (long long) a.n_tokens,
+                          (long long) a.n_seqs, (long long) a.H);
+        }
+    } else if (path == gdn_path::slice32_two_blocks) {
         gdn_single<16, 32, 2><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
     } else if (path == gdn_path::slice32_one_block) {
         gdn_single<16, 32, 1><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);

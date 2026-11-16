@@ -58,6 +58,8 @@ export GGML_CUDA_NVFP4_MMQ_FUSION=1
 export GGML_CUDA_NVFP4_MLP=1
 export GGML_CUDA_SCALED_SWIGLU=1
 export GGML_CUDA_SSM_CONV_SPLIT=1
+export GGML_CUDA_SSM_CONV_QK_NORM=1
+export GGML_CUDA_GDN_SCRATCH_REUSE=1
 export GGML_CUDA_EARLY_QKVZ=1
 export GGML_CUDA_BF16_SHARED_INPUT=1
 export GGML_CUDA_FP8_BF16_NORM=1
@@ -79,6 +81,28 @@ and activation packing are fused where the graph and storage permit it.
 Prepared matrix layouts are retained for later calls. Direct packing produces
 the selected consumer's values and scale layout without an intermediate MMQ
 layout conversion.
+
+`GGML_CUDA_SSM_CONV_QK_NORM=1` combines four-tap split convolution, SiLU,
+and query/key normalization for F32 inputs with 128-element heads. Four warps
+process adjacent token positions independently. It applies to batches of at
+least 64 tokens with a supported layout and no retained intermediate that the
+fusion would discard. Unsupported layouts and overlapping buffers retain the
+existing path.
+
+`GGML_CUDA_GDN_SCRATCH_REUSE=1` uses 16 warps for the C16 whole-head recurrent
+prefill kernel. Packed recurrent state is no longer needed after the input
+projections, so its shared storage can hold the later Gram matrices and solved
+updates. Query storage becomes delta storage only after Gram construction
+finishes. This reduces shared-memory use and per-thread register pressure
+while retaining F32 state and the existing high/residual arithmetic. Existing
+shape, architecture, and resource guards remain in force; other schedules keep
+the original kernel.
+
+For selection diagnostics, set `GGML_CUDA_SSM_CONV_QK_NORM_TRACE=1` or
+`GGML_CUDA_GDN_SCRATCH_REUSE_TRACE=1`. Disable tracing for timing runs.
+
+The native NVFP4 MLP consumer uses a K256 tile for its F32 down projection.
+Gate/up projections retain K128 tiles, including their BF16 output path.
 
 `GGML_CUDA_FP8_BF16_NORM=1` lets a closed group of two FP8 and two BF16
 projections share normalized input preparation. It requires per-token FP8
@@ -140,7 +164,7 @@ including integrated CUDA GPUs selected automatically.
 ## Validation
 
 Run the relevant backend tests against the intended CUDA build, including
-`SSM_CONV_SPLIT`, `SSM_CONV_SPLIT_QKV`, `BF16_SHARED_INPUT`, `FP8_PIPELINE`,
+`SSM_CONV_SPLIT`, `SSM_CONV_SPLIT_QKV`, `SSM_CONV_QK_NORM`, `GATED_DELTA_NET`, `BF16_SHARED_INPUT`, `FP8_PIPELINE`,
 `FP8_GATED_NORM`, `FP8_NORM_REUSE`, `FP8_BF16_NORM`, `FP8_QKV_PREPARE`, `NVFP4_MLP`, `NVFP4_MLP_NORM`, and
 `NVFP4_NORM_REUSE`. Require nonzero test counts. For calibrated activation
 quantization, compare packed values and scales against an independent native
