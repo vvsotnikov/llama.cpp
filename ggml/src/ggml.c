@@ -6498,9 +6498,9 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(ggml_is_contiguous(beta));
     GGML_ASSERT(ggml_is_contiguous(state));
 
-    GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k->type == GGML_TYPE_F32);
-    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_BF16);
+    GGML_ASSERT(k->type == q->type);
+    GGML_ASSERT(v->type == q->type);
     GGML_ASSERT(g->type == GGML_TYPE_F32);
     GGML_ASSERT(beta->type == GGML_TYPE_F32);
     GGML_ASSERT(state->type == GGML_TYPE_F32);

@@ -424,9 +424,27 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         const char * value = getenv("GGML_CUDA_SSM_CONV_SPLIT");
         return value && strcmp(value, "0") != 0;
     }();
+    static const bool bf16_gdn_enabled = [] {
+        const char * value = getenv("LLAMA_CUDA_BF16_GDN");
+        return value && atoi(value) != 0;
+    }();
+    const auto layer_device = model.dev_layer(il);
+    const bool cuda_layer =
+        layer_device && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(layer_device)), "CUDA") == 0;
+    const bool bf16_gdn = bf16_gdn_enabled && cuda_layer && n_seq_tokens >= 64 && n_seq_tokens <= 4096 && n_seqs == 1 &&
+                          !inp->tree_parent && head_k_dim == 128 && head_v_dim == 128 && num_v_heads <= 128 &&
+                          cparams.fused_gdn_ch && cparams.fused_gdn_ar;
+    static const bool defer_history = [] {
+        const char * value = getenv("GGML_CUDA_SSM_DEFER_HISTORY");
+        return value && atoi(value) != 0;
+    }();
+    const bool defer =
+        defer_history && bf16_gdn && split_conv && n_seq_tokens >= int64_t(cparams.n_rs_seq) + conv_kernel_size;
+    ggml_tensor * deferred_conv_update = nullptr;
     ggml_tensor * separate_history = nullptr;
-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il,
-            split_conv ? &separate_history : nullptr);
+    ggml_tensor * conv_input =
+        build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il,
+                         split_conv ? &separate_history : nullptr, defer ? &deferred_conv_update : nullptr);
 
     ggml_tensor * state = inp->gdn_ctl ?
         build_rs(ssm_states_all, inp->s_copy_s, inp->s_copy_s_main, hparams.n_embd_s(), n_seqs,
@@ -443,6 +461,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    if (bf16_gdn) {
+        conv_output_silu = ggml_cast(ctx0, conv_output_silu, GGML_TYPE_BF16);
+    }
     cb(conv_output_silu, "conv_output_silu", il);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
@@ -477,8 +498,16 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
+    if (bf16_gdn) {
+        q_conv = ggml_cast(ctx0, q_conv, GGML_TYPE_F32);
+        k_conv = ggml_cast(ctx0, k_conv, GGML_TYPE_F32);
+    }
     q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
     k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+    if (bf16_gdn) {
+        q_conv = ggml_cast(ctx0, q_conv, GGML_TYPE_BF16);
+        k_conv = ggml_cast(ctx0, k_conv, GGML_TYPE_BF16);
+    }
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
@@ -496,6 +525,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
+    if (deferred_conv_update) {
+        // Keep current convolution inputs live through all fused output stores.
+        ggml_build_forward_expand(gf, q_conv);
+        ggml_build_forward_expand(gf, k_conv);
+        ggml_build_forward_expand(gf, v_conv);
+        ggml_build_forward_expand(gf, deferred_conv_update);
+    }
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]

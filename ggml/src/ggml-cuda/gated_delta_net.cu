@@ -1,5 +1,6 @@
-#include "gated_delta_net.cuh"
+#include "gated-delta-net-bf16.cuh"
 #include "gated-delta-net-mma.cuh"
+#include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
 #include <cstdint>
@@ -700,6 +701,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
         rp.row   = stash->ne[0];
         rp.w     = stash->ne[1] / 2;
         rp.indexed = ggml_nelements(dst->src[7]) > 3;
+        if (src_q->type == GGML_TYPE_BF16) {
+            GGML_ASSERT(ggml_cuda_gdn_bf16_supported(ctx.device, dst));
+            ggml_cuda_pool_alloc<float> committed(ctx.pool(), S_v * S_v * H);
+            // Replay reads only the previous F32 window when the current token count is zero.
+            launch_gated_delta_net<false, false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, committed.get(), S_v, H, 0,
+                                                       n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1, rq3,
+                                                       scale, state_slot_stride, K, rp, stream);
+            ggml_cuda_gdn_bf16_run(ctx, dst, committed.get(), state_d);
+            return;
+        }
         if (dst->src[8]) {
             GGML_ASSERT(!kda && S_v == 128 && n_tokens <= rp.w && n_tokens <= 32);
             const int warp = std::min(128, ggml_cuda_info().devices[ctx.device].warp_size);
@@ -770,6 +781,12 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, rp, stream);
         }
+        return;
+    }
+
+    if (src_q->type == GGML_TYPE_BF16) {
+        GGML_ASSERT(ggml_cuda_gdn_bf16_supported(ctx.device, dst));
+        ggml_cuda_gdn_bf16_run(ctx, dst, s_d, state_d);
         return;
     }
 

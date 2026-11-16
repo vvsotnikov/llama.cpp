@@ -2,6 +2,12 @@
 
 List of GGML operations and backend support status.
 
+In this fork, `GATED_DELTA_NET` also accepts matching BF16 Q/K/V inputs with
+F32 gates, state and output. CPU provides the reference implementation. CUDA
+supports the guarded prefill shapes when built with the optional
+[BF16 provider](development/cuda-native-pipeline.md#optional-bf16-recurrent-prefill).
+Metal, OpenVINO and SYCL retain F32 support and reject BF16 inputs.
+
 ## How to add a backend to this table:
 
 1. Run `test-backend-ops support --output csv` with your backend name and redirect output to a csv file in `docs/ops/` (e.g., `docs/ops/CUDA.csv`)

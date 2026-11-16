@@ -9,3 +9,11 @@ bool ggml_cuda_op_ssm_conv_qk_norm(ggml_backend_cuda_context & ctx,
                                    ggml_tensor *               v,
                                    float                       eps,
                                    float                       scale);
+
+bool ggml_cuda_op_ssm_conv_bf16_qk(ggml_backend_cuda_context & ctx,
+                                   const ggml_tensor *         conv,
+                                   ggml_tensor *               q,
+                                   ggml_tensor *               k,
+                                   ggml_tensor *               v,
+                                   float                       eps,
+                                   float                       scale);

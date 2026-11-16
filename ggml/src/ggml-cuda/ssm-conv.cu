@@ -361,3 +361,121 @@ bool ggml_cuda_op_ssm_conv_qk_norm(ggml_backend_cuda_context & ctx,
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+static __device__ __forceinline__ float4 round_bf16_qk(float4 x) {
+    return make_float4(__bfloat162float(__float2bfloat16_rn(x.x)), __bfloat162float(__float2bfloat16_rn(x.y)),
+                       __bfloat162float(__float2bfloat16_rn(x.z)), __bfloat162float(__float2bfloat16_rn(x.w)));
+}
+
+static __device__ __forceinline__ void store_bf16_qk(nv_bfloat16 * dst, float4 x) {
+    const auto a = __float22bfloat162_rn(make_float2(x.x, x.y));
+    const auto b = __float22bfloat162_rn(make_float2(x.z, x.w));
+    *reinterpret_cast<uint2 *>(dst) =
+        make_uint2(*reinterpret_cast<const uint32_t *>(&a), *reinterpret_cast<const uint32_t *>(&b));
+}
+
+static __global__ void conv_bf16_qk(const float * x,
+                                    const float * history,
+                                    const float * weight,
+                                    nv_bfloat16 * q,
+                                    nv_bfloat16 * k,
+                                    nv_bfloat16 * v,
+                                    int           channels,
+                                    int           tokens,
+                                    int           q_heads,
+                                    int           v_stride,
+                                    float         eps,
+                                    float         scale_out) {
+    const int lane = threadIdx.x, head = 4 * blockIdx.x + threadIdx.y;
+    if (128 * head >= channels) {
+        return;
+    }
+    const int seq = blockIdx.y, ch = 128 * head + 4 * lane;
+    const int begin = 32 * blockIdx.z, end = min(begin + 32, tokens);
+    float4    values[4], weights[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int pos = begin + j - 3;
+        if (pos < 0) {
+            const auto * h = history + int64_t(seq) * channels * 3 + ch * 3 + pos + 3;
+            values[j]      = make_float4(h[0], h[3], h[6], h[9]);
+        } else {
+            values[j] = *reinterpret_cast<const float4 *>(x + (int64_t(seq) * tokens + pos) * channels + ch);
+        }
+        const auto * w = weight + ch * 4 + j;
+        weights[j]     = make_float4(w[0], w[4], w[8], w[12]);
+    }
+    for (int t = begin; t < end; ++t) {
+        float4 y = make_float4(0, 0, 0, 0);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            y.x += values[j].x * weights[j].x;
+            y.y += values[j].y * weights[j].y;
+            y.z += values[j].z * weights[j].z;
+            y.w += values[j].w * weights[j].w;
+        }
+        // Preserve the convolution's separate zero-bias addition and native SiLU.
+        y = make_float4(ggml_cuda_op_silu_single(y.x + 0.0f), ggml_cuda_op_silu_single(y.y + 0.0f),
+                        ggml_cuda_op_silu_single(y.z + 0.0f), ggml_cuda_op_silu_single(y.w + 0.0f));
+        y = round_bf16_qk(y);
+        if (head < 2 * q_heads) {
+            float sum = 0.0f;
+            sum += y.x * y.x + y.y * y.y + y.z * y.z + y.w * y.w;
+            sum               = warp_reduce_sum(sum);
+            const float   inv = rsqrtf(sum / 128.0f + eps);
+            const float4  out = make_float4(scale_out * (inv * y.x), scale_out * (inv * y.y), scale_out * (inv * y.z),
+                                            scale_out * (inv * y.w));
+            nv_bfloat16 * dst = head < q_heads ? q : k;
+            const int     h   = head < q_heads ? head : head - q_heads;
+            store_bf16_qk(dst + ((int64_t(seq) * tokens + t) * q_heads + h) * 128 + 4 * lane, out);
+        } else {
+            store_bf16_qk(v + ((int64_t(seq) * tokens + t) * v_stride + (head - 2 * q_heads) * 128 + 4 * lane), y);
+        }
+        if (t + 1 < end) {
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+                values[j] = values[j + 1];
+            }
+            values[3] = *reinterpret_cast<const float4 *>(x + (int64_t(seq) * tokens + t + 1) * channels + ch);
+        }
+    }
+}
+
+bool ggml_cuda_op_ssm_conv_bf16_qk(ggml_backend_cuda_context & ctx,
+                                   const ggml_tensor *         conv,
+                                   ggml_tensor *               q,
+                                   ggml_tensor *               k,
+                                   ggml_tensor *               v,
+                                   float                       eps,
+                                   float                       scale) {
+    const auto *  x        = conv->src[0];
+    const auto *  w        = conv->src[1];
+    const auto *  history  = conv->src[2];
+    const int64_t channels = conv->ne[0], tokens = conv->ne[1], seqs = conv->ne[2];
+    if (!GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ctx.device].cc) || channels <= 0 || channels > INT_MAX ||
+        channels % 128 || tokens < 64 || tokens > 32 * 65535 || seqs < 1 || seqs > 65535 ||
+        channels > INT64_MAX / tokens / seqs / 4 || conv->ne[3] != 1 || x->type != GGML_TYPE_F32 ||
+        w->type != GGML_TYPE_F32 || history->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != channels ||
+        !ggml_is_matrix(w) || !ggml_is_contiguous(w) || x->ne[0] != tokens || x->ne[1] != channels ||
+        x->ne[2] != seqs || x->ne[3] != 1 || x->nb[0] != size_t(channels) * 4 || x->nb[1] != 4 ||
+        x->nb[2] != size_t(tokens * channels) * 4 || !ggml_is_contiguous(history) || history->ne[0] != 3 ||
+        history->ne[1] != channels || history->ne[2] != seqs || history->ne[3] != 1 || q->type != GGML_TYPE_BF16 ||
+        k->type != GGML_TYPE_BF16 || v->type != GGML_TYPE_BF16 || !ggml_is_contiguous(q) || !ggml_is_contiguous(k) ||
+        !ggml_are_same_shape(q, k) || q->ne[0] != 128 || q->ne[1] < 1 || q->ne[1] >= channels / 256 ||
+        q->ne[2] != tokens || q->ne[3] != seqs || v->ne[0] != 128 || 2 * q->ne[1] + v->ne[1] != channels / 128 ||
+        v->ne[2] != tokens || v->ne[3] != seqs || v->nb[0] != 2 || v->nb[1] != 256 ||
+        v->nb[2] != size_t(channels) * 2 || v->nb[3] != size_t(channels * tokens) * 2) {
+        return false;
+    }
+    const ggml_tensor * tensors[] = { x, w, history, q, k, v };
+    for (const auto * t : tensors) {
+        if (reinterpret_cast<uintptr_t>(t->data) % 16) {
+            return false;
+        }
+    }
+    conv_bf16_qk<<<dim3((channels / 128 + 3) / 4, seqs, (tokens + 31) / 32), dim3(32, 4), 0, ctx.stream()>>>(
+        (const float *) x->data, (const float *) history->data, (const float *) w->data, (nv_bfloat16 *) q->data,
+        (nv_bfloat16 *) k->data, (nv_bfloat16 *) v->data, channels, tokens, q->ne[1], channels, eps, scale);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}

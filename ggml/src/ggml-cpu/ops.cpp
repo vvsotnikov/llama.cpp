@@ -11265,6 +11265,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int64_t rk3 = nev3 / nek3;
 
     const float scale = 1.0f / sqrtf((float) S_v);
+    const bool         bf16  = src_q->type == GGML_TYPE_BF16;
+    std::vector<float> converted;
+    if (bf16) {
+        converted.resize(neq0 + nek0 + nev0);
+    }
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iv1 = ir % H; // head_index
@@ -11304,6 +11309,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
+
+            if (bf16) {
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) q_d, converted.data(), neq0);
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) k_d, converted.data() + neq0, nek0);
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) v_d, converted.data() + neq0 + nek0, nev0);
+                q_d = converted.data();
+                k_d = converted.data() + neq0;
+                v_d = converted.data() + neq0 + nek0;
+            }
 
             const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
             const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
@@ -11396,6 +11410,7 @@ void ggml_compute_forward_gated_delta_net(
 
     switch (src0->type) {
         case GGML_TYPE_F32:
+        case GGML_TYPE_BF16:
             {
                 ggml_compute_forward_gated_delta_net_f32(params, dst);
             } break;

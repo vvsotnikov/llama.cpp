@@ -443,14 +443,14 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return build_delta_net_chunking(q, k, v, g, b, s, il);
 }
 
-ggml_tensor * llm_build_delta_net_base::build_conv_state(
-        llm_graph_input_rs * inp,
-        ggml_tensor *        conv_states_all,
-        ggml_tensor *        qkv_mixed,
-        int64_t              conv_kernel_size,
-        int64_t              conv_channels,
-        int                  il,
-        ggml_tensor **       separate_history) {
+ggml_tensor * llm_build_delta_net_base::build_conv_state(llm_graph_input_rs * inp,
+                                                         ggml_tensor *        conv_states_all,
+                                                         ggml_tensor *        qkv_mixed,
+                                                         int64_t              conv_kernel_size,
+                                                         int64_t              conv_channels,
+                                                         int                  il,
+                                                         ggml_tensor **       separate_history,
+                                                         ggml_tensor **       deferred_update) {
     const auto * mctx_cur = inp->mctx;
 
     const auto kv_head  = mctx_cur->get_head();
@@ -529,7 +529,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                     (s_slot * mem_size + kv_head) * row_size);
         cb(conv_state_update, "conv_state_update", il);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+        ggml_tensor * update = ggml_cpy(ctx0, conv_state_last, conv_state_update);
+        if (deferred_update) {
+            *deferred_update = update;
+        } else {
+            ggml_build_forward_expand(gf, update);
+        }
     } else {
         // [TAG_RECURRENT_ROLLBACK_SPLITS]
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
@@ -567,7 +572,12 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
                 conv_states_all->nb[1],
                 kv_head * row_size);
 
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, slots, windows, inp->s_slot_rev));
+        ggml_tensor * update = ggml_set_rows(ctx0, slots, windows, inp->s_slot_rev);
+        if (deferred_update) {
+            *deferred_update = update;
+        } else {
+            ggml_build_forward_expand(gf, update);
+        }
     }
 
     return conv_input;

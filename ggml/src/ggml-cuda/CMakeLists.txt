@@ -132,6 +132,15 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    set(GGML_CUDA_GDN_BF16_LIBRARY "" CACHE FILEPATH "Optional native BF16 GDN provider")
+    if (GGML_CUDA_GDN_BF16_LIBRARY)
+        if (NOT EXISTS "${GGML_CUDA_GDN_BF16_LIBRARY}")
+            message(FATAL_ERROR "GGML_CUDA_GDN_BF16_LIBRARY does not exist")
+        endif()
+        target_link_libraries(ggml-cuda PRIVATE "${GGML_CUDA_GDN_BF16_LIBRARY}")
+        set_source_files_properties(gated-delta-net-bf16.cu PROPERTIES COMPILE_DEFINITIONS GGML_CUDA_GDN_BF16)
+    endif()
+
     set(GGML_CUDA_CUTLASS_PATH "" CACHE PATH "CUTLASS root for the optional FP8 producer pipeline")
     if (GGML_CUDA_CUTLASS_PATH)
         if (CUDAToolkit_VERSION VERSION_LESS "12.8")

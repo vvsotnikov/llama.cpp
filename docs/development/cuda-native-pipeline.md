@@ -1,4 +1,9 @@
-# Experimental CUDA prefill pipeline
+# Experimental CUDA prefill, decode and DFlash2 pipeline
+
+This branch combines the fork's activation preparation, projection and attention
+prefill paths with its IQ4 decode path, asynchronous DFlash2 injection, and
+speculative tree execution. The runtime options below are required to enable
+the experimental paths; checking out the branch alone does not enable them.
 
 These options belong to this fork. They apply to dense Qwen3.5-family models
 with mixed NVFP4 and per-channel FP8 weights, including the Qwen3.8-27B NVFP4
@@ -161,6 +166,64 @@ linear draft. A comparison with a seven-proposal chain must state that policy
 difference. The device-checkpoint path uses the loaded model's CUDA device,
 including integrated CUDA GPUs selected automatically.
 
+## Optional BF16 recurrent prefill
+
+This additional path is experimental and is disabled in the serving recipe
+above. It rounds convolution outputs and normalized Q/K to BF16, while retaining
+F32 gates, recurrent state and graph output. It changes the activation policy;
+it does not claim bit identity with F32 recurrent prefill or a measured speedup
+over the configuration above. Model quality and downstream timing must be
+evaluated separately before selecting it.
+
+The Linux/WSL provider uses FlashInfer's CuTe DSL GDN implementation with the
+Q-head lookup adapted to ggml's modulo head layout. It is compiled ahead of time
+for the selected SM120 or SM121 GPU. The builder uses an installed FlashInfer
+package and the public cuDNN Frontend runtime shim; it does not download source
+or install packages. Tested builder dependencies are PyTorch 2.14.0,
+FlashInfer 0.7.2.post1, CUTLASS DSL 4.8.0 and CUDA 13.4. These are separate from
+the C++ CUTLASS dependency used by the matrix kernels.
+
+Set `CUDNN_FRONTEND_ROOT` to a checkout of
+[NVIDIA/cudnn-frontend](https://github.com/NVIDIA/cudnn-frontend), containing
+`aot/sm120/src/runtime_shim.cpp`. Keep that checkout and `GDN_BUILD_DIR` outside
+this source tree. Run the builder in the Python environment containing the
+dependencies:
+
+```sh
+python scripts/build_cuda_gdn_bf16.py \
+    --cuda-root "$CUDA_ROOT" --device 0 \
+    --runtime-shim "$CUDNN_FRONTEND_ROOT/aot/sm120/src/runtime_shim.cpp" \
+    --output-dir "$GDN_BUILD_DIR"
+
+cmake -S . -B "$LLAMA_BUILD_DIR" \
+    -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
+    -DGGML_CUDA_CUTLASS_PATH="$CUTLASS_ROOT" \
+    -DGGML_CUDA_GDN_BF16_LIBRARY="$GDN_BUILD_DIR/libggml-gdn-bf16.so"
+cmake --build "$LLAMA_BUILD_DIR" --target llama-server test-backend-ops -j 4
+
+export LD_LIBRARY_PATH="$GDN_BUILD_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LLAMA_CUDA_BF16_GDN=1
+export GGML_CUDA_SSM_BF16_QK=1
+export GGML_CUDA_SSM_DEFER_HISTORY=1
+```
+
+The builder writes the adapted FlashInfer source, exported object, provider
+source and a dependency/source-hash manifest beside the library. Preserve
+FlashInfer's license header when redistributing those generated files. Rebuild
+for the GPU on which the library will run; it is not a universal CUDA binary.
+The normal build does not need this library. Without it, BF16 recurrent
+operations use the CPU reference, so leave `LLAMA_CUDA_BF16_GDN` unset unless
+the provider is configured and qualified on the intended GPU.
+
+Selection is limited to single-sequence, non-tree prefill batches of 64 to
+4096 tokens with 128-element heads and supported layouts. Short speculative
+verification batches retain the F32 path. The convolution fusion preserves
+the explicit BF16 rounding points and checks retained outputs and buffer
+overlap. Deferring the convolution-history write keeps the current projection
+live until Q/K/V have been written, allowing the fusion without removing its
+alias checks. Set `GGML_CUDA_SSM_BF16_QK_TRACE=1` to check selection, then unset
+it before timing.
+
 ## Validation
 
 Run the relevant backend tests against the intended CUDA build, including
@@ -179,3 +242,9 @@ processed prompt tokens per prefill second and generated tokens per decode
 second separately. Include drafting and verification in decode time. Report
 actual cache hits and output lengths. Keep results from profilers separate from
 uninstrumented request timing, and identify the exact binary and options.
+
+For the optional provider, compare `GATED_DELTA_NET` against the CPU reference
+and run `SSM_CONV_BF16_QK` with the fusion both enabled and disabled. The latter
+includes short batches, retained intermediates and unsupported input layouts.
+Also test speculative rejection followed by replay and cached continuation;
+operator tests alone do not qualify recurrent history handling in the server.

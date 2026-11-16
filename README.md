@@ -19,6 +19,9 @@
 
 ## Quick start
 
+For this fork's experimental CUDA prefill, decode and DFlash2 options, see the
+[CUDA pipeline build and serving guide](docs/development/cuda-native-pipeline.md).
+
 A few options to get `llama.cpp` installed on your machine:
 
 ```bash

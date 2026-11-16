@@ -1,103 +1,100 @@
-#include "ggml-cuda.h"
-#include "ggml-impl.h"
 #include "ggml-backend-impl.h"
-
-#include <array>
-
-#include "ggml-cuda/allreduce.cuh"
-#include "ggml-cuda/common.cuh"
+#include "ggml-cuda.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
+#include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/binbcast.cuh"
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
+#include "ggml-cuda/common.cuh"
 #include "ggml-cuda/concat.cuh"
 #include "ggml-cuda/conv-transpose-1d.cuh"
-#include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
+#include "ggml-cuda/conv2d.cuh"
 #include "ggml-cuda/conv3d.cuh"
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
-#include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
+#include "ggml-cuda/diagmask.cuh"
+#include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/fp8.cuh"
-#include "ggml-cuda/nvfp4-mlp.cuh"
 #include "ggml-cuda/fwht.cuh"
+#include "ggml-cuda/gated-delta-net-bf16.cuh"
+#include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/im2col.cuh"
-#include "ggml-cuda/mmf.cuh"
-#include "ggml-cuda/mmq.cuh"
-#include "ggml-cuda/mmq-few.cuh"
 #include "ggml-cuda/iq3-fragment.cuh"
 #include "ggml-cuda/iq4-fragment.cuh"
-#include "ggml-cuda/prefill-iq3.cuh"
+#include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/mean.cuh"
+#include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmq-few.cuh"
+#include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
+#include "ggml-cuda/nvfp4-mlp.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
 #include "ggml-cuda/pad.cuh"
-#include "ggml-cuda/pool2d.cuh"
+#include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/pool1d.cuh"
+#include "ggml-cuda/pool2d.cuh"
+#include "ggml-cuda/prefill-iq3.cuh"
 #include "ggml-cuda/quantize.cuh"
-#include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/roll.cuh"
+#include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/scale.cuh"
+#include "ggml-cuda/set-rows.cuh"
+#include "ggml-cuda/set.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
+#include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
+#include "ggml-cuda/top-k-mask.cuh"
 #include "ggml-cuda/top-k.cuh"
-#include "ggml-cuda/mean.cuh"
-#include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
+#include "ggml-cuda/tri.cuh"
+#include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
-#include "ggml-cuda/gla.cuh"
-#include "ggml-cuda/gated_delta_net.cuh"
-#include "ggml-cuda/dsv4-hc.cuh"
-#include "ggml-cuda/set.cuh"
-#include "ggml-cuda/set-rows.cuh"
-#include "ggml-cuda/pad_reflect_1d.cuh"
-#include "ggml-cuda/solve_tri.cuh"
-#include "ggml-cuda/tri.cuh"
-#include "ggml-cuda/cumsum.cuh"
-#include "ggml-cuda/fill.cuh"
-#include "ggml-cuda/lightning-indexer.cuh"
-#include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-impl.h"
 #include "ggml.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cfloat>
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
-#include <cfloat>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <cstdarg>
-#include <cstdio>
-#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -5311,6 +5308,112 @@ static int ggml_cuda_try_ssm_conv_qk_norm(ggml_backend_cuda_context & ctx, ggml_
     return 8;
 }
 
+static int ggml_cuda_try_ssm_conv_bf16_qk(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    if (!ggml_cuda_env_flag("GGML_CUDA_SSM_BF16_QK") || !ctx.stream_context().concurrent_events.empty() ||
+        i + 13 >= graph->n_nodes) {
+        return 0;
+    }
+    const ggml_op ops[] = { GGML_OP_SSM_CONV_SPLIT, GGML_OP_UNARY, GGML_OP_CPY, GGML_OP_VIEW, GGML_OP_CPY,
+                            GGML_OP_RMS_NORM,       GGML_OP_SCALE, GGML_OP_CPY, GGML_OP_VIEW, GGML_OP_CPY,
+                            GGML_OP_RMS_NORM,       GGML_OP_SCALE, GGML_OP_CPY, GGML_OP_VIEW };
+    for (int j = 0; j < 14; ++j) {
+        const auto * node = graph->nodes[i + j];
+        if (node->op != ops[j] || !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return 0;
+        }
+        if (j == 7 || j == 12 || j == 13) {
+            continue;
+        }
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            return 0;
+        }
+        int uses = 0;
+        for (int k = 0; k < 14; ++k) {
+            for (const auto * src : graph->nodes[i + k]->src) {
+                uses += src == node;
+            }
+        }
+        if (uses != ggml_node_get_use_count(graph, i + j)) {
+            return 0;
+        }
+    }
+    const auto * conv = graph->nodes[i];
+    const auto * silu = graph->nodes[i + 1];
+    const auto * raw  = graph->nodes[i + 2];
+    auto *       q    = graph->nodes[i + 7];
+    auto *       k    = graph->nodes[i + 12];
+    auto *       v    = graph->nodes[i + 13];
+    if (silu->src[0] != conv || silu->type != GGML_TYPE_F32 || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
+        conv->type != GGML_TYPE_F32 || !ggml_are_same_shape(silu, conv) || raw->src[0] != silu || raw->src[1] != raw ||
+        raw->type != GGML_TYPE_BF16 || !ggml_are_same_shape(raw, conv) || !ggml_is_contiguous(raw)) {
+        return 0;
+    }
+    float eps = 0.0f, scale = 0.0f;
+    for (int offset : { 3, 8 }) {
+        const auto * view            = graph->nodes[i + offset];
+        const auto * values          = graph->nodes[i + offset + 1];
+        const auto * norm            = graph->nodes[i + offset + 2];
+        const auto * scaled          = graph->nodes[i + offset + 3];
+        const auto * output          = graph->nodes[i + offset + 4];
+        const size_t expected_offset = offset == 3 ? 0 : size_t(q->ne[1]) * 128 * 2;
+        if (view->src[0] != raw || view->view_src != raw || view->view_offs != expected_offset ||
+            view->type != GGML_TYPE_BF16 || !ggml_are_same_shape(view, q) || view->nb[0] != 2 || view->nb[1] != 256 ||
+            view->nb[2] != raw->nb[1] || view->nb[3] != raw->nb[2] || values->src[0] != view ||
+            values->src[1] != values || values->type != GGML_TYPE_F32 || !ggml_is_contiguous(values) ||
+            norm->src[0] != values || norm->type != GGML_TYPE_F32 || !ggml_is_contiguous(norm) ||
+            scaled->src[0] != norm || scaled->type != GGML_TYPE_F32 || !ggml_is_contiguous(scaled) ||
+            output->src[0] != scaled || output->src[1] != output || output->type != GGML_TYPE_BF16 ||
+            !ggml_are_same_shape(values, q) || !ggml_are_same_shape(norm, q) || !ggml_are_same_shape(scaled, q) ||
+            !ggml_are_same_shape(output, q)) {
+            return 0;
+        }
+        float e, s, bias;
+        memcpy(&e, norm->op_params, sizeof(e));
+        memcpy(&s, scaled->op_params, sizeof(s));
+        memcpy(&bias, (const float *) scaled->op_params + 1, sizeof(bias));
+        if (!std::isfinite(e) || e <= 0.0f || !std::isfinite(s) || bias != 0.0f) {
+            return 0;
+        }
+        if (offset == 3) {
+            eps   = e;
+            scale = s;
+        } else if (e != eps || s != scale) {
+            return 0;
+        }
+    }
+    if (v->src[0] != raw || v->view_src != raw || v->view_offs != size_t(q->ne[1]) * 256 * 2) {
+        return 0;
+    }
+    const ggml_tensor * outputs[] = { q, k, v };
+    for (int j = 0; j < 3; ++j) {
+        for (const auto * src : { conv->src[0], conv->src[1], conv->src[2] }) {
+            if (!src || ggml_cuda_tensors_overlap(outputs[j], src)) {
+                return 0;
+            }
+        }
+        for (int n = 0; n < j; ++n) {
+            if (ggml_cuda_tensors_overlap(outputs[j], outputs[n])) {
+                return 0;
+            }
+        }
+    }
+    const ggml_tensor * tensors[] = { conv->src[0], conv->src[1], conv->src[2], q, k, v };
+    for (const auto * t : tensors) {
+        if (!t->buffer || !ggml_backend_buffer_is_cuda(t->buffer) ||
+            ((ggml_backend_cuda_buffer_context *) t->buffer->context)->device != ctx.device) {
+            return 0;
+        }
+    }
+    if (!ggml_cuda_op_ssm_conv_bf16_qk(ctx, conv, q, k, v, eps, scale)) {
+        return 0;
+    }
+    if (ggml_cuda_env_flag("GGML_CUDA_SSM_BF16_QK_TRACE")) {
+        fprintf(stderr, "SSM_BF16_QK_SELECTED tokens=%lld sequences=%lld\n", (long long) conv->ne[1],
+                (long long) conv->ne[2]);
+    }
+    return 13;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, std::vector<bool> & nodes_fused) {
     if (ggml_cuda_fusion_disabled()) {
         return 0;
@@ -5318,6 +5421,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     const int bf16_skip = ggml_cuda_try_bf16_shared_input(*cuda_ctx, cgraph, i);
     if (bf16_skip) { return bf16_skip; }
+    const int bf16_conv_skip = ggml_cuda_try_ssm_conv_bf16_qk(*cuda_ctx, cgraph, i);
+    if (bf16_conv_skip) {
+        return bf16_conv_skip;
+    }
     const int conv_norm_skip = ggml_cuda_try_ssm_conv_qk_norm(*cuda_ctx, cgraph, i);
     if (conv_norm_skip) {
         return conv_norm_skip;
@@ -6463,6 +6570,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_prepare_quant_fragments(*cuda_ctx,cgraph);
     ggml_cuda_prepare_prefill_iq3(*cuda_ctx, cgraph);
     ggml_cuda_prepare_nvfp4_mlp(*cuda_ctx, cgraph);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET && cgraph->nodes[i]->src[0]->type == GGML_TYPE_BF16) {
+            ggml_cuda_gdn_bf16_init(cuda_ctx->device);
+            break;
+        }
+    }
     bool graph_mode = false;
 #ifdef USE_CUDA_GRAPH
     static const bool graphs_disabled = getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr;
@@ -7702,7 +7815,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return true;
+            return op->src[0]->type == GGML_TYPE_F32 || ggml_cuda_gdn_bf16_supported(dev_ctx->device, op);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
