@@ -17,6 +17,7 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
+#include "llama-memory-hybrid-kvq.h"
 #include "llama-memory-recurrent.h"
 
 #include "llama.h"
@@ -463,6 +464,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_r_cache         ("cache_r_l\\d*");
     static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
+    static const std::regex pattern_spk_cache       ("cache_spk_l\\d*");
+    static const std::regex pattern_spv_cache       ("cache_spv_l\\d*");
+    static const std::regex pattern_spgb_cache      ("cache_spgb_l\\d*");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
     static const std::regex pattern_kda_conv1d      ("blk\\.\\d*\\.ssm_conv1d_(q|k|v)\\.weight");
@@ -572,7 +576,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
             }
             if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
-                    std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+                    std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache) ||
+                    std::regex_match(tensor_name, pattern_spk_cache) || std::regex_match(tensor_name, pattern_spv_cache) ||
+                    std::regex_match(tensor_name, pattern_spgb_cache)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
             }
         }
@@ -637,7 +643,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ssm_beta_alpha) || std::regex_match(tensor_name, pattern_ssm_beta_alpha_cat)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
-        if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+        if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache) ||
+                std::regex_match(tensor_name, pattern_spk_cache) || std::regex_match(tensor_name, pattern_spv_cache) ||
+                std::regex_match(tensor_name, pattern_spgb_cache)) {
             if (ud->model->arch == LLM_ARCH_LFM2 || ud->model->arch == LLM_ARCH_LFM2MOE || ud->model->arch == LLM_ARCH_LFM3) {
                 // the LFM2 shortconv block runs fully mirrored, so its conv state must be mirrored too
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED, "");
@@ -692,9 +700,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
         if (is_glm5_next && std::regex_match(tensor_name, pattern_r_cache)) {
             // the conv state holds the q, k and v windows one after the other
-            const int64_t conv_state_size = (hparams.ssm_d_conv - 1) * hparams.n_head(il) * hparams.n_embd_head_kda;
-            GGML_ASSERT(tensor->ne[axis] == 3*conv_state_size);
+            const int64_t d_inner         = hparams.n_head(il) * hparams.n_embd_head_kda;
+            const int64_t conv_state_size = (hparams.ssm_d_conv - 1) * d_inner;
+            if (tensor->ne[axis] != 3*conv_state_size) {
+                // replay: q, k and v histories [d_inner, window + pending], every column is a block of heads
+                GGML_ASSERT(tensor->ne[axis] % (3*d_inner) == 0);
+                return {{d_inner, uint32_t(tensor->ne[axis] / d_inner)}};
+            }
             return {{conv_state_size, 3}};
+        }
+        if (is_glm5_next && (std::regex_match(tensor_name, pattern_spk_cache) || std::regex_match(tensor_name, pattern_spv_cache) ||
+                std::regex_match(tensor_name, pattern_spgb_cache))) {
+            // replay pending inputs, per token: k [S_k, H], v [S_v, H], then the gates [S_v, H] and the betas (in element 0)
+            const int64_t d_inner = hparams.n_head(il) * hparams.n_embd_head_kda;
+            GGML_ASSERT(tensor->ne[axis] % d_inner == 0);
+            return {{d_inner, uint32_t(tensor->ne[axis] / d_inner)}};
         }
         // TODO: deduplicate condition [TAG_SPLIT_QGATE_QWEN]
         // zonos3 has the qwen35 GDN layout, its attention layers have no fused qkv
@@ -726,6 +746,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     return {{key_dim, 2}, {value_dim, 1}};
                 }
                 if (std::regex_match(tensor_name, pattern_r_cache)) {
+                    // the replay layouts need the Qwen 3.5 pattern, llama_context keeps Qwen 3 Next on snapshots
+                    GGML_ASSERT(tensor->ne[axis] == (2*key_dim + value_dim) * (hparams.ssm_d_conv - 1));
                     return {{key_dim * (hparams.ssm_d_conv - 1), 2}, {value_dim * (hparams.ssm_d_conv - 1), 1}};
                 }
             } else {
@@ -750,10 +772,25 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     return {{n_k_heads, head_ratio}};
                 }
                 if (std::regex_match(tensor_name, pattern_r_cache)) {
+                    const int64_t n_conv_ch = 2*key_dim + value_dim;
+                    if (tensor->ne[axis] != n_conv_ch * (hparams.ssm_d_conv - 1)) {
+                        // replay: [channels, window + pending] per cell, every column is a q, k, v block
+                        GGML_ASSERT(tensor->ne[axis] % n_conv_ch == 0);
+                        return {{key_dim, uint32_t((2 + head_ratio) * (tensor->ne[axis] / n_conv_ch))}};
+                    }
                     return {{key_dim * (hparams.ssm_d_conv - 1), 2 + head_ratio}};
                 }
                 if (std::regex_match(tensor_name, pattern_s_cache)) {
                     return {{n_k_heads * head_v_dim * head_v_dim, head_ratio}};
+                }
+                // replay pending inputs, per token: k [S_k, H_k], v [S_v, H_v], then the gates and betas [H_v]
+                if (std::regex_match(tensor_name, pattern_spk_cache) || std::regex_match(tensor_name, pattern_spv_cache)) {
+                    GGML_ASSERT(tensor->ne[axis] % key_dim == 0);
+                    return {{key_dim, uint32_t(tensor->ne[axis] / key_dim)}};
+                }
+                if (std::regex_match(tensor_name, pattern_spgb_cache)) {
+                    GGML_ASSERT(tensor->ne[axis] % n_k_heads == 0);
+                    return {{n_k_heads, uint32_t(tensor->ne[axis] / n_k_heads)}};
                 }
             }
 
@@ -810,7 +847,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return {granularity_qkv / head_dim};
             }
             if (std::regex_match(tensor_name, pattern_r_cache)) {
-                return std::vector<int64_t>(segments.size(), granularity_qkv * (hparams.ssm_d_conv - 1));
+                // replay: channels first, each segment is a single conv column
+                const int64_t conv_state_size = (hparams.ssm_d_conv - 1) * hparams.n_head(il) * head_dim;
+                const bool    replay          = tensor->ne[0] != 3*conv_state_size;
+                return std::vector<int64_t>(segments.size(), granularity_qkv * (replay ? 1 : hparams.ssm_d_conv - 1));
+            }
+            if (std::regex_match(tensor_name, pattern_spk_cache) || std::regex_match(tensor_name, pattern_spv_cache) ||
+                    std::regex_match(tensor_name, pattern_spgb_cache)) {
+                return std::vector<int64_t>(segments.size(), granularity_qkv);
             }
             if (std::regex_match(tensor_name, pattern_s_cache)) {
                 return {granularity_qkv * head_dim};
@@ -847,10 +891,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return std::vector<int64_t>(segments.size(), 2 * (granularity_qkv / head_dim));
             }
             if (std::regex_match(tensor_name, pattern_r_cache)) {
-                return std::vector<int64_t>(segments.size(), granularity_qkv * (hparams.ssm_d_conv - 1));
+                // replay: [channels, window + pending], each segment is a single conv column
+                const int64_t n_conv_ch = 2*hparams.ssm_n_group*hparams.ssm_d_state + hparams.ssm_d_inner;
+                const bool    replay    = tensor->ne[0] != n_conv_ch * (hparams.ssm_d_conv - 1);
+                return std::vector<int64_t>(segments.size(), granularity_qkv * (replay ? 1 : hparams.ssm_d_conv - 1));
             }
             if (std::regex_match(tensor_name, pattern_s_cache)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
+            }
+            if (std::regex_match(tensor_name, pattern_spk_cache) || std::regex_match(tensor_name, pattern_spv_cache)) {
+                return std::vector<int64_t>(segments.size(), granularity_qkv);
+            }
+            if (std::regex_match(tensor_name, pattern_spgb_cache)) {
+                return std::vector<int64_t>(segments.size(), granularity_qkv / head_dim);
             }
         } else {
             // regular attention
@@ -3140,6 +3193,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                     /* n_seq_max         */ cparams.n_seq_max,
                     /* n_rs_seq          */ cparams.n_rs_seq,
+                    /* rs_replay         */ cparams.rs_replay,
                     /* offload           */ cparams.offload_kqv,
                     /* unified           */ cparams.kv_unified,
                     /* filter_attn       */ std::move(filter_attn),
@@ -3332,6 +3386,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
+                            false,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
@@ -3426,11 +3481,34 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* rs_replay         */ cparams.rs_replay,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
+                    } else if (params.kvq_tail > 0 && llama_model_supports_kvq(this)) {
+                        // the two-tier KV cache
+                        res = new llama_memory_hybrid_kvq(
+                            /* model             */ *this,
+                            /* no_alloc          */ params.no_alloc,
+                            /* attn_type_k       */ params.type_k,
+                            /* attn_type_v       */ params.type_v,
+                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_n_swa        */ hparams.n_swa,
+                            /* attn_swa_type     */ hparams.swa_type,
+                            /* recurrent_type_k  */ GGML_TYPE_F32,
+                            /* recurrent_type_v  */ GGML_TYPE_F32,
+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* n_seq_max         */ cparams.n_seq_max,
+                            /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* rs_replay         */ cparams.rs_replay,
+                            /* offload           */ cparams.offload_kqv,
+                            /* unified           */ cparams.kv_unified,
+                            /* filter_attn       */ std::move(filter_attn),
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* tail              */ params.kvq_tail);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -3446,6 +3524,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* rs_replay         */ cparams.rs_replay,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -4082,6 +4161,47 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
 
 void llama_model_set_attn_rot(struct llama_model * model, bool value) {
     model->attn_rot = value;
+}
+
+bool llama_model_supports_kvq(const struct llama_model * model, std::string * reason) {
+    auto fail = [&](const std::string & why) {
+        if (reason) {
+            *reason = why;
+        }
+        return false;
+    };
+
+    if (model->arch != LLM_ARCH_QWEN35 && model->arch != LLM_ARCH_SENSENOVA_LOOP) {
+        return fail(std::string("the architecture is '") + llm_arch_name(model->arch) + "', only qwen35 and sensenova_loop are supported");
+    }
+
+    const auto & hp = model->hparams;
+
+    uint32_t n_head    = 0;
+    uint32_t n_head_kv = 0;
+    for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+        if (hp.is_recr(il)) {
+            continue;
+        }
+        if (hp.n_embd_head_k(il) != 256 || hp.n_embd_head_v(il) != 256) {
+            return fail("the attention head size must be 256 for K and V (layer " + std::to_string(il) + " has " +
+                    std::to_string(hp.n_embd_head_k(il)) + " and " + std::to_string(hp.n_embd_head_v(il)) + ")");
+        }
+        if (hp.n_head_kv(il) == 0 || hp.n_head(il) % hp.n_head_kv(il) != 0) {
+            return fail("layer " + std::to_string(il) + " needs a whole number of query heads per kv head");
+        }
+        if (n_head == 0) {
+            n_head    = hp.n_head(il);
+            n_head_kv = hp.n_head_kv(il);
+        } else if (hp.n_head(il) != n_head || hp.n_head_kv(il) != n_head_kv) {
+            return fail("all attention layers must have the same number of heads and kv heads");
+        }
+    }
+    if (n_head == 0) {
+        return fail("the model has no attention layer");
+    }
+
+    return true;
 }
 
 //

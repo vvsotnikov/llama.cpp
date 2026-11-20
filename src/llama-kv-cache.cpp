@@ -80,7 +80,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
                const char * name_tag,
-                     bool   is_indexer) :
+                     bool   is_indexer,
+                     bool   attn_rot) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_swa(n_swa), is_indexer(is_indexer),
     attn_rot_bufs(no_alloc), swa_type(swa_type), ctxs_bufs(no_alloc),
@@ -298,14 +299,14 @@ llama_kv_cache::llama_kv_cache(
         n_rot_k = other->n_rot_k;
         n_rot_v = other->n_rot_v;
     } else {
-        // two knobs turn the same thing off: the environment variable, for the whole process, and
-        //   the model setting, for the contexts of one model - see llama_model_set_attn_rot
+        // three knobs turn the same thing off: the environment variable, for the whole process, the model
+        //   setting, for the contexts of one model (llama_model_set_attn_rot), and the argument of this cache
         const char * env_rot_disable = getenv("LLAMA_ATTN_ROT_DISABLE");
 
-        const bool attn_rot_disable = !model.attn_rot || (env_rot_disable != nullptr && atoi(env_rot_disable) != 0);
+        const bool attn_rot_disable = !attn_rot || !model.attn_rot || (env_rot_disable != nullptr && atoi(env_rot_disable) != 0);
         if (attn_rot_disable) {
             LLAMA_LOG_INFO("%s: attention rotation force disabled (%s)\n", __func__,
-                    model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot");
+                    !attn_rot ? "this cache" : model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot");
         }
 
         bool attn_rot_k =
@@ -1038,6 +1039,19 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         const auto & cells = v_cells[seq_to_stream[seq_id]];
 
+        if (ring) {
+            GGML_ASSERT(n_stream == 1);
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const llama_pos pos = ubatch.pos[i];
+                const uint32_t  idx = pos >= 0 ? (uint32_t) (pos % (llama_pos) cells.size()) : 0;
+                if (pos < 0 || !cells.is_empty(idx)) {
+                    return { };
+                }
+                res.idxs[s].push_back(idx);
+            }
+            continue;
+        }
+
         uint32_t head_cur = v_heads[seq_to_stream[seq_id]];
 
         // if we have enough unused cells before the current head ->
@@ -1285,6 +1299,12 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].v;
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -1295,6 +1315,33 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return seq_to_stream[seq_id];
+}
+
+void llama_kv_cache::ring_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    GGML_ASSERT(ring && n_stream == 1 && p0 >= 0 && seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    for (llama_pos p = p0; p < p1; ++p) {
+        const uint32_t idx = (uint32_t) (p % (llama_pos) cells.size());
+        GGML_ASSERT(cells.is_empty(idx));
+        cells.pos_set(idx, p);
+        cells.seq_add(idx, seq_id);
+    }
+}
+
+void llama_kv_cache::move_bufs(ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(!ctxs_bufs.no_alloc);
+    for (auto & [ctx, buf] : ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
+        buf.reset();
+        buf = llama_memory_bufs::alloc_buf(ctx.get(), buft, false, "kv cache");
+        ggml_backend_buffer_clear(buf.get(), 0);
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
+    }
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {

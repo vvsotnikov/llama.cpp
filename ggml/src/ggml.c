@@ -1097,6 +1097,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "KVQ_ATTN",
+    "KVQ_FIT",
 
     "UNARY",
 
@@ -1114,7 +1116,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1210,6 +1212,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "kvq_attn(q, kc, vc, tab_inv, tab_aux, k, v, rkv, ridx, mask)",
+    "kvq_fit(x, par, rows)",
 
     "unary(x)",
 
@@ -1227,7 +1231,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5414,7 +5418,8 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
         struct ggml_tensor  * kv_rows,
         float                 scale,
         float                 max_bias,
-        float                 logit_softcap) {
+        float                 logit_softcap,
+        bool                  lse) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     // TODO: check if vT can be multiplied by (k*qT)
 
@@ -5443,12 +5448,17 @@ static struct ggml_tensor * ggml_flash_attn_ext_impl(
         GGML_ASSERT(mask);
     }
 
+    // the log-sum-exp goes after the rows of the result
+    GGML_ASSERT(!lse || (q->ne[3] == 1 && !kv_rows));
+    const int64_t n_lse = lse ? (q->ne[1] + v->ne[0] - 1)/v->ne[0] : 0;
+
     // permute(0, 2, 1, 3)
-    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1] + n_lse, q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_i32(result, 5, lse ? 1 : 0);
 
     result->op     = GGML_OP_FLASH_ATTN_EXT;
     result->src[0] = q;
@@ -5469,7 +5479,19 @@ struct ggml_tensor * ggml_flash_attn_ext(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
-    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap);
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap, false);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_lse(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 logit_softcap) {
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, NULL, scale, max_bias, logit_softcap, true);
 }
 
 struct ggml_tensor * ggml_flash_attn_ext_rows(
@@ -5482,9 +5504,15 @@ struct ggml_tensor * ggml_flash_attn_ext_rows(
         float                 scale,
         float                 max_bias,
         float                 logit_softcap) {
-    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, kv_rows, scale, max_bias, logit_softcap);
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, kv_rows, scale, max_bias, logit_softcap, false);
 }
 
+bool ggml_flash_attn_ext_get_lse(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    return ggml_get_op_params_i32(a, 5) != 0;
+}
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
         const struct ggml_tensor * a) {
@@ -6308,7 +6336,12 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
-        int64_t               K) {
+        struct ggml_tensor  * pend_k,
+        struct ggml_tensor  * pend_v,
+        struct ggml_tensor  * pend_gb,
+        struct ggml_tensor  * n_rep,
+        int64_t               K,
+        bool                  keep) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6351,6 +6384,30 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    const bool replay = pend_k != NULL;
+    GGML_ASSERT((pend_v != NULL) == replay && (pend_gb != NULL) == replay && (n_rep != NULL) == replay);
+    GGML_ASSERT(replay || !keep);
+    if (replay) {
+        const int64_t n_pend = pend_k->ne[2];
+
+        GGML_ASSERT(K == 1);
+        GGML_ASSERT(pend_k->type == GGML_TYPE_F32 && pend_v->type == GGML_TYPE_F32 && pend_gb->type == GGML_TYPE_F32);
+        GGML_ASSERT(n_rep->type == GGML_TYPE_I32);
+        GGML_ASSERT(pend_k->nb[0] == sizeof(float) && pend_v->nb[0] == sizeof(float) && pend_gb->nb[0] == sizeof(float));
+        GGML_ASSERT(pend_k->ne[0]  == k->ne[0] && pend_k->ne[1]  == k->ne[1] && pend_k->ne[3]  == n_seqs);
+        GGML_ASSERT(pend_v->ne[0]  == S_v      && pend_v->ne[1]  == H        && pend_v->ne[2]  == n_pend   && pend_v->ne[3]  == n_seqs);
+        GGML_ASSERT(pend_gb->ne[0] == g->ne[0] && pend_gb->ne[1] == H        && pend_gb->ne[2] == 2*n_pend && pend_gb->ne[3] == n_seqs);
+        GGML_ASSERT(ggml_is_contiguous(n_rep) && ggml_nelements(n_rep) == n_seqs);
+
+        ggml_set_op_params_i32(result, 1, (int32_t) n_pend);
+        ggml_set_op_params_i32(result, 2, keep ? 1 : 0);
+
+        result->src[6] = pend_k;
+        result->src[7] = pend_v;
+        result->src[8] = pend_gb;
+        result->src[9] = n_rep;
+    }
 
     return result;
 }
@@ -6583,6 +6640,233 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_kvq_attn
+
+struct ggml_tensor * ggml_kvq_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * kc,
+        struct ggml_tensor  * vc,
+        struct ggml_tensor  * tab_inv,
+        struct ggml_tensor  * tab_aux,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * rkv,
+        struct ggml_tensor  * ridx,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        int                   n_chunk_rows,
+        int                   mode) {
+    GGML_ASSERT(mode == GGML_KVQ_ATTN || mode == GGML_KVQ_SCORE);
+    const bool attn  = mode == GGML_KVQ_ATTN;
+    const bool score = mode == GGML_KVQ_SCORE;
+    GGML_ASSERT(!score || kc);
+
+    const int64_t D      = q->ne[0];
+    const int64_t n_head = q->ne[1];
+    const int64_t L      = q->ne[2];
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && q->nb[0] == sizeof(float) && q->ne[3] == 1);
+
+    GGML_ASSERT(k->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(k->ne[0] == D && k->ne[1] >= 1 && k->ne[3] == 1);
+    const int64_t G      = k->ne[2];
+    const int64_t n_tail = k->ne[1];
+    GGML_ASSERT(n_head % G == 0);
+
+    if (attn) {
+        GGML_ASSERT(v && v->type == k->type);
+        GGML_ASSERT(v->ne[0] == D && v->ne[1] == n_tail && v->ne[2] == G && v->ne[3] == 1);
+    }
+
+    int64_t n_coarse = 0;
+    if (kc) {
+        n_coarse = kc->ne[1];
+        GGML_ASSERT(n_chunk_rows > 0);
+        const int64_t n_chunk = (n_coarse + n_chunk_rows - 1)/n_chunk_rows;
+
+        GGML_ASSERT(kc->type == GGML_TYPE_I32 && kc->ne[2] == G && kc->ne[3] == 1);
+        GGML_ASSERT(tab_inv && tab_inv->type == GGML_TYPE_I8);
+        GGML_ASSERT(tab_inv->ne[0] == D && tab_inv->ne[1] == D && tab_inv->ne[2] == 2*G && tab_inv->ne[3] >= n_chunk);
+        GGML_ASSERT(tab_aux && tab_aux->type == GGML_TYPE_F32);
+        GGML_ASSERT(tab_aux->ne[0] == D && tab_aux->ne[1] == 3 && tab_aux->ne[2] == 2*G && tab_aux->ne[3] >= n_chunk);
+        GGML_ASSERT(ggml_is_contiguous_rows(tab_inv) && ggml_is_contiguous_rows(tab_aux));
+        if (attn) {
+            GGML_ASSERT(vc && vc->type == GGML_TYPE_I32);
+            GGML_ASSERT(vc->ne[0] >= 2 && vc->ne[1] == n_coarse && vc->ne[2] == G && vc->ne[3] == 1);
+        }
+    }
+
+    if (attn && rkv) {
+        GGML_ASSERT(rkv->type == GGML_TYPE_Q8_0);
+        GGML_ASSERT(rkv->ne[0] == D && rkv->ne[2] == G && rkv->ne[3] == 2);
+        GGML_ASSERT(ridx && ridx->type == GGML_TYPE_I32 && ridx->ne[0] == rkv->ne[1] && ridx->ne[1] == G);
+    }
+
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(mask->ne[0] >= n_coarse + n_tail && mask->ne[1] >= L);
+    }
+
+    struct ggml_tensor * result = attn ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_head, L) : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_coarse, G, L);
+
+    const int32_t params[] = { 0, n_chunk_rows, mode };
+    ggml_set_op_params(result, params, sizeof(params));
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_KVQ_ATTN;
+    result->src[0] = q;
+    result->src[1] = kc;
+    result->src[2] = attn ? vc : NULL;
+    result->src[3] = kc ? tab_inv : NULL;
+    result->src[4] = kc ? tab_aux : NULL;
+    result->src[5] = k;
+    result->src[6] = attn ? v : NULL;
+    result->src[7] = attn ? rkv : NULL;
+    result->src[8] = attn && rkv ? ridx : NULL;
+    result->src[9] = mask;
+
+    return result;
+}
+
+// ggml_kvq_fit
+
+struct ggml_tensor * ggml_kvq_fit(
+        struct ggml_context * ctx,
+        int                   mode,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * par,
+        struct ggml_tensor  * rows) {
+    const int64_t D = x->ne[0];
+    const int64_t n = x->ne[1];
+    const int64_t B = x->ne[2];
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->ne[3] == 1 && n >= 1);
+    GGML_ASSERT(x->nb[0] == sizeof(float) && x->nb[1] == D*sizeof(float));
+
+    const bool need_par = mode != GGML_KVQ_FIT_MEAN && mode != GGML_KVQ_FIT_COV;
+    if (need_par) {
+        GGML_ASSERT(par && par->type == GGML_TYPE_F32 && par->nb[0] == sizeof(float) && par->nb[1] == D*sizeof(float));
+        GGML_ASSERT(par->ne[0] == D && par->ne[2] == B && par->ne[3] == 1);
+        GGML_ASSERT(par->ne[1] >= (mode == GGML_KVQ_FIT_ROT ? D : 4));
+    }
+
+    struct ggml_tensor * result;
+    switch (mode) {
+        case GGML_KVQ_FIT_MEAN:
+        case GGML_KVQ_FIT_GAIN:
+            result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 1, B);
+            break;
+        case GGML_KVQ_FIT_COV:
+            result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, D, B);
+            break;
+        case GGML_KVQ_FIT_ROT:
+            result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n, B);
+            break;
+        case GGML_KVQ_FIT_CODE:
+            GGML_ASSERT(rows && rows->type == GGML_TYPE_I32 && rows->nb[0] == sizeof(int32_t));
+            GGML_ASSERT(rows->ne[0] >= 1 && rows->ne[1] == n && rows->ne[2] == B && rows->ne[3] == 1);
+            result = ggml_view_tensor(ctx, rows);
+            break;
+        default:
+            GGML_ABORT("unknown kvq_fit mode %d", mode);
+    }
+
+    ggml_set_op_params_i32(result, 0, mode);
+
+    result->op     = GGML_OP_KVQ_FIT;
+    result->src[0] = x;
+    result->src[1] = need_par ? par : NULL;
+    result->src[2] = mode == GGML_KVQ_FIT_CODE ? rows : NULL;
+
+    return result;
+}
+
+static bool ggml_kvq_fit_rows_ok(const struct ggml_tensor * t, int64_t D, int64_t n, int64_t B) {
+    return t->type == GGML_TYPE_F32 && t->ne[0] == D && t->ne[1] >= n && t->ne[2] == B && t->ne[3] == 1 &&
+           t->nb[0] == sizeof(float) && t->nb[1] == D*sizeof(float);
+}
+
+// per task: three double and one float matrix, the QL rotations (1.5 D^2 float pairs), small arrays; 16 arrays aligned to 256 bytes
+size_t ggml_kvq_fit_table_work_size(int64_t D, int64_t B) {
+    return (size_t) B*(40*D*D + 288*D + 64) + 16*256;
+}
+
+struct ggml_tensor * ggml_kvq_fit_table(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * tab,
+        struct ggml_tensor  * work,
+        int                   n_tok,
+        int                   n_k) {
+    const int64_t D = tab->ne[0];
+    const int64_t B = tab->ne[2];
+    GGML_ASSERT(ggml_kvq_fit_rows_ok(tab, D, 2*D + 3, B) && tab->ne[1] == 2*D + 3);
+    GGML_ASSERT(work == NULL || (work->type == GGML_TYPE_I8 && ggml_nbytes(work) >= ggml_kvq_fit_table_work_size(D, B)));
+    GGML_ASSERT(n_tok >= 1 && n_k >= 0 && n_k <= B);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, tab);
+
+    ggml_set_op_params_i32(result, 0, GGML_KVQ_FIT_TABLE);
+    ggml_set_op_params_i32(result, 1, n_k);
+    ggml_set_op_params_i32(result, 2, n_tok);
+
+    result->op     = GGML_OP_KVQ_FIT;
+    result->src[0] = tab;
+    result->src[1] = work;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_kvq_fit_bits(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sigma,
+        struct ggml_tensor  * par,
+        float                 avg_bits) {
+    const int64_t D = sigma->ne[0];
+    const int64_t B = sigma->ne[2];
+    GGML_ASSERT(ggml_kvq_fit_rows_ok(sigma, D, 1, B) && sigma->ne[1] == 1);
+    GGML_ASSERT(ggml_kvq_fit_rows_ok(par, D, 4, B));
+    GGML_ASSERT(avg_bits >= 0.0f && avg_bits <= 8.0f);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 4, B);
+
+    ggml_set_op_params_i32(result, 0, GGML_KVQ_FIT_BITS);
+    ggml_set_op_params_f32(result, 1, avg_bits);
+
+    result->op     = GGML_OP_KVQ_FIT;
+    result->src[0] = sigma;
+    result->src[1] = par;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_kvq_fit_pack(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * par,
+        struct ggml_tensor  * inv) {
+    const int64_t D = x->ne[0];
+    const int64_t B = x->ne[2];
+    GGML_ASSERT(ggml_kvq_fit_rows_ok(x, D, D + 1, B) && x->ne[1] == D + 1);
+    GGML_ASSERT(ggml_kvq_fit_rows_ok(par, D, 4, B) && par->ne[1] == 4);
+
+    struct ggml_tensor * result;
+    if (inv) {
+        GGML_ASSERT(inv->type == GGML_TYPE_I8 && inv->ne[0] == D && inv->ne[1] == D && inv->ne[2] == B && inv->ne[3] == 1);
+        GGML_ASSERT(inv->nb[0] == 1 && inv->nb[1] == (size_t) D);
+        result = ggml_view_tensor(ctx, inv);
+    } else {
+        result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, 3, B);
+    }
+
+    ggml_set_op_params_i32(result, 0, inv ? GGML_KVQ_FIT_PACK_INV : GGML_KVQ_FIT_PACK_AUX);
+
+    result->op     = GGML_OP_KVQ_FIT;
+    result->src[0] = x;
+    result->src[1] = par;
+    result->src[2] = inv;
 
     return result;
 }

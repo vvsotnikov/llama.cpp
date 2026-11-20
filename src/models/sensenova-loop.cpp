@@ -169,15 +169,19 @@ llama_model_sensenova_loop::graph::graph(const llm_graph_params & params) : grap
     const auto & loop = static_cast<const llama_model_sensenova_loop &>(model);
     auto * inp = build_inp_mem_hybrid();
     ggml_tensor * inp_pos = build_inp_pos();
+    auto * inp_kvq = build_inp_kvq();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
     ggml_tensor * cur = build_inp_embd(model.tok_embd);
     ggml_tensor * streams = nullptr;
+
+    const int kvq_lead = build_kvq_begin(inp_kvq);
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
         const uint32_t physical = loop.physical_layer(il);
         const bool mhc = physical >= hparams.mhc_start && physical < hparams.mhc_end;
         res->t_layer_inp[il] = cur;
+        build_kvq_prefetch_at(inp->get_attn(), inp_kvq, kvq_lead, cur, inp_pos, il);
         if (mhc && physical == hparams.mhc_start) {
             streams = ggml_reshape_3d(ctx0, ggml_concat(ctx0, cur, cur, 0), n_embd, 2, cur->ne[1]);
         }
@@ -191,7 +195,7 @@ llama_model_sensenova_loop::graph::graph(const llm_graph_params & params) : grap
         if (hparams.is_recr(il)) {
             cur = build_layer_attn_linear(inp->get_recr(), cur, il);
         } else {
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, il);
+            cur = build_layer_attn(inp->get_attn(), inp_kvq, cur, inp_pos, il);
         }
         if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
             cur = ggml_get_rows(ctx0, cur, inp_out_ids);

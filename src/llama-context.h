@@ -22,6 +22,7 @@ class llama_moe_cache;
 
 class llama_io_read_i;
 class llama_io_write_i;
+class llama_memory_hybrid_kvq;
 
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
@@ -44,9 +45,11 @@ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_b
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
+    // kvq_tail > 0: the memory is the two-tier KV cache with a ring of that many cells (llama_init_from_model_kvq)
     llama_context(
             const llama_model & model,
-                  llama_context_params params);
+                  llama_context_params params,
+                  uint32_t kvq_tail = 0);
 
     ~llama_context();
 
@@ -280,8 +283,10 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // embd: an embd ubatch (rows of ctx_other's layer input device buffer if the context reads them), the injection batches of a DFlash draft
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr,
+        bool embd = false);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
@@ -319,6 +324,12 @@ private:
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
+    // the ubatch is a token generation ubatch (tg phase): at most n_tokens_tg tokens, and not a prompt ubatch of the two-tier cache
+    bool ubatch_tg(const llama_ubatch & ubatch, const llama_memory_context_i * mctx) const;
+
+    // switches the device compute buffers to the sizes of the tg or the pp phase
+    void phase_set(bool tg);
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -344,6 +355,7 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    llama_memory_hybrid_kvq * mem_kvq = nullptr; // memory.get() when it is the two-tier KV cache, set once where the memory is created
     llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
@@ -407,6 +419,21 @@ private:
 
     bool sched_need_reserve = true;
 
+    // compute buffers per phase: the prompt ubatches (pp) and the ubatches of at most n_tokens_tg tokens (tg), see phase_set
+    // the device buffers hold the sizes of the current phase only; host buffers are kept (SIZE_MAX)
+    bool     phase_on    = false; // cparams.phase_bufs and the context can use it
+    bool     phase_tg    = false;
+    uint32_t n_tokens_tg = 0;
+    std::vector<size_t> phase_size_pp; // the reserve of the pp graph
+    std::vector<size_t> phase_size_tg; // the reserve of a tg graph (0 with the two-tier cache), at least the largest size used in a tg phase
+    int32_t  n_phase_switch = 0;
+    double   t_phase_switch = 0.0; // ms
+
+    // rows of the layer input device buffer: n_batch, or n_tokens_tg while the batches are that small (phases on)
+    int64_t layer_inp_rows = 0;
+
+    int32_t kvq_fit_graph = 0; // llama_memory_hybrid_kvq::fit_graph_kind of the last reserve
+
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;
@@ -425,6 +452,9 @@ private:
     };
 
     copy_experts_info copy_experts;
+
+    // the copy callback is called before the scheduler waits for the GPU, see sched_new
+    bool sched_copy_early = false;
 
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different

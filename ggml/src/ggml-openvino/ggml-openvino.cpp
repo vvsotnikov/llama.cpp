@@ -1875,6 +1875,9 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
         if (op->src[5] != nullptr) {
             return {false, "FLASH_ATTN_EXT with K/V row lists is not supported"};
         }
+        if (ggml_flash_attn_ext_get_lse(op)) {
+            return {false, "FLASH_ATTN_EXT with the log-sum-exp output is not supported"};
+        }
 
         if (op->src[4] != nullptr && op->src[3] == nullptr) {
             return {false, "FLASH_ATTN_EXT with sinks but no mask is not supported"};
@@ -2044,6 +2047,9 @@ static ggml_openvino_op_support is_op_supported_case(const ggml_tensor * op) {
                 GGML_ABORT("ggml-openvino: GGML_OPENVINO_GDN_NATIVE_STATE is set, but %s", reason);
             }
             return {false, reason};
+        }
+        if (((const int32_t *) op->op_params)[1] != 0) {
+            return {false, "GATED_DELTA_NET with replay of pending tokens is not supported"};
         }
         break;
     }

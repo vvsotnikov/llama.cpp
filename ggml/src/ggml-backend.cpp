@@ -1229,6 +1229,7 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
+    bool   callback_copy_early;
 
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
@@ -2124,6 +2125,14 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    const bool use_callback = sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input);
+
+    // early callback: it runs before the wait below and synchronizes by itself if it needs to
+    if (use_callback && sched->callback_copy_early &&
+        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        return;
+    }
+
     // wait for the split backend to finish using the input before overwriting it
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -2131,7 +2140,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         ggml_backend_synchronize(split_backend);
     }
 
-    if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+    if (use_callback && !sched->callback_copy_early &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
         return;
     }
@@ -2512,6 +2521,11 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     sched->callback_copy_user_data = user_data;
 }
 
+void ggml_backend_sched_set_copy_callback_early(ggml_backend_sched_t sched, bool early) {
+    GGML_ASSERT(sched);
+    sched->callback_copy_early = early;
+}
+
 void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data) {
     GGML_ASSERT(sched);
     sched->callback_realloc = callback;
@@ -2555,6 +2569,15 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
 }
 
+bool ggml_backend_sched_resize_buffers(ggml_backend_sched_t sched, const size_t * sizes) {
+    GGML_ASSERT(sched);
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_synchronize(sched->backends[i]);
+    }
+    ggml_backend_sched_reset(sched);
+    return ggml_gallocr_resize(sched->galloc, sizes);
+}
+
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
@@ -2584,6 +2607,7 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_ARGMAX:
+        case GGML_OP_CONV_2D:
             return true;
         default:
             return false;

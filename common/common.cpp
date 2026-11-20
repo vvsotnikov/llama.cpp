@@ -1388,10 +1388,36 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
-    llama_context * lctx = llama_init_from_model(model, cparams);
+    // two-tier KV cache: one entry point creates the context with the packed memory and enables the fit
+    // (the rotation is off in the attention cache of this context only, a later context of the model is a normal one)
+    llama_kvq_config kvq_cfg;
+    if (params.kvq.enabled) {
+        kvq_cfg.tail = params.kvq.tail;
+
+        kvq_cfg.fit.chunk     = params.kvq.chunk;
+        kvq_cfg.fit.bits_k    = params.kvq.bits_k;
+        kvq_cfg.fit.bits_v    = params.kvq.bits_v;
+        kvq_cfg.fit.rem       = params.kvq.rem;
+        kvq_cfg.fit.min_rows  = params.kvq.min_rows;
+
+        kvq_cfg.params.prefetch_n   = params.kvq.prefetch_n;
+        kvq_cfg.params.resident_cap = params.kvq.resident_cap;
+        kvq_cfg.params.lead         = params.kvq.lead;
+        kvq_cfg.params.layer_bufs   = params.kvq.layer_bufs;
+        kvq_cfg.params.scr_block    = params.kvq.scr_block;
+    }
+
+    llama_context * lctx = params.kvq.enabled ? llama_init_from_model_kvq(model, cparams, kvq_cfg) : llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
+    }
+
+    if (params.kvq.enabled) {
+        const llama_kvq_fit_params & fp = kvq_cfg.fit;
+        const llama_kvq_params     & kp = kvq_cfg.params;
+        COM_INF("%s: two-tier KV cache: chunks of %d rows, K%dV%d, prefetch_n = %d, resident_cap = %d, lead = %d, rows after the last chunk: %s\n", __func__,
+                fp.chunk, fp.bits_k, fp.bits_v, kp.prefetch_n, llama_kvq_resident_slots(kp), kp.lead, fp.rem == LLAMA_KVQ_REM_MERGE ? "merge" : "own");
     }
 
     pimpl->context.reset(lctx);
@@ -1745,7 +1771,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    cparams.n_rs_seq          = std::max(params.n_rs_seq, params.speculative.need_n_rs_seq());
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
@@ -1772,6 +1798,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.rs_replay         = params.rs_replay;
+    cparams.phase_bufs        = params.phase_bufs < 0 ? params.kvq.enabled : params.phase_bufs != 0;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
