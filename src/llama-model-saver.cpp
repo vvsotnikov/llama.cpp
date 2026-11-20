@@ -193,7 +193,10 @@ void llama_model_saver::add_kv_from_model() {
     // add_kv(LLM_KV_GENERAL_SOURCE_URL,                ???);
     // add_kv(LLM_KV_GENERAL_SOURCE_HF_REPO,            ???);
 
-    add_kv(LLM_KV_VOCAB_SIZE,                        vocab.n_tokens());
+    add_kv(LLM_KV_VOCAB_SIZE,                        hparams.n_vocab_padded ? hparams.n_vocab_padded : vocab.n_tokens());
+    if (hparams.n_vocab_unpadded > 0) {
+        add_kv(LLM_KV_VOCAB_SIZE_UNPADDED,           hparams.n_vocab_unpadded);
+    }
     add_kv(LLM_KV_CONTEXT_LENGTH,                    hparams.n_ctx_train);
     add_kv(LLM_KV_EMBEDDING_LENGTH,                  hparams.n_embd);
     if (hparams.n_embd_out_impl > 0) {
@@ -238,6 +241,7 @@ void llama_model_saver::add_kv_from_model() {
     add_kv(LLM_KV_DECODER_BLOCK_COUNT,               hparams.dec_n_layer);
     add_kv(LLM_KV_ATTN_LOGIT_SOFTCAPPING,            hparams.f_attn_logit_softcapping);
     add_kv(LLM_KV_ROUTER_LOGIT_SOFTCAPPING,          hparams.f_router_logit_softcapping);
+    add_kv(LLM_KV_ROUTER_HIDDEN_SIZE,                hparams.n_router_hidden);
     add_kv(LLM_KV_FINAL_LOGIT_SOFTCAPPING,           hparams.f_final_logit_softcapping);
     add_kv(LLM_KV_SWIN_NORM,                         hparams.swin_norm);
     add_kv(LLM_KV_RESCALE_EVERY_N_LAYERS,            hparams.rescale_every_n_layers);
@@ -326,7 +330,16 @@ void llama_model_saver::add_kv_from_model() {
             }
         }
     }
-    add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS,        hparams.is_recr_impl, true);
+    add_kv(LLM_KV_ATTENTION_RECURRENT_LAYERS, std::vector<uint32_t>(
+            hparams.is_recr_impl.begin(), hparams.is_recr_impl.begin() + hparams.n_layer_all));
+    if (hparams.n_relative > 0) {
+        add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH,     hparams.n_relative);
+        add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT,     hparams.n_relative_extent);
+        add_kv(LLM_KV_ATTENTION_QK_CLIP,             hparams.f_qk_clip);
+        add_kv(LLM_KV_ATTENTION_RELATIVE_CLIP,       hparams.f_relative_clip);
+        add_kv(LLM_KV_ATTENTION_LOG_SCALE_FLOOR,     hparams.n_log_scale_floor);
+        add_kv(LLM_KV_ATTENTION_LOG_SCALE_ALPHA,     hparams.f_log_scale_alpha);
+    }
     add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,      hparams.dsv4_o_group_count);
     add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,        hparams.dsv4_o_lora_rank);
     add_kv(LLM_KV_ATTENTION_PASS_LORA_RANK,          hparams.metis_pass_lora_rank);
@@ -339,8 +352,18 @@ void llama_model_saver::add_kv_from_model() {
     } else {
         add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,         hparams.dsv4_compress_ratios, true);
     }
-    add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
-    add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+    if (hparams.loop_count > 0) {
+        add_kv(LLM_KV_LOOP_START,               hparams.loop_start);
+        add_kv(LLM_KV_LOOP_END,                 hparams.loop_end);
+        add_kv(LLM_KV_LOOP_COUNT,               hparams.loop_count);
+        add_kv(LLM_KV_HYPER_CONNECTION_START,          hparams.mhc_start);
+        add_kv(LLM_KV_HYPER_CONNECTION_END,            hparams.mhc_end);
+        add_kv(LLM_KV_HYPER_CONNECTION_PRE_SCALE,      hparams.mhc_pre_scale);
+        add_kv(LLM_KV_HYPER_CONNECTION_FIXED_IDENTITY, hparams.mhc_fixed_identity);
+    }
+
+    add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.loop_count > 0 ? hparams.mhc_streams : hparams.dsv4_hc_mult);
+    add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.loop_count > 0 ? hparams.mhc_iterations : hparams.dsv4_hc_sinkhorn_iters);
     add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     add_kv(LLM_KV_HYPER_CONNECTION_MAGNITUDE,           hparams.hc_magnitude);
     add_kv(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
@@ -521,6 +544,7 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->output_s);
     add_tensor(model->output_in_s);
     add_tensor(model->output_res_score);
+    add_tensor(model->output_res_query);
     add_tensor(model->nextn_proj_pre);
     add_tensor(model->nextn_proj_post);
     add_tensor(model->cls);
@@ -559,12 +583,15 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->hc_head_base);
     add_tensor(model->hc_head_scale);
     add_tensor(model->per_layer_tok_embd);
+    add_tensor(model->per_layer_tok_embd_s);
     add_tensor(model->per_layer_model_proj);
     add_tensor(model->per_layer_proj_norm);
     add_tensor(model->value_embd);
     add_tensor(model->hc_head_norm);
     add_tensor(model->hc_head_down);
     add_tensor(model->hc_head_up);
+    add_tensor(model->res_scale_in);
+    add_tensor(model->res_scale_in_b);
 
     // looped architectures alias physical tensors across cache slots; save each
     // tensor once. a different tensor with an existing name still asserts below
